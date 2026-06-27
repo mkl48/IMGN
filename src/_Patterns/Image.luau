@@ -2,15 +2,17 @@
 -- _Patterns/Image.luau
 -- Plinko Labs
 --
--- Adapter for loading real image files (PNG/BMP/TGA/JPG) onto a Canvas, via the osgl-rbx/image
--- deserializer (https://github.com/osgl-rbx/image). That library isn't on Wally and is a heavy
--- thing to vendor, so IMGN does NOT hard-depend on it: you install osgl yourself and pass the
--- required module in. This module just knows how to drive its API and copy the decoded RGBA8
--- buffer onto a Canvas (osgl's DynamicImage buffer is the same 4-bytes-per-pixel layout IMGN
--- uses, so it's a straight per-pixel copy with optional nearest-neighbour scaling).
+-- Adapter for loading real image files (PNG/BMP/TGA/JPG) onto a Canvas. The actual deserializer
+-- is osgl-rbx/image (https://github.com/osgl-rbx/image), vendored under _Packages/Image and used
+-- internally - so callers just pass bytes, no separate install. This module drives osgl's API and
+-- copies the decoded RGBA8 buffer onto a Canvas (osgl's DynamicImage buffer is the same
+-- 4-bytes-per-pixel layout IMGN uses, so it's a straight per-pixel copy with optional
+-- nearest-neighbour scaling).
 --
 -- Bytes come from you: HttpService:GetAsync(url) returns the file as a string, or bake the file
 -- into a ModuleScript - either a `string` or a `buffer` works.
+
+local Decoder = require(script.Parent.Parent._Packages.Image)
 
 --[=[
 	@class Image
@@ -27,17 +29,15 @@ export type LoadOptions = {
 	SkipTransparent: boolean?, -- don't write fully-transparent source pixels (composite instead of replace)
 }
 
--- Decode `bytes` (string|buffer) with the passed-in osgl `image` module into a DynamicImage.
-function Image.decode(image: any, bytes: string | buffer, format: string?): any
-	assert(image and image.ImageReader, "IMGN: pass the osgl-rbx/image module as the first argument")
-
+-- Decode `bytes` (string|buffer) with the bundled decoder into a DynamicImage.
+function Image.decode(bytes: string | buffer, format: string?): any
 	local reader
 	if format then
-		local fmt = image.ImageFormat[format]
+		local fmt = Decoder.ImageFormat[format]
 		assert(fmt, `IMGN: unknown image Format "{format}"`)
-		reader = image.ImageReader.withFormat(bytes, fmt)
+		reader = Decoder.ImageReader.withFormat(bytes, fmt)
 	else
-		reader = image.ImageReader.open(bytes)
+		reader = Decoder.ImageReader.open(bytes)
 		local guess = reader:WithGuessedFormat()
 		if guess and guess.isOk == false then
 			error("IMGN: could not detect the image format (pass Format = \"PNG\" to be explicit)")

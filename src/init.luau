@@ -59,13 +59,13 @@ end
 
 --[=[
 	@within IMGN
-	Decodes a real image file and returns a [Canvas] sized to it (times `Scale`), already drawn and
-	rendered. `image` is the [osgl-rbx/image](https://github.com/osgl-rbx/image) module (install it
-	yourself and pass it in - IMGN doesn't bundle it); `bytes` is the file as a `string`/`buffer`.
-	`config` accepts `Parent`, `Driver`, `AutoRender`, plus image `Scale`/`Format`/`SkipTransparent`.
-	For finer placement onto an existing canvas, use [Canvas:LoadImage] instead.
+	Decodes a real image file (PNG/BMP/TGA/JPG) and returns a [Canvas] sized to it (times `Scale`),
+	already drawn and rendered. The decoder is bundled with IMGN - just pass `bytes`, the file as a
+	`string`/`buffer`. `config` accepts `Parent`, `Driver`, `AutoRender`, plus image
+	`Scale`/`Format`/`SkipTransparent`. For finer placement onto an existing canvas, use
+	[Canvas:LoadImage] instead.
 ]=]
-function IMGN.ImageCanvas(image: any, bytes: string | buffer, config: {
+function IMGN.ImageCanvas(bytes: string | buffer, config: {
 	Parent: Instance?,
 	Driver: any?,
 	AutoRender: boolean?,
@@ -74,7 +74,7 @@ function IMGN.ImageCanvas(image: any, bytes: string | buffer, config: {
 	SkipTransparent: boolean?,
 }?): Canvas
 	config = config or {}
-	local decoded = ImageHelper.decode(image, bytes, config.Format)
+	local decoded = ImageHelper.decode(bytes, config.Format)
 	local scale = config.Scale or 1
 	local width = math.max(1, math.floor(decoded.width * scale + 0.5))
 	local height = math.max(1, math.floor(decoded.height * scale + 0.5))

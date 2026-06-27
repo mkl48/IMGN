@@ -2,6 +2,9 @@
 --
 -- Paste this whole script into the Roblox Studio command bar to (re)install IMGN into
 -- ReplicatedStorage. A previous install named "IMGN" is replaced.
+--
+-- Bundles osgl-rbx/image (c) 2023-2025 OSGL Contributors, under the OSGL License
+-- (https://github.com/osgl-rbx/image), as ReplicatedStorage.IMGN._Packages.Image.
 
 local RS = game:GetService("ReplicatedStorage")
 
@@ -98,13 +101,13 @@ end
 
 --[=[
 	@within IMGN
-	Decodes a real image file and returns a [Canvas] sized to it (times `Scale`), already drawn and
-	rendered. `image` is the [osgl-rbx/image](https://github.com/osgl-rbx/image) module (install it
-	yourself and pass it in - IMGN doesn't bundle it); `bytes` is the file as a `string`/`buffer`.
-	`config` accepts `Parent`, `Driver`, `AutoRender`, plus image `Scale`/`Format`/`SkipTransparent`.
-	For finer placement onto an existing canvas, use [Canvas:LoadImage] instead.
+	Decodes a real image file (PNG/BMP/TGA/JPG) and returns a [Canvas] sized to it (times `Scale`),
+	already drawn and rendered. The decoder is bundled with IMGN - just pass `bytes`, the file as a
+	`string`/`buffer`. `config` accepts `Parent`, `Driver`, `AutoRender`, plus image
+	`Scale`/`Format`/`SkipTransparent`. For finer placement onto an existing canvas, use
+	[Canvas:LoadImage] instead.
 ]=]
-function IMGN.ImageCanvas(image: any, bytes: string | buffer, config: {
+function IMGN.ImageCanvas(bytes: string | buffer, config: {
 	Parent: Instance?,
 	Driver: any?,
 	AutoRender: boolean?,
@@ -113,7 +116,7 @@ function IMGN.ImageCanvas(image: any, bytes: string | buffer, config: {
 	SkipTransparent: boolean?,
 }?): Canvas
 	config = config or {}
-	local decoded = ImageHelper.decode(image, bytes, config.Format)
+	local decoded = ImageHelper.decode(bytes, config.Format)
 	local scale = config.Scale or 1
 	local width = math.max(1, math.floor(decoded.width * scale + 0.5))
 	local height = math.max(1, math.floor(decoded.height * scale + 0.5))
@@ -1236,15 +1239,14 @@ end
 
 --[=[
 	@within Canvas
-	Decodes a real image file and draws it onto this canvas. `image` is the
-	[osgl-rbx/image](https://github.com/osgl-rbx/image) module (IMGN doesn't bundle it - install it
-	and pass it in); `bytes` is the file as a `string` or `buffer` (e.g. from
+	Decodes a real image file (PNG/BMP/TGA/JPG) and draws it onto this canvas. The decoder is
+	bundled with IMGN - just pass `bytes`, the file as a `string` or `buffer` (e.g. from
 	`HttpService:GetAsync`). `options` (see [Image.LoadOptions]) sets `X`/`Y` offset, nearest-
 	neighbour `Scale`, an explicit `Format`, and `SkipTransparent`. Returns the drawn width/height.
 	Call `:Render()` afterwards.
 ]=]
-function Canvas.LoadImage(self: Canvas, image: any, bytes: string | buffer, options: Image.LoadOptions?): (number, number)
-	local decoded = Image.decode(image, bytes, options and options.Format)
+function Canvas.LoadImage(self: Canvas, bytes: string | buffer, options: Image.LoadOptions?): (number, number)
+	local decoded = Image.decode(bytes, options and options.Format)
 	return Image.blit(self, decoded, options)
 end
 
@@ -1845,8 +1847,4220 @@ end
 
 return RowMerge
 ]])
-local _7 = folder("_Patterns", _1)
-mod("Draw", _7, [[
+local _7 = folder("_Packages", _1)
+local _8 = mod("Image", _7, [[
+local Reader = script.ImageReader.Reader
+
+local ImageReader = require(script.ImageReader)
+local ReaderModule = require(Reader)
+local Bmp = require(Reader.Bmp)
+local Png = require(Reader.Png)
+local Tga = require(Reader.Tga)
+
+export type Decoder<T> = ReaderModule.Codec<T>
+export type Bmp = Bmp.BmpHeader
+export type Png = Png.PngHeader
+export type Tga = Tga.TgaHeader
+export type ImageReader<T> = ImageReader.ImageReader<T>
+
+return {
+    ImageReader = require(script.ImageReader),
+    ImageFormat = require(script.ImageFormat),
+    ImageError = require(script.ImageError)
+}]])
+mod("Cursor", _8, [[
+local ImageError = require(script.Parent.ImageError)
+
+type ImageError = ImageError.ImageError
+export type Cursor = {
+	PeekByte: (self: Cursor) -> number,
+	ReadByte: (self: Cursor) -> number,
+	PeekU32: (self: Cursor) -> number,
+	ReadU32: (self: Cursor) -> number,
+	PeekU16: (self: Cursor) -> number,
+	ReadU16: (self: Cursor) -> number,
+	PeekI32: (self: Cursor) -> number,
+	ReadI32: (self: Cursor) -> number,
+	ExpectByte: (self: Cursor, byte: number) -> (),
+	ExpectBytes: (self: Cursor, bytes: string) -> boolean,
+	ExpectBytesRaw: (self: Cursor, ...number) -> boolean,
+	SkipBytes: (self: Cursor, bytes: number) -> (),
+	ReadString: (self: Cursor, length: number) -> string,
+	Fork: (self: Cursor, length: number) -> Cursor,
+	Iterate: (self: Cursor) -> () -> number,
+	ReadByteCollection: (self: Cursor, bytes: number) -> buffer,
+	BytesRemaining: (self: Cursor) -> number,
+	PeekBit: (self: Cursor) -> number,
+	ReadBit: (self: Cursor) -> number,
+
+	buffer: buffer,
+	bufferLength: number,
+	position: number,
+	bitPosition: number,
+}
+
+local Cursor = {}
+
+local function isPastBufferLength(self: Cursor)
+	return self.position + (self.bitPosition / 8) > self.bufferLength
+end
+
+function Cursor.BytesRemaining(self: Cursor)
+	return self.bufferLength - self.position
+end
+
+function Cursor.PeekByte(self: Cursor): number
+	return buffer.readu8(self.buffer, self.position)
+end
+
+function Cursor.PeekU32(self: Cursor): number
+	return buffer.readu32(self.buffer, self.position)
+end
+
+function Cursor.ReadU32(self: Cursor): number
+	if isPastBufferLength(self) then
+		return error(ImageError.Decoding)
+	end
+
+	local result = self:PeekU32()
+	self.position += 4
+
+	return result
+end
+
+function Cursor.PeekBit(self: Cursor): number
+	return buffer.readbits(self.buffer, self.position * 8 + self.bitPosition, 1)
+end
+
+function Cursor.ReadBit(self: Cursor): number
+	if isPastBufferLength(self) then
+		return error(ImageError.Decoding)
+	end
+
+	local result = self:PeekBit()
+	self.bitPosition += 1
+
+	return result
+end
+
+function Cursor.ReadString(self: Cursor, length: number): string
+	if isPastBufferLength(self) then
+		return error(ImageError.Decoding)
+	end
+
+	local characters = ""
+	for i = 1, length do
+		characters ..= string.char(self:ReadByte())
+	end
+
+	return characters
+end
+
+function Cursor.Fork(self: Cursor, length: number): Cursor
+	local chunk = buffer.create(length)
+	buffer.copy(chunk, 0, self.buffer, self.position, length)
+	self.position += length
+
+	return new(chunk)
+end
+
+function Cursor.Iterate(self: Cursor): () -> number
+	return function()
+		return self.position + 1 > self.bufferLength and self:ReadByte() or nil 
+	end
+end
+
+function Cursor.PeekU16(self: Cursor): number
+	return buffer.readu16(self.buffer, self.position)
+end
+
+function Cursor.ReadU16(self: Cursor): number
+	if isPastBufferLength(self) then
+		return error(ImageError.Decoding)
+	end
+
+	local result = self:PeekU16()
+	self.position += 2
+
+	return result
+end
+
+function Cursor.PeekI32(self: Cursor): number
+	return buffer.readi32(self.buffer, self.position)
+end
+
+function Cursor.ReadI32(self: Cursor): number
+	if isPastBufferLength(self) then
+		return error(ImageError.Decoding)
+	end
+
+	local result = self:PeekI32()
+	self.position += 4
+
+	return result
+end
+
+function Cursor.ReadByte(self: Cursor): number
+	if isPastBufferLength(self) then
+		return error(ImageError.Decoding, 2)
+	end
+
+	local result = self:PeekByte()
+	self.position += 1
+
+	return result
+end
+
+function Cursor.ExpectByte(self: Cursor, byte: number): boolean
+	if isPastBufferLength(self) then
+		return error(ImageError.Decoding)
+	end
+
+	local newByte = self:ReadByte()
+	return newByte == byte
+end
+
+function Cursor.ReadByteCollection(self: Cursor, bytes: number): buffer
+	if isPastBufferLength(self) then
+		error(ImageError.Decoding)
+	end
+
+	local subBuffer = buffer.create(bytes)
+	for position = 0, bytes - 1 do
+		local newByte = self:ReadByte()
+		buffer.writeu8(subBuffer, position, newByte)
+	end
+
+	return subBuffer
+end
+
+function Cursor.ExpectBytes(self: Cursor, bytes: string): boolean
+	return buffer.tostring(self:ReadByteCollection(string.len(bytes))) == bytes
+end
+
+function Cursor.ExpectBytesRaw(self: Cursor, ...: number): boolean
+	local chars = {}
+
+	for _, v in {...} do
+		table.insert(chars, string.char(v))
+	end
+
+	return self:ExpectBytes(table.concat(chars))
+end
+
+function Cursor.SkipBytes(self: Cursor, bytes: number)
+	self.position += bytes
+	if isPastBufferLength(self) then
+		return error(ImageError.Decoding)
+	end
+
+	return
+end
+
+function new(bfr: buffer, position: number?): Cursor
+	local self = table.clone(Cursor)
+	self.buffer = bfr
+	self.bufferLength = buffer.len(bfr)
+	self.position = position or 0
+	self.bitPosition = 0
+
+	return self
+end
+
+return {
+	new = new
+}
+]])
+mod("DataReader", _8, [[
+local ImageReader = script.Parent.ImageReader
+local ImageReaderTypes = require(ImageReader.types)
+
+local DataReader = {}
+
+function DataReader.convertToBuffer(dataStream: ImageReaderTypes.ReadableData): buffer
+    if type(dataStream) == "string" then
+        return buffer.fromstring(dataStream)
+    end
+
+    return dataStream
+end
+
+return DataReader]])
+local _9 = mod("DynamicImage", _8, [[
+local Reader = require(script.Parent.ImageReader.Reader)
+local ImageFormat = require(script.Parent.ImageFormat)
+local ImageError = require(script.Parent.ImageError)
+local Result = require(script.Parent.Result)
+local types = require(script.types)
+
+export type DynamicImage<T> = types.DynamicImage<T>
+
+local DynamicImage = {}
+
+function DynamicImage.Encode<T>(self: DynamicImage<T>, format: ImageFormat.ImageFormat): ImageError.ImageResult<buffer>
+	local codecs = Reader.GetCodecs()
+	local codec = codecs[format]
+	if not codec then
+		return Result.err(ImageError.Encoding)
+	end
+
+	if not codec.canEncode then
+		return Result.err(ImageError.Unsupported)
+	end
+
+	return Result.ok(codec.encode(self.width, self.height, self.buffer))
+end
+
+function DynamicImage.ReadPixel<T>(self: DynamicImage<T>, x: number, y: number): number
+	return buffer.readu32(self.buffer, (y * self.width + x) * 4)
+end
+
+function DynamicImage.ReadPixelRGBA<T>(self: DynamicImage<T>, x: number, y: number)
+	local index = (y * self.width + x) * 4
+	return buffer.readu8(self.buffer, index),
+		buffer.readu8(self.buffer, index + 1),
+		buffer.readu8(self.buffer, index + 2),
+		buffer.readu8(self.buffer, index + 3)
+end
+
+return {
+	new = function<T>(width: number, height: number, buffer: buffer, header: T): DynamicImage<T>
+		if type(buffer) == "table" then
+			buffer = buffer[1]
+		end
+
+		local self = table.clone(DynamicImage)
+		self.width = width
+		self.height = height
+		self.buffer = buffer
+		self.header = header
+
+		return self
+	end,
+}
+]])
+mod("types", _9, [[
+local ImageFormat = require(script.Parent.Parent.ImageFormat)
+
+export type DynamicImage<T> = {
+    width: number,
+    height: number,
+    buffer: buffer,
+    header: T,
+
+    Encode: (self: DynamicImage<T>, format: ImageFormat.ImageFormat) -> buffer,
+
+    ReadPixel: (x: number, y: number) -> number,
+    ReadPixelRGBA: (x: number, y: number) -> (number, number, number, number)
+}
+
+return nil]])
+mod("ImageError", _8, [[
+local Result = require(script.Parent.Result)
+local SafeEnum = require(script.Parent.SafeEnum)
+
+type Result<T, E> = Result.Result<T, E>
+export type ImageError = number
+export type ImageResult<T> = Result<T, ImageError>
+
+local ImageError = {
+    Decoding = SafeEnum() :: ImageError,
+    Encoding = SafeEnum() :: ImageError,
+    Unsupported = SafeEnum() :: ImageError,
+}
+
+return ImageError]])
+mod("ImageFormat", _8, [[
+local SafeEnum = require(script.Parent.SafeEnum)
+
+type Extensions = "BMP"
+type ImageFormatFromExtension = (extension: Extensions) -> ImageFormat
+export type ImageFormat = number
+
+local ImageFormat = {
+	UNKNOWN = SafeEnum() :: ImageFormat,
+	BMP = SafeEnum() :: ImageFormat,
+	PNG = SafeEnum() :: ImageFormat,
+	TGA = SafeEnum() :: ImageFormat,
+    JPG = SafeEnum() :: ImageFormat,
+}
+
+local extensionMap = {
+	["BMP"] = ImageFormat.BMP,
+	["DIB"] = ImageFormat.BMP,
+
+	["PNG"] = ImageFormat.PNG,
+	["TGA"] = ImageFormat.TGA,
+
+    ["JPEG"] = ImageFormat.JPG,
+    ["JPG"] = ImageFormat.JPG,
+    ["JPE"] = ImageFormat.JPG,
+    ["JIF"] = ImageFormat.JPG,
+    ["JFIF"] = ImageFormat.JPG,
+    ["JFI"] = ImageFormat.JPG
+}
+
+ImageFormat.fromExtension = function(extension: Extensions)
+	return extensionMap[string.upper(extension)] or ImageFormat.UNKNOWN
+end
+
+return ImageFormat :: typeof(ImageFormat)
+]])
+local _10 = mod("ImageReader", _8, [[
+local types = require(script.types)
+local structs = require(script.structs)
+
+local ImageFormat = require(script.Parent.ImageFormat)
+local DataReader = require(script.Parent.DataReader)
+local Result = require(script.Parent.Result)
+local ImageError = require(script.Parent.ImageError)
+local Reader = require(script.Reader)
+local Cursor = require(script.Parent.Cursor)
+local DynamicImage = require(script.Parent.DynamicImage)
+
+type Result<T, E> = Result.Result<T, E>
+type ImageResult<T> = ImageError.ImageResult<T>
+type ReadableData = types.ReadableData
+type ImageFormat = ImageFormat.ImageFormat
+type Cursor = Cursor.Cursor
+type Dimensions = structs.Dimensions
+export type ImageReader<T> = types.ImageReader<T>
+
+local ImageReader = {}
+
+function ImageReader.IntoDimensions<T>(self: ImageReader<T>): ImageResult<Dimensions>
+    return Reader.GetCodec(self.format).getDimensions(self.cursor)
+end
+
+function ImageReader.IntoHeader<T>(self: ImageReader<T>)
+	return Reader.GetCodec(self.format).getHeader(self.cursor)
+end
+
+function ImageReader.Decode<T>(self: ImageReader<T>)
+
+	local res = Reader.GetCodec(self.format).decode(self.cursor)
+	if not res.isOk then
+		return res
+	end
+
+	return Result.ok(DynamicImage.new(res:Unwrap()))
+end
+
+function ImageReader.WithGuessedFormat<T>(self: ImageReader<T>)
+	local decoders = Reader.GetCodecs()
+	local format
+	for k, v in decoders do
+		local success = v.isFile(self.cursor)
+
+		if not success.isOk then
+			return success
+		end
+
+		local value = success:Unwrap()
+
+		if value then
+			format = k
+			continue
+		end
+	end
+
+	format = format or ImageFormat.UNKNOWN
+	self.format = format
+
+	return Result.ok(format)
+end
+
+function open(dataStream: ReadableData): ImageReader<"UNKNOWN">
+    local bfr = DataReader.convertToBuffer(dataStream)
+
+	local self = table.clone(ImageReader)
+	self.format = ImageFormat.UNKNOWN
+	self.buffer = bfr
+    self.cursor = Cursor.new(bfr)
+
+	return self
+end
+
+return {
+	open = open,
+
+	withFormat = function(dataStream: ReadableData, format: ImageFormat)
+		local newFile = open(dataStream)
+        newFile.format = format
+
+        return newFile
+	end,
+}
+]])
+local _11 = mod("Reader", _10, [[
+--!strict
+
+local ImageReader = script.Parent
+local ImageFormat = require(ImageReader.Parent.ImageFormat)
+local ImageError = require(ImageReader.Parent.ImageError)
+local Cursor = require(ImageReader.Parent.Cursor)
+local DynamicImageTypes = require(ImageReader.Parent.DynamicImage.types)
+local structs = require(script.Parent.structs)
+
+local PNG = require(script.Png)
+
+type ImageResult<T> = ImageError.ImageResult<T>
+type ImageFormat = ImageFormat.ImageFormat
+type Cursor = Cursor.Cursor
+type Dimensions = structs.Dimensions
+
+export type Codec<T> = {
+    canEncode: boolean,
+
+    getHeader: (cursor: Cursor) -> ImageResult<T>,
+    isFile: (cursor: Cursor) -> ImageResult<boolean>,
+    getDimensions: (cursor: Cursor) -> ImageResult<Dimensions>,
+    decode: (cursor: Cursor) -> DynamicImageTypes.DynamicImage<T>,
+    encode: ((width: number, height: number, buffer: buffer) -> ImageResult<buffer>)?
+}
+
+export type PNG = PNG.PngHeader
+
+local CODECS = {
+    [ImageFormat.BMP] = require(script.Bmp),
+    [ImageFormat.PNG] = require(script.Png),
+    [ImageFormat.TGA] = require(script.Tga),
+    [ImageFormat.JPG] = require(script.Jpeg),
+}:: {[number]: Codec<any>}
+
+return {
+    GetCodec = function<T>(format: ImageFormat)
+        return CODECS[format]
+    end,
+
+    GetCodecs = function()
+        return CODECS
+    end
+}]])
+mod("Bmp", _11, [[
+local Reader = script.Parent
+local ImageReader = Reader.Parent
+local Cursor = require(ImageReader.Parent.Cursor)
+local ImageError = require(ImageReader.Parent.ImageError)
+local Result = require(ImageReader.Parent.Result)
+local ImageReaderStructs = require(ImageReader.structs)
+local DynamicImageTypes = require(ImageReader.Parent.DynamicImage.types)
+local util = require(script.Parent.util)
+
+local createRGBAColor = util.createRGBAColor
+
+local Bmp = {
+    canEncode = true
+}
+
+type Result<T, E> = Result.Result<T, E>
+type ImageResult<T> = ImageError.ImageResult<T>
+type DynamicImage<T> = DynamicImageTypes.DynamicImage<T>
+type Dimensions = ImageReaderStructs.Dimensions
+type Cursor = Cursor.Cursor
+export type BmpHeader = {
+	bytes: number,
+	pixelDataOffset: number,
+	headerSize: number,
+	dimensions: Dimensions,
+	colorDepth: number,
+	compressionType: number,
+	imageSizeBytes: number,
+	xPixelsPerMeter: number,
+	yPixelsPerMeter: number,
+	numberOfColors: number,
+	importantColors: number,
+}
+
+function Bmp.getHeader(cursor: Cursor): ImageResult<BmpHeader>
+	cursor.position = 0
+
+	local s, r = pcall(function(...)
+        local isBmp = Bmp.isFile(cursor)
+        if not isBmp.isOk or isBmp.isOk and not isBmp:Unwrap() then
+            return Result.err(ImageError.Decoding)
+        end
+
+        local bytes = cursor:ReadU32()
+
+        -- 2 reserve slots
+        cursor:SkipBytes(4)
+
+
+        local pixelDataOffset = cursor:ReadU32()
+        local headerSize = cursor:ReadU32()
+
+        local dimensions = Bmp.getDimensions(cursor)
+        if not dimensions.isOk then
+            return dimensions -- Full result, no need to cast!
+        end
+
+        -- Colour panes
+        cursor:ExpectBytes(string.char(1) .. string.char(0))
+
+        local colorDepth = cursor:ReadU16()
+        local compression = cursor:ReadU32()
+        local imageSize = cursor:ReadU32()
+        local xPPM = cursor:ReadU32()
+        local yPPM = cursor:ReadU32()
+        local numColors = cursor:ReadU32()
+        local importantColors = cursor:ReadU32()
+
+        return Result.ok({
+            bytes = bytes,
+            pixelDataOffset = pixelDataOffset,
+            headerSize = headerSize,
+            dimensions = dimensions:Unwrap(),
+            colorDepth = colorDepth,
+            compressionType = compression,
+            imageSizeBytes = imageSize,
+            xPixelsPerMeter = xPPM,
+            yPixelsPerMeter = yPPM,
+            numberOfColors = numColors,
+            importantColors = importantColors,
+        })
+    end)
+
+    if s then
+        return r
+    end
+
+    local words = string.split(r, " ")
+    return Result.err(tonumber(words[#words]))
+end
+
+function Bmp.isFile(cursor: Cursor): ImageResult<boolean>
+    cursor.position = 0
+
+    local s, r = pcall(cursor.ExpectBytes, cursor, "BM")
+    if s then
+        return Result.ok(r)
+    else
+        local words = string.split(r, " ")
+        return Result.err(tonumber(words[#words]))
+    end
+end
+
+function Bmp.getDimensions(cursor: Cursor): ImageResult<Dimensions>
+	cursor.position = 18
+
+	local s, r = pcall(function(...)
+        local width = cursor:ReadI32()
+        local height = cursor:ReadI32()
+
+        return Result.ok({
+            width = width,
+            height = height,
+        })
+    end)
+
+    if s then
+        return r
+    end
+
+    local words = string.split(r, " ")
+    return Result.err(tonumber(words[#words]))
+end
+
+function decode8bit(width: number, height: number, pixels: buffer, palette: buffer, cursor: Cursor)
+	for y = 0, height - 1 do
+		for x = 0, width - 1 do
+			local index = cursor:ReadByte()
+
+			local pixelOffset = (y * width + x) * 4
+            buffer.writeu32(pixels, pixelOffset, buffer.readu32(palette, index * 4))
+		end
+		local padding = (4 - (width % 4)) % 4
+		cursor:SkipBytes(padding)
+	end
+
+	return Result.okSmall()
+end
+
+function decode4bit(width: number, height: number, pixels: buffer, palette: buffer, cursor: Cursor)
+    for y = 0, height - 1 do
+        for x = 0, width - 1, 2 do  -- 2 because of 2 pixels per byte
+            local byte = cursor:ReadByte()
+
+            
+            local index1 = bit32.band(bit32.rshift(byte, 4), 0x0F)
+            local pixelOffset1 = (y * width + x) * 4
+            buffer.writeu32(pixels, pixelOffset1, buffer.readu32(palette, index1 * 4))   
+
+            -- Low nibble
+            if x + 1 < width then
+                local index2 = bit32.band(byte, 0x0F)
+                local pixelOffset2 = (y * width + x + 1) * 4
+                buffer.writeu32(pixels, pixelOffset2, buffer.readu32(palette, index2 * 4))   
+            end
+        end
+        
+        -- Padding
+        local bytesRead = math.ceil(width / 2)
+        local padding = (4 - (bytesRead % 4)) % 4
+        cursor:SkipBytes(padding)
+    end
+    return Result.okSmall()
+end
+
+function decode1bit(width: number, height: number, pixels: buffer, palette: buffer, cursor: Cursor)
+    for y = 0, height - 1 do
+        local bitsRemaining = 0
+        local currentByte = 0
+
+        for x = 0, width - 1 do
+            if bitsRemaining == 0 then
+                currentByte = cursor:ReadByte()
+                bitsRemaining = 8
+            end
+
+            local index = bit32.band(bit32.rshift(currentByte, bitsRemaining - 1), 1)
+            bitsRemaining = bitsRemaining - 1
+
+            local pixelOffset = (y * width + x) * 4
+            buffer.writeu32(pixels, pixelOffset, buffer.readu32(palette, index * 4))                                -- A
+        end
+
+        local bytesRead = math.ceil(width / 8)
+        local padding = (4 - (bytesRead % 4)) % 4
+        cursor:SkipBytes(padding)
+    end
+
+    return Result.okSmall()
+end
+
+function decode16bit(width: number, height: number, pixels: buffer, cursor: Cursor, header: BmpHeader)
+    for y = 0, height - 1 do
+        for x = 0, width - 1 do
+            local pixel = cursor:ReadU16()
+
+            local r = bit32.band(bit32.rshift(pixel, 10), 0x1F)
+            local g = bit32.band(bit32.rshift(pixel, 5), 0x1F)
+            local b = bit32.band(pixel, 0x1F)
+
+            
+            local rb = bit32.bor(bit32.lshift(r, 3), bit32.rshift(r, 2))
+            local gb = bit32.bor(bit32.lshift(g, 3), bit32.rshift(g, 2))
+            local bb = bit32.bor(bit32.lshift(b, 3), bit32.rshift(b, 2))
+
+            local offset = (y * width + x) * 4
+            buffer.writeu32(pixels, offset, createRGBAColor(rb, gb, bb))
+        end
+    end
+
+    return Result.okSmall()
+end
+
+function decode24bit(width: number, height: number, pixels: buffer, cursor: Cursor, header: BmpHeader)
+    for y = 0, height - 1 do
+        for x = 0, width - 1 do
+            local b = cursor:ReadByte()
+            local g = cursor:ReadByte()
+            local r = cursor:ReadByte()
+
+            local offset = (y * width + x) * 4
+            buffer.writeu32(pixels, offset, createRGBAColor(r, g, b))
+        end
+
+        local padding = (4 - (width * 3) % 4) % 4
+        cursor:SkipBytes(padding)
+    end
+
+    return Result.okSmall()
+end
+
+function decode32bit(width: number, height: number, pixels: buffer, cursor: Cursor, header: BmpHeader)
+    for y = 0, height - 1 do
+        for x = 0, width - 1 do
+            local b = cursor:ReadByte()
+            local g = cursor:ReadByte()
+            local r = cursor:ReadByte()
+            local a = cursor:ReadByte()
+
+            local offset = (y * width + x) * 4
+            buffer.writeu32(pixels, offset, createRGBAColor(r, g, b, a))
+        end
+    end
+
+    return Result.okSmall()
+end
+
+function flipBuffer(width: number, height: number, pixels: buffer)
+    local newPixels = buffer.create(width * height * 4)
+    local rowSize = width * 4
+        
+    for y = 0, height - 1 do
+        local sourceY = height - 1 - y
+        buffer.copy(
+            newPixels,
+            y * rowSize,
+            pixels,
+            sourceY * rowSize,
+            rowSize 
+        )
+    end
+
+    return newPixels
+end
+
+local colorDepthMap = {
+	[1] = decode1bit,
+	[4] = decode4bit,
+	[8] = decode8bit,
+    [16] = decode16bit,
+    [24] = decode24bit,
+    [32] = decode32bit,
+}
+
+function BmpDecodePallete(cursor: Cursor, header: BmpHeader)
+    cursor.position = 14 + header.headerSize -- Pallete area
+
+	local numberOfColors = header.numberOfColors
+	if numberOfColors == 0 and header.colorDepth <= 8 then
+		numberOfColors = 2 ^ header.colorDepth -- 1-bit=2, 4-bit=16, 8-bit=256
+	end
+
+	local palette = buffer.create(numberOfColors * 4)
+	local s, res = pcall(function(...)
+        for i = 0, numberOfColors - 1 do
+            local index = i * 4
+
+            local bByte = cursor:ReadByte()
+            local gByte = cursor:ReadByte()
+            local rByte = cursor:ReadByte()
+
+
+            -- Skip Alpha! (not present here)
+            cursor:SkipBytes(1)
+
+            --BGR -> RGBA (No point converting to u32 here. 256 * 4 writes (worst case) isn't too much)
+            buffer.writeu8(palette, index, rByte) -- R
+            buffer.writeu8(palette, index + 1, gByte) -- G
+            buffer.writeu8(palette, index + 2, bByte) -- B
+            buffer.writeu8(palette, index + 3, 255) -- A
+	    end
+    end)
+
+    if not s then
+        local words = string.split(res, " ")
+        return Result.err(tonumber(words[#words]))
+    end
+
+	-- Start reading
+	cursor.position = header.pixelDataOffset
+
+	local dimensions = header.dimensions
+	local trueWidth, trueHeight = math.abs(dimensions.width), math.abs(dimensions.height)
+	local pixels = buffer.create(trueWidth * trueHeight * 4)
+
+	local bits = header.colorDepth
+    
+	s, res = pcall(colorDepthMap[bits], trueWidth, trueHeight, pixels, palette, cursor)
+	if not s then
+		local words = string.split(res, " ")
+        return Result.err(tonumber(words[#words]))
+	end
+
+    local isTopDown = dimensions.height < 0
+    if not isTopDown then
+        pixels = flipBuffer(trueWidth, trueHeight, pixels)
+    end
+    
+	return Result.okSmall(
+        trueWidth, trueHeight, pixels, header
+    )
+end
+
+function BmpDecodeTrueColor(cursor: Cursor, header: BmpHeader)
+    -- 15, 24, & 32 bit
+    -- 15 bit is stored as 5 bytes each with an extra 0 (16 bit)??? 
+
+    cursor.position = header.pixelDataOffset
+
+	local dimensions = header.dimensions
+	local trueWidth, trueHeight = math.abs(dimensions.width), math.abs(dimensions.height)
+	local pixels = buffer.create(trueWidth * trueHeight * 4)
+
+	local bits = header.colorDepth
+    
+    local s, res = pcall(colorDepthMap[bits], trueWidth, trueHeight, pixels, cursor, header)
+    if not s then
+		local words = string.split(res, " ")
+        return Result.err(tonumber(words[#words]))
+	end
+
+    local isTopDown = dimensions.height < 0
+    if not isTopDown then
+        pixels = flipBuffer(trueWidth, trueHeight, pixels)
+    end
+
+    return Result.okSmall(
+        trueWidth, trueHeight, pixels, header
+    )
+end
+
+function Bmp.decode(cursor: Cursor): ImageResult<DynamicImageTypes.DynamicImage<any>> -- Dw about the type
+	local header = Bmp.getHeader(cursor)
+	if not header.isOk then
+		return header -- No need to cast
+	end
+
+	local headerData = header:Unwrap()
+    if headerData.colorDepth > 32 or headerData.colorDepth ~= 32 and headerData.compressionType ~= 0 and headerData.colorDepth == 32 and (headerData.compressionType ~= 0 or headerData.compressionType ~= 3) then
+        return Result.err(ImageError.Unsupported)
+    end
+
+	-- Decode
+	if headerData.colorDepth <= 8 then
+		local res = BmpDecodePallete(cursor, headerData)
+        return Result.castSmallToDefault(res)
+	end
+
+	local res = BmpDecodeTrueColor(cursor, headerData)
+    return Result.castSmallToDefault(res)
+end
+
+function Bmp.encode(width: number, height: number, pixels: buffer)
+    local FILE_HEADER_SIZE = 14
+    local DIB_HEADER_SIZE = 40
+    local PIXEL_DATA_OFFSET = FILE_HEADER_SIZE + DIB_HEADER_SIZE
+    local BYTES_PER_PIXEL = 4
+
+    local rowSize = width * BYTES_PER_PIXEL
+    local fileSize = PIXEL_DATA_OFFSET + (rowSize * height)
+    local bmp = buffer.create(fileSize)
+
+    -- BITMAPFILEHEADER (14 bytes)
+    buffer.writeu8(bmp, 0, 0x42)  -- 'B'
+    buffer.writeu8(bmp, 1, 0x4D)  -- 'M'
+    buffer.writeu32(bmp, 2, fileSize)  -- File size
+    buffer.writeu32(bmp, 6, 0)
+    buffer.writeu32(bmp, 10, PIXEL_DATA_OFFSET)  -- Pixel data offset
+
+    -- BITMAPINFOHEADER (40 bytes)
+    buffer.writeu32(bmp, 14, DIB_HEADER_SIZE)  -- Header size
+    buffer.writeu32(bmp, 18, width)
+    buffer.writeu32(bmp, 22, height)
+    buffer.writeu16(bmp, 26, 1)  -- Planes
+    buffer.writeu16(bmp, 28, 32)  -- Bits per pixel
+    buffer.writeu32(bmp, 30, 3)  -- Compression (BI_BITFIELDS for alpha!!)
+    buffer.writeu32(bmp, 34, rowSize * height)  -- Image size
+    buffer.writeu32(bmp, 38, 0)  -- X pixels per mete
+    buffer.writeu32(bmp, 42, 0)  -- Y pixels per meter
+    buffer.writeu32(bmp, 46, 0)  -- Colors in palette
+    buffer.writeu32(bmp, 50, 0)  -- Important colors
+
+    -- (BGRA format, bottom-to-top)
+    for y = height - 1, 0, -1 do  -- Backwards
+        for x = 0, width - 1 do
+            local srcOffset = (y * width + x) * 4  -- RGBA source
+            local dstOffset = PIXEL_DATA_OFFSET + ((height - 1 - y) * rowSize) + (x * 4)
+
+            -- Reversed so you can't really use `u32`
+            buffer.writeu8(bmp, dstOffset,     buffer.readu8(pixels, srcOffset + 2))  -- B
+            buffer.writeu8(bmp, dstOffset + 1, buffer.readu8(pixels, srcOffset + 1))  -- G
+            buffer.writeu8(bmp, dstOffset + 2, buffer.readu8(pixels, srcOffset))      -- R
+            buffer.writeu8(bmp, dstOffset + 3, buffer.readu8(pixels, srcOffset + 3))  -- A
+        end
+    end
+
+    return bmp
+end
+
+return Bmp
+]])
+local _12 = mod("Jpeg", _11, [[
+local Reader = script.Parent
+local ImageReader = Reader.Parent
+local Cursor = require(ImageReader.Parent.Cursor)
+local ImageError = require(ImageReader.Parent.ImageError)
+local Result = require(ImageReader.Parent.Result)
+local ImageReaderStructs = require(ImageReader.structs)
+local DynamicImageTypes = require(ImageReader.Parent.DynamicImage.types)
+local Decoder = require(script.Decoder)
+local util = require(script.Parent.util)
+local t = require(script.types)
+
+type Result<T, E> = Result.Result<T, E>
+type ImageResult<T> = ImageError.ImageResult<T>
+type DynamicImage<T> = DynamicImageTypes.DynamicImage<T>
+type Dimensions = ImageReaderStructs.Dimensions
+type Cursor = Cursor.Cursor
+export type JpgHeader = t.JpgHeader
+
+local Jpg = {
+	canEncode = false,
+}
+
+function Jpg.getHeader(cursor: Cursor): ImageResult<JpgHeader>
+	local s, r = pcall(function(...)
+		-- cursor.buffer = util.RemoveFF00(cursor.buffer)
+		local isJpeg = Jpg.isFile(cursor)
+
+		if not isJpeg.isOk or isJpeg.isOk and not isJpeg:Unwrap() then
+			return Result.err(ImageError.Decoding)
+		end
+
+		cursor.position = 0
+		cursor:ExpectBytesRaw(0xff, 0xe0)
+		cursor:ExpectBytesRaw(0xff, 224)
+
+		local app0Length = util.beToLe16(cursor:ReadU16()) -- Includes these 2 bytes
+		cursor:SkipBytes(5) -- Skip "JFIF\0"
+		local versionMajor = cursor:ReadByte()
+		local versionMinor = cursor:ReadByte()
+		local densityUnits = cursor:ReadByte()
+		local xDensity = util.beToLe16(cursor:ReadU16())
+		local yDensity = util.beToLe16(cursor:ReadU16())
+		local thumbWidth = cursor:ReadByte()
+		local thumbHeight = cursor:ReadByte()
+
+		local bytesReadSoFar = 16
+
+		if app0Length > bytesReadSoFar then
+			cursor:SkipBytes(app0Length - bytesReadSoFar)
+		end
+
+		-- Don't use `GetDimensions`!
+		local originalPosition = cursor.position
+		while true do
+			local marker = util.beToLe16(cursor:ReadU16())
+
+			if marker == 0xFFC0 or marker == 0xFFC2 then
+				local length = util.beToLe16(cursor:ReadU16())
+				local precision = cursor:ReadByte()
+				local height = util.beToLe16(cursor:ReadU16())
+				local width = util.beToLe16(cursor:ReadU16())
+				local componentCount = cursor:ReadByte()
+				cursor:SkipBytes((length - 2) - 6)
+
+				cursor.position = originalPosition
+				return Result.ok({
+					dimensions = {
+						width = width,
+						height = height,
+					},
+					componentCount = componentCount,
+					precision = precision,
+					versionMajor = versionMajor,
+					versionMinor = versionMinor,
+					density = densityUnits,
+					xDensity = xDensity,
+					yDensity = yDensity,
+					thumbnailWidth = thumbWidth,
+					thumbnailHeight = thumbHeight,
+				})
+			else
+				local length = util.beToLe16(cursor:ReadU16())
+				cursor:SkipBytes(length - 2)
+			end
+		end
+	end)
+
+	if not s then
+		return Result.err(ImageError.Decoding)
+	end
+
+	return r
+end
+
+function Jpg.getDimensions(cursor: Cursor): ImageResult<Dimensions>
+	local s, r = pcall(function(...)
+		cursor.position = 4
+		local app0Len = util.beToLe16(cursor:ReadU16())
+		cursor:SkipBytes(app0Len - 2)
+
+		while true do
+			local marker = util.beToLe16(cursor:ReadU16())
+
+			if marker == 0xFFC0 or marker == 0xFFC2 then
+				if marker == 0xFFC2 then
+					return Result.err(ImageError.Unsupported)
+				end
+
+				cursor:SkipBytes(2)
+				cursor:SkipBytes(1)
+
+				local height = util.beToLe16(cursor:ReadU16())
+				local width = util.beToLe16(cursor:ReadU16())
+
+				return Result.ok({
+					width = width,
+					height = height,
+				})
+			else
+				local length = util.beToLe16(cursor:ReadU16())
+				cursor:SkipBytes(length - 2)
+			end
+		end
+	end)
+
+	if not s then
+		return Result.err(ImageError.Decoding)
+	end
+
+	return r
+end
+
+function Jpg.isFile(cursor: Cursor)
+	local s, r = pcall(function(...)
+		cursor.position = 6
+		return Result.ok(cursor:ExpectBytes("JFIF\0"))
+	end)
+
+	if not s then
+		return Result.err(ImageError.Decoding)
+	end
+
+	return r
+end
+
+function Jpg.decode(cursor: Cursor)
+	-- TODO: pcall!
+	local header = Jpg.getHeader(cursor):Unwrap()
+    local s, bfr = pcall(function()
+        local by = string.split(buffer.tostring(cursor.buffer), "")
+        for i, str in by do
+            by[i] = string.byte(str)
+        end
+        return Decoder.decode(by)
+    end)
+    
+    if s then
+        if not bfr.isOk then
+            return Result.castSmallToDefault(bfr)
+        end
+
+        return Result.ok(header.dimensions.width, header.dimensions.height, bfr.value, header)
+    end
+
+	return Result.err(ImageError.Decoding)
+end
+
+return Jpg
+]])
+local _13 = mod("Decoder", _12, [[
+local JPEG = {}
+
+local HUFFMAN_MODULE = require(script.HuffmanTable)
+local BITSTREAM_MODULE = require(script.BitStream)
+local util = require(script.Parent.Parent.util)
+local ImageError = require(script.Parent.Parent.Parent.Parent.ImageError)
+local Result = require(script.Parent.Parent.Parent.Parent.Result)
+
+local RUN_SERVICE = game:GetService("RunService")
+
+local PREVENT_TIMEOUT_INTERVAL = 50
+
+-- Supported modes
+local supportedModes =
+	{ -- If a mode is not supported (set to false) then the module will simply return and say that the mode isn't supported, in short, it won't bother decoding it.
+		[0xC0] = true, -- "Start Of Frame 0"
+		[0xC1] = true, -- "Start Of Frame 1"
+		[0xC2] = true, -- "Start Of Frame 2"
+		[0xC3] = false, -- "Start Of Frame 3"
+		[0xC5] = false, -- "Start Of Frame 5"
+		[0xC6] = false, -- "Start Of Frame 6"
+		[0xC7] = false, -- "Start Of Frame 7"
+		[0xC9] = false, -- "Start Of Frame 9"
+		[0xCA] = false, -- "Start Of Frame 10"
+		[0xCB] = false, -- "Start Of Frame 11"
+		[0xCD] = false, -- "Start Of Frame 13"
+		[0xCE] = false, -- "Start Of Frame 14"
+		[0xCF] = false, -- "Start Of Frame 15"
+	}
+
+-- Create idct LUT
+local idctTable = {}
+
+local function NormCoeff(n)
+	if n == 0 then
+		return math.sqrt(1 / 8)
+	else
+		return math.sqrt(2 / 8)
+	end
+end
+
+for i = 0, 7 do
+	for j = 0, 7 do
+		local grid = {}
+
+		for y = 0, 7 do
+			for x = 0, 7 do
+				local nn = NormCoeff(j) * math.cos(j * math.pi * (x + 0.5) / 8)
+				local mm = NormCoeff(i) * math.cos(i * math.pi * (y + 0.5) / 8)
+
+				grid[x * 8 + y + 1] = nn * mm
+			end
+		end
+
+		idctTable[i * 8 + j + 1] = grid
+	end
+end
+
+-- Zigzag LUTs
+local zigzag1D = {
+	1,
+	2,
+	9,
+	17,
+	10,
+	3,
+	4,
+	11,
+	18,
+	25,
+	33,
+	26,
+	19,
+	12,
+	5,
+	6,
+	13,
+	20,
+	27,
+	34,
+	41,
+	49,
+	42,
+	35,
+	28,
+	21,
+	14,
+	7,
+	8,
+	15,
+	22,
+	29,
+	36,
+	43,
+	50,
+	57,
+	58,
+	51,
+	44,
+	37,
+	30,
+	23,
+	16,
+	24,
+	31,
+	38,
+	45,
+	52,
+	59,
+	60,
+	53,
+	46,
+	39,
+	32,
+	40,
+	47,
+	54,
+	61,
+	62,
+	55,
+	48,
+	56,
+	63,
+	64,
+}
+
+local zigzag2D = {
+	{ 1, 2, 6, 7, 15, 16, 28, 29 },
+	{ 3, 5, 8, 14, 17, 27, 30, 43 },
+	{ 4, 9, 13, 18, 26, 31, 42, 44 },
+	{ 10, 12, 19, 25, 32, 41, 45, 54 },
+	{ 11, 20, 24, 33, 40, 47, 53, 55 },
+	{ 21, 23, 34, 39, 47, 52, 56, 61 },
+	{ 22, 35, 38, 48, 51, 57, 60, 62 },
+	{ 36, 37, 49, 50, 58, 59, 63, 64 },
+}
+
+-- Useful functions
+local function CombineTwoBytes(high, low)
+	return bit32.lshift(high, 8) + low
+end
+
+local function DecodeNumber(code, bits)
+	local l = math.pow(2, code - 1)
+
+	if bits >= l then
+		return bits
+	else
+		return bits - (2 * l - 1)
+	end
+end
+
+local function BitwiseHandleOverflow(x)
+	if x > 4000000000 then
+		return x - 4294967296
+	else
+		return x
+	end
+end
+
+function JPEG.decode(rawInputBytes)
+	local jpeg = {}
+
+	jpeg.ImageData = {}
+
+	jpeg.QuantisationTables = {}
+	jpeg.HuffmanDCTables = {}
+	jpeg.HuffmanACTables = {}
+
+	jpeg.ImageWidth = 0
+	jpeg.ImageHeight = 0
+
+	jpeg.MCUCountX = 0
+	jpeg.MCUCountY = 0
+
+	jpeg.MaxVerticalSampleFactor = 0
+	jpeg.MaxHorizontalSampleFactor = 0
+
+	jpeg.FrameType = 0 -- The marker from start of frame, e.g 0xC0 = SOF0 (baseline), 0xC2 = SOF2 (progressive)
+	jpeg.RestartInterval = 0
+	jpeg.Precision = 8
+
+	jpeg.ComponentCount = 0
+	jpeg.ColorComponents = {}
+
+	local colorTransform = 0
+
+	local mcus = {}
+	local eobRun = 0
+	local previousDCs = { 0, 0, 0, 0 }
+
+	local addOneToSelector = false -- Prevents zero index because this is Lua
+
+	-- 'pos' will index the first byte in 'bytes' after the length information
+
+	local function APPn(marker, pos, bytes)
+		local payloadLength = CombineTwoBytes(bytes[pos - 2], bytes[pos - 1])
+
+		if marker == 0xEE and payloadLength >= 12 then
+			local i = pos
+
+			if
+				bytes[i] == 65
+				and bytes[i + 1] == 100
+				and bytes[i + 2] == 111
+				and bytes[i + 3] == 98
+				and bytes[i + 4] == 101
+			then
+				colorTransform = bytes[i + 11]
+			end
+		end
+
+		return payloadLength
+	end
+
+	local function COM(marker, pos, bytes)
+		local payloadLength = CombineTwoBytes(bytes[pos - 2], bytes[pos - 1])
+		return payloadLength
+	end
+
+	local function DQT(marker, pos, bytes)
+		local payloadLength = CombineTwoBytes(bytes[pos - 2], bytes[pos - 1])
+
+		local i = 0
+		while bytes[pos + i] ~= 0xFF do
+			local precision = bit32.rshift(bytes[pos + i], 4)
+			local identifier = bit32.band(bytes[pos + i], 0x0F)
+
+			local quant = {}
+
+			if precision == 1 then
+				for j = 1, 64 do
+					local highByte = bytes[pos + i + 1]
+					local lowByte = bytes[pos + i + 2]
+
+					local value = CombineTwoBytes(highByte, lowByte)
+					table.insert(quant, value)
+
+					i = i + 2
+				end
+			else
+				for j = 1, 64 do
+					i = i + 1
+					table.insert(quant, bytes[pos + i])
+				end
+			end
+
+			-- Add it to the global variable
+			jpeg.QuantisationTables[identifier + 1] = quant
+
+			i = i + 1
+		end
+
+		return payloadLength
+	end
+
+	local function DHT(marker, pos, bytes)
+		local payloadLength = CombineTwoBytes(bytes[pos - 2], bytes[pos - 1])
+
+		-- Create huffman table
+		local function GetCodesFromLengths(lengths) -- Creates the codes used to traverse the huffman tree given the lengths in the jpeg binary
+			local codes = {}
+
+			local codeCandidate = 0
+
+			for bitLength = 1, #lengths do
+				local length = lengths[bitLength]
+
+				for i = 1, length do
+					table.insert(codes, { codeCandidate, bitLength })
+
+					codeCandidate = codeCandidate + 1
+				end
+
+				codeCandidate = bit32.lshift(codeCandidate, 1)
+			end
+
+			return codes
+		end
+
+		-- Extract class and destination
+		local i = 0
+
+		while i < payloadLength - 2 do -- Subtract 2 because payload length includes length information
+			local classAndDestination = bytes[pos + i] -- This will be used to index jpeg.HuffmanTables
+
+			local class = bit32.band(bit32.rshift(classAndDestination, 4), 0x0F) -- 0 = DC, 1 = AC
+			local destination = bit32.band(classAndDestination, 0x0F) -- 0 = Luminace, 1 = Chrominance
+
+			-- Extract information
+			local symbols = {}
+			local lengths = {}
+			local symbolsSorted = {}
+
+			-- Extract lengths
+			for j = 1, 16 do
+				i = i + 1
+				table.insert(lengths, bytes[pos + i])
+			end
+
+			-- Extract symbols
+			for j, length in pairs(lengths) do
+				symbolsSorted[j] = {}
+
+				for k = 1, length do
+					i = i + 1
+					local symbol = bytes[pos + i]
+
+					table.insert(symbols, symbol)
+					symbolsSorted[j][k] = symbol
+				end
+			end
+
+			i = i + 1
+
+			for i, info in pairs(GetCodesFromLengths(lengths)) do
+				local code = info[1]
+				local bitLength = info[2]
+
+				local str = ""
+				local c = code
+
+				for i = 1, bitLength do
+					local bit = bit32.band(c, 1)
+					c = bit32.rshift(c, 1)
+
+					str = str .. bit
+				end
+			end
+
+			local huffmanTable = HUFFMAN_MODULE.CreateHuffmanTable()
+			HUFFMAN_MODULE.ConstructTree(huffmanTable, lengths, symbols)
+
+			if class == 0 then -- DC
+				jpeg.HuffmanDCTables[destination + 1] = huffmanTable
+			elseif class == 1 then -- AC
+				jpeg.HuffmanACTables[destination + 1] = huffmanTable
+			end
+		end
+
+		return payloadLength
+	end
+
+	local function DRI(marker, pos, bytes)
+		local payloadLength = CombineTwoBytes(bytes[pos - 2], bytes[pos - 1])
+
+		local interval = CombineTwoBytes(bytes[pos], bytes[pos + 1]) --CombineTwoBytes(bytes[2], bytes[3])
+		jpeg.RestartInterval = interval
+
+		return payloadLength
+	end
+
+	local function SOFn(marker, pos, bytes)
+		if not supportedModes[marker] then
+			error("")
+		end
+
+		local payloadLength = CombineTwoBytes(bytes[pos - 2], bytes[pos - 1])
+
+		-- Read information
+		local precision = bytes[pos]
+		local lineNumber = CombineTwoBytes(bytes[pos + 1], bytes[pos + 2]) -- aka height
+		local samplesPerLine = CombineTwoBytes(bytes[pos + 3], bytes[pos + 4]) -- aka width
+		local componentCount = bytes[pos + 5]
+
+		jpeg.ImageWidth = samplesPerLine
+		jpeg.ImageHeight = lineNumber
+		jpeg.Precision = precision
+		jpeg.ComponentCount = componentCount
+		jpeg.FrameType = marker
+
+		jpeg.MCUCountX = math.floor((jpeg.ImageWidth - 1) / 8)
+		jpeg.MCUCountY = math.floor((jpeg.ImageHeight - 1) / 8)
+
+		-- Fill in image with blank data
+		for x = 1, jpeg.ImageWidth do
+			jpeg.ImageData[x] = {}
+
+			for y = 1, jpeg.ImageHeight do
+				jpeg.ImageData[x][y] = { 0, 0, 0 }
+			end
+		end
+
+		-- Create mcus
+		for x = 1, jpeg.MCUCountX + 8 do
+			mcus[x] = {}
+			for y = 1, jpeg.MCUCountY + 8 do
+				mcus[x][y] = {}
+				for i = 1, componentCount do
+					mcus[x][y][i] = table.create(64, 0)
+				end
+			end
+		end
+
+		for id = 0, componentCount - 1 do
+			local componentId = bytes[pos + 6 + (id * 3)]
+			local sampleFactor = bytes[pos + 7 + (id * 3)]
+			local quantTableId = bytes[pos + 8 + (id * 3)]
+
+			if addOneToSelector then
+				componentId = componentId + 1
+			end
+
+			if componentId == 0 then
+				addOneToSelector = true
+				componentId = componentId + 1
+			end
+
+			local horizontalSample = bit32.band(bit32.rshift(sampleFactor, 4), 0x0F)
+			local verticalSample = bit32.band(sampleFactor, 0x0F)
+
+			jpeg.MaxHorizontalSampleFactor = math.max(jpeg.MaxHorizontalSampleFactor, horizontalSample)
+			jpeg.MaxVerticalSampleFactor = math.max(jpeg.MaxVerticalSampleFactor, verticalSample)
+
+			jpeg.ColorComponents[componentId] = {}
+			jpeg.ColorComponents[componentId].ID = id + 1
+			jpeg.ColorComponents[componentId].HorizontalSamplingFactor = horizontalSample
+			jpeg.ColorComponents[componentId].VerticalSamplingFactor = verticalSample
+			jpeg.ColorComponents[componentId].QuantSelection = quantTableId
+		end
+
+		return payloadLength
+	end
+
+	local function SOS(marker, pos, bytes)
+		local componentCount = bytes[pos]
+		local offset = 1
+
+		local loopComponents = {}
+
+		for i = 0, componentCount - 1 do
+			local selector = bytes[pos + offset]
+
+			local huffmanId = bytes[pos + offset + 1]
+			local DCTableID = bit32.band(bit32.rshift(huffmanId, 4), 0x0F)
+			local ACTableID = bit32.band(huffmanId, 0x0F)
+
+			if addOneToSelector then
+				selector = selector + 1
+			end
+
+			local component = {}
+			component.ID = selector
+			component.HuffmanDCTableID = DCTableID + 1
+			component.HuffmanACTableID = ACTableID + 1
+			component.HorizontalSample = jpeg.ColorComponents[selector].HorizontalSamplingFactor
+			component.VerticalSample = jpeg.ColorComponents[selector].VerticalSamplingFactor
+
+			local quantSelection = jpeg.ColorComponents[selector].QuantSelection + 1
+			component.QuantisationTable = jpeg.QuantisationTables[quantSelection]
+
+			table.insert(loopComponents, component)
+
+			offset = offset + 2
+		end
+
+		local successiveApproximation = bytes[pos + offset + 2]
+		local ss = bytes[pos + offset] -- Spectral start
+		local se = bytes[pos + offset + 1] -- Spectral end
+		local ah = bit32.band(bit32.rshift(successiveApproximation, 4), 0x0F) -- Successive Approximation low part of byte
+		local al = bit32.band(successiveApproximation, 0x0F) -- Successive Approximation low part of byte
+
+		-- Create scan data by removing stuff bytes and restart markers from inside it
+		local scanData = {}
+
+		do
+			local i = pos + offset + 2
+			local bytesToSkip = 0
+
+			while true do
+				i = i + 1
+
+				if bytesToSkip > 0 then
+					bytesToSkip = bytesToSkip - 1
+					continue
+				end
+
+				local byte = bytes[i]
+				local nextByte = bytes[i + 1]
+
+				if byte == 0xFF then
+					if nextByte >= 0xD0 and nextByte <= 0xD7 then
+						bytesToSkip = bytesToSkip + 1
+						continue
+					elseif nextByte == 0x00 then
+						bytesToSkip = bytesToSkip + 1
+						table.insert(scanData, byte)
+						continue
+					else -- Probably another marker
+						break
+					end
+				end
+
+				table.insert(scanData, byte)
+
+				if nextByte == nil then
+					break
+				end
+			end
+			
+		end
+
+		-- Make bit stream from scan data that will be used for huffman decoding
+		local bitStream = BITSTREAM_MODULE.CreateBitStream(scanData)
+
+		local mcuCountX = math.floor((jpeg.ImageWidth - 1) / 8)
+		local mcuCountY = math.floor((jpeg.ImageHeight - 1) / 8)
+
+		local maxHorizontalSample = jpeg.MaxHorizontalSampleFactor
+		local maxVerticalSample = jpeg.MaxVerticalSampleFactor
+
+		local restartInterval = jpeg.RestartInterval
+		local restartCount = restartInterval
+
+		local decodedMCUCount = 0
+
+		-- Function used for decoding individual MCUs in baseline mode
+		local function BaselineDecodeMCUComponent(mcu, component)
+			-- Decode DC component
+			local code = HUFFMAN_MODULE.GetCode(jpeg.HuffmanDCTables[component.HuffmanDCTableID], bitStream)
+
+			local actualID = jpeg.ColorComponents[component.ID].ID
+			local prevDC = previousDCs[actualID]
+
+			if prevDC == nil then
+				prevDC = 0
+			end
+
+			local bits = bitStream.ReadBits(code)
+			local dccoeff = DecodeNumber(code, bits) + prevDC
+
+			previousDCs[actualID] = dccoeff -- Set previous DC
+
+			mcu[1] = dccoeff
+
+			local huffmanTable = jpeg.HuffmanACTables[component.HuffmanACTableID]
+
+			-- Decode AC components
+			local i = 1
+			while i < 64 do
+				code = HUFFMAN_MODULE.GetCode(huffmanTable, bitStream)
+
+				if code == 0 then
+					return
+				end
+
+				if code > 16 then -- AC table
+					i = i + bit32.rshift(code, 4) -- Num zeros which we skip
+					code = bit32.band(code, 0x0F)
+				end
+
+				bits = bitStream.ReadBits(code)
+
+				if i < 64 then
+					i = i + 1
+
+					local accoeff = DecodeNumber(code, bits)
+					mcu[i] = accoeff
+				end
+			end
+		end
+
+		-- Functions used for decoding parts of individual MCUs in progressive mode
+		local function Extend(additional, magnitude)
+			local vt = BitwiseHandleOverflow(bit32.lshift(1, magnitude - 1))
+
+			if additional < vt then
+				return additional + BitwiseHandleOverflow(bit32.lshift(-1, magnitude)) + 1
+			else
+				return additional
+			end
+		end
+
+		local function RefineAC(coeff)
+			if coeff > 0 then
+				if bitStream.ReadBit() == 1 then
+					return coeff + BitwiseHandleOverflow(bit32.lshift(1, al))
+				end
+			elseif coeff < 0 then
+				if bitStream.ReadBit() == 1 then
+					return coeff + BitwiseHandleOverflow(bit32.lshift(-1, al))
+				end
+			end
+
+			return coeff
+		end
+
+		local function DecodeDCProgressiveFirstPerBlock(mcu, component)
+			local size = HUFFMAN_MODULE.GetCode(jpeg.HuffmanDCTables[component.HuffmanDCTableID], bitStream)
+			local bits = bitStream.ReadBits(size)
+
+			local dcValue = Extend(bits, size) + previousDCs[component.ID]
+			previousDCs[component.ID] = dcValue -- Set previous DC
+
+			mcu[1] = BitwiseHandleOverflow(bit32.lshift(dcValue, al))
+		end
+
+		local function DecodeDCProgressiveRefinePerBlock(mcu, component)
+			local bit = bitStream.ReadBit()
+
+			local leftShiftedBit = BitwiseHandleOverflow(bit32.lshift(bit, al))
+			mcu[1] = BitwiseHandleOverflow(bit32.bor(mcu[1], leftShiftedBit))
+		end
+
+		local function DecodeACProgressiveFirstPerBlock(mcu, component)
+			if eobRun > 0 then
+				eobRun = eobRun - 1
+				return
+			end
+
+			local huffmanTable = jpeg.HuffmanACTables[component.HuffmanACTableID]
+
+			local i = ss
+			while i <= se do
+				local symbol = HUFFMAN_MODULE.GetCode(huffmanTable, bitStream)
+
+				local runLength = bit32.rshift(symbol, 4)
+				local size = bit32.band(symbol, 0x0F)
+
+				if size == 0 then
+					if runLength == 15 then
+						i = i + 16
+					else
+						eobRun = bitStream.ReadBits(runLength) + math.pow(2, runLength) - 1
+						return
+					end
+				else
+					i = i + runLength + 1
+
+					local bits = bitStream.ReadBits(size)
+
+					local value = Extend(bits, size)
+					value = bit32.lshift(value, al)
+					value = BitwiseHandleOverflow(value)
+
+					mcu[i] = value
+				end
+			end
+		end
+
+		local function DecodeACProgressiveRefinePerBlock(mcu, component)
+			local i = ss
+
+			if eobRun > 0 then
+				while i <= se do
+					if mcu[i + 1] ~= 0 then
+						mcu[i + 1] = RefineAC(mcu[i + 1])
+					end
+
+					i = i + 1
+				end
+
+				eobRun = eobRun - 1
+				return
+			end
+
+			local huffmanTable = jpeg.HuffmanACTables[component.HuffmanACTableID]
+
+			while i <= se do
+				local symbol = HUFFMAN_MODULE.GetCode(huffmanTable, bitStream)
+
+				local runLength = bit32.rshift(symbol, 4)
+				local size = symbol % 16
+
+				if size == 1 then
+					local value = Extend(bitStream.ReadBits(size), size)
+					value = BitwiseHandleOverflow(bit32.lshift(value, al))
+
+					while (runLength > 0 or mcu[i + 1] ~= 0) and i < se do
+						i = i + 1
+
+						if mcu[i] ~= 0 then
+							mcu[i] = RefineAC(mcu[i])
+						else
+							runLength = runLength - 1
+						end
+					end
+
+					i = i + 1
+					mcu[i] = value
+				elseif size == 0 then
+					if runLength < 15 then
+						local newEOBrun = bitStream.ReadBits(runLength)
+							+ BitwiseHandleOverflow(bit32.lshift(1, runLength))
+
+						while i <= se and i < se do
+							i = i + 1
+
+							if mcu[i] ~= 0 then
+								mcu[i] = RefineAC(mcu[i])
+							end
+						end
+
+						eobRun = newEOBrun - 1
+						return
+					else
+						while runLength >= 0 and i < se do
+							i = i + 1
+
+							if mcu[i] ~= 0 then
+								mcu[i] = RefineAC(mcu[i])
+							else
+								runLength = runLength - 1
+							end
+						end
+					end
+				else
+					i = i + 1
+				end
+			end
+		end
+
+		-- Main progressive jpeg decoding functions
+		local function DecodeDCProgressiveFirst()
+			if componentCount > 1 then -- Interleaved
+				for y = 0, mcuCountY, maxVerticalSample do
+					for x = 0, mcuCountX, maxHorizontalSample do
+						for _, component in pairs(loopComponents) do
+							for v = 0, component.VerticalSample - 1 do
+								for h = 0, component.HorizontalSample - 1 do
+									local mcuX = x + h + 1
+									local mcuY = y + v + 1
+
+									DecodeDCProgressiveFirstPerBlock(mcus[mcuX][mcuY][component.ID], component)
+								end
+							end
+						end
+					end
+
+					if y % PREVENT_TIMEOUT_INTERVAL == 0 then
+							RUN_SERVICE.Stepped:Wait()
+						end
+				end
+			else -- For non-interleaved (one component) we do this
+				local component = loopComponents[1]
+
+				for y = 0, mcuCountY, 3 - component.VerticalSample do
+					for x = 0, mcuCountX, 3 - component.HorizontalSample do
+						local mcuX = x + 1
+						local mcuY = y + 1
+
+						DecodeDCProgressiveFirstPerBlock(mcus[mcuX][mcuY][component.ID], component)
+					end
+
+					if y % PREVENT_TIMEOUT_INTERVAL == 0 then
+							RUN_SERVICE.Stepped:Wait()
+						end
+				end
+			end
+		end
+
+		local function DecodeDCProgressiveRefine()
+			for y = 0, mcuCountY, maxVerticalSample do
+				for x = 0, mcuCountX, maxHorizontalSample do
+					for _, component in pairs(loopComponents) do
+						local verticalSample = component.VerticalSample
+						local horizontalSample = component.HorizontalSample
+
+						for v = 0, verticalSample - 1 do
+							for h = 0, horizontalSample - 1 do
+								local mcuX = x + h + 1
+								local mcuY = y + v + 1
+
+								DecodeDCProgressiveRefinePerBlock(mcus[mcuX][mcuY][component.ID], component)
+							end
+						end
+					end
+				end
+
+				if y % PREVENT_TIMEOUT_INTERVAL == 0 then
+						RUN_SERVICE.Stepped:Wait()
+					end
+			end
+		end
+
+		local function DecodeACProgressiveFirst()
+			local component = loopComponents[1]
+
+			local subtractFromX = 2
+			local subtractFromY = 2
+
+			if maxHorizontalSample == 2 then
+				subtractFromX = 3
+			end
+			if maxVerticalSample == 2 then
+				subtractFromY = 3
+			end
+
+			for y = 0, mcuCountY, subtractFromY - component.VerticalSample do
+				for x = 0, mcuCountX, subtractFromX - component.HorizontalSample do
+					local mcuX = x + 1
+					local mcuY = y + 1
+
+					DecodeACProgressiveFirstPerBlock(mcus[mcuX][mcuY][component.ID], component)
+				end
+
+				if y % PREVENT_TIMEOUT_INTERVAL == 0 then
+						RUN_SERVICE.Stepped:Wait()
+					end
+			end
+		end
+
+		local function DecodeACProgressiveRefine()
+			local component = loopComponents[1]
+
+			local subtractFromX = 2
+			local subtractFromY = 2
+
+			if maxHorizontalSample == 2 then
+				subtractFromX = 3
+			end
+			if maxVerticalSample == 2 then
+				subtractFromY = 3
+			end
+
+			for y = 0, mcuCountY, subtractFromY - component.VerticalSample do
+				for x = 0, mcuCountX, subtractFromX - component.HorizontalSample do
+					local mcuX = x + 1
+					local mcuY = y + 1
+
+					DecodeACProgressiveRefinePerBlock(mcus[mcuX][mcuY][component.ID], component)
+				end
+
+				if y % PREVENT_TIMEOUT_INTERVAL == 0 then
+						RUN_SERVICE.Stepped:Wait()
+					end
+			end
+		end
+
+		-- Decode baseline jpegs
+		if jpeg.FrameType == 0xC0 then
+			
+			for y = 0, mcuCountY, maxVerticalSample do
+				for x = 0, mcuCountX, maxHorizontalSample do
+					for i, component in pairs(loopComponents) do
+						local componentId = i
+						local quantisationTable = component.QuantisationTable
+						local horizontalSample = component.HorizontalSample
+						local verticalSample = component.VerticalSample
+
+						for v = 0, verticalSample - 1 do
+							for h = 0, horizontalSample - 1 do
+								local mcuX = x + h + 1
+								local mcuY = y + v + 1
+
+								BaselineDecodeMCUComponent(mcus[mcuX][mcuY][componentId], component)
+							end
+						end
+
+						decodedMCUCount = decodedMCUCount + (verticalSample * horizontalSample)
+					end
+
+					-- Restart Interval
+					if restartInterval ~= 0 then
+						restartCount = restartCount - 1
+
+						if restartCount == 0 then
+							restartCount = restartInterval
+
+							previousDCs = { 0, 0, 0 }
+							bitStream.Align()
+						end
+					end
+				end
+
+				-- if y % PREVENT_TIMEOUT_INTERVAL == 0 then
+				-- 		RUN_SERVICE.Stepped:Wait()
+				-- 	end
+			end
+		end
+
+		-- Decode progressive jpegs
+		if jpeg.FrameType == 0xC2 then
+			-- Validation checks
+			-- Decode
+			if ss == 0 and se == 0 then
+				if ah == 0 then
+					DecodeDCProgressiveFirst()
+				else
+					DecodeDCProgressiveRefine()
+				end
+			else
+				if ah == 0 then
+					DecodeACProgressiveFirst()
+				else
+					DecodeACProgressiveRefine()
+				end
+			end
+		end
+	end
+
+	local markerProcedures = {
+		[0xC0] = SOFn, -- SOF0  [Baseline DCT]
+		[0xC1] = SOFn, -- SOF1  [Extended Sequential DCT]
+		[0xC2] = SOFn, -- SOF2  [Progressive DCT]
+		[0xC3] = SOFn, -- SOF3  [Lossless (sequential)]
+		[0xC4] = DHT, -- DHT   [Define Huffman Table]
+		[0xC5] = SOFn, -- SOF5  [Differential sequential DCT]
+		[0xC6] = SOFn, -- SOF6  [Differential progressive DCT]
+		[0xC7] = SOFn, -- SOF7  [Differential lossless (sequential)]
+		[0xC8] = "Print", -- JPG   [Reserved for JPEG extensions]
+		[0xC9] = SOFn, -- SOF9  [Extended sequential DCT]
+		[0xCA] = SOFn, -- SOF10 [Progressive DCT]
+		[0xCB] = SOFn, -- SOF11 [Lossless (sequential)]
+		[0xCC] = "Print", -- DAC   [Define arithmetic coding conditioning(s)]
+		[0xCD] = SOFn, -- SOF13 [Differential sequential DCT]
+		[0xCE] = SOFn, -- SOF14 [Differential progressive DCT]
+		[0xCF] = SOFn, -- SOF15 [Differential lossless (sequential)]
+		[0xD0] = "Print", -- RSTm* [Restart with modulo 8 count "m"]
+		[0xD1] = "Print", -- RSTm* [Restart with modulo 8 count "m"]
+		[0xD2] = "Print", -- RSTm* [Restart with modulo 8 count "m"]
+		[0xD3] = "Print", -- RSTm* [Restart with modulo 8 count "m"]
+		[0xD4] = "Print", -- RSTm* [Restart with modulo 8 count "m"]
+		[0xD5] = "Print", -- RSTm* [Restart with modulo 8 count "m"]
+		[0xD6] = "Print", -- RSTm* [Restart with modulo 8 count "m"]
+		[0xD7] = "Print", -- RSTm* [Restart with modulo 8 count "m"]
+		[0xD8] = "Print", -- SOI  [Start of image]
+		[0xD9] = "Print", -- EOI  [End of image]
+		[0xDA] = SOS, -- SOS   [Start of scan]
+		[0xDB] = DQT, -- DQT   [Define quantisation table(s)]
+		[0xDC] = "Print", -- DNL   [Define number of lines]
+		[0xDD] = DRI, -- DRI   [Define restart interval]
+		[0xDE] = "Print", -- DHP   [Define hierarchical progression]
+		[0xDF] = "Print", -- EXP   [Expand reference components(s)]
+		[0xE0] = APPn, -- APP0  [Application segments 0xE0->0xEF]
+		[0xE1] = APPn, -- APP1
+		[0xE2] = APPn, -- APP2
+		[0xE3] = APPn, -- APP3
+		[0xE4] = APPn, -- APP4
+		[0xE5] = APPn, -- APP5
+		[0xE6] = APPn, -- APP6
+		[0xE7] = APPn, -- APP7
+		[0xE8] = APPn, -- APP8
+		[0xE9] = APPn, -- APP9
+		[0xEA] = APPn, -- APP10
+		[0xEB] = APPn, -- APP11
+		[0xEC] = APPn, -- APP12
+		[0xED] = APPn, -- APP13
+		[0xEE] = APPn, -- APP14
+		[0xEF] = APPn, -- APP15
+		[0xF0] = "Print", -- JPG0  [JPG segments 0xF0->0xFD]
+		[0xF1] = "Print", -- JPG1
+		[0xF2] = "Print", -- JPG2
+		[0xF3] = "Print", -- JPG3
+		[0xF4] = "Print", -- JPG4
+		[0xF5] = "Print", -- JPG5
+		[0xF6] = "Print", -- JPG6
+		[0xF7] = "Print", -- JPG7
+		[0xF8] = "Print", -- JPG8
+		[0xF9] = "Print", -- JPG9
+		[0xFA] = "Print", -- JPG10
+		[0xFB] = "Print", -- JPG11
+		[0xFC] = "Print", -- JPG12
+		[0xFD] = "Print", -- JPG13
+		[0xFE] = COM, -- COM [Comment]
+	}
+
+	local bytes = rawInputBytes
+	local skipCount = 0
+
+	local scanCount = 0
+
+	for pos = 1, #bytes - 1 do
+		local byte = bytes[pos]
+		local nextByte = bytes[pos + 1]
+
+		if skipCount > 0 then
+			skipCount = skipCount - 1
+			continue
+		end
+
+		if byte ~= 0xFF then -- Skip unless there is a possible marker, scanning and stuff will be dealt with inside functions
+			continue
+		end
+
+		if nextByte == 0x00 then
+			continue
+		end
+		
+		-- nextByte is the marker
+		
+		local procedure = markerProcedures[nextByte]
+
+		if procedure == nil then
+			continue
+		elseif type(procedure) == "string" then
+			continue
+		end
+
+		-- Procedure
+
+		local returnValue = procedure(nextByte, pos + 4, bytes)
+
+		if returnValue then
+			-- Return incase jpeg is not supported
+			if returnValue == type("table") and not returnValue.isOk then
+				return returnValue
+			elseif type(returnValue) == "number" then
+				-- Skip bytes
+				skipCount = skipCount + returnValue
+			end
+		end
+
+		-- For debugging
+		if nextByte == 0xDA then
+			scanCount = scanCount + 1
+		end
+
+		if scanCount == 1000000 then
+			break
+		end
+	end
+
+	local iLimit = (8 * jpeg.MaxVerticalSampleFactor) - 1
+	local jLimit = (8 * jpeg.MaxHorizontalSampleFactor) - 1
+
+	local subtractFromX = 2
+	local subtractFromY = 2
+
+	if jpeg.MaxHorizontalSampleFactor == 2 then
+		subtractFromX = 3
+	end
+	if jpeg.MaxVerticalSampleFactor == 2 then
+		subtractFromY = 3
+	end
+
+	for component, _ in pairs(jpeg.ColorComponents) do
+		local actualID = jpeg.ColorComponents[component].ID
+		local componentHorizontalSample = jpeg.ColorComponents[component].HorizontalSamplingFactor
+		local componentVerticalSample = jpeg.ColorComponents[component].VerticalSamplingFactor
+		local quantSelection = jpeg.ColorComponents[component].QuantSelection
+		local quantisationTable = jpeg.QuantisationTables[quantSelection + 1]
+
+		for y = 0, jpeg.MCUCountY, jpeg.MaxVerticalSampleFactor do
+			for x = 0, jpeg.MCUCountX, jpeg.MaxHorizontalSampleFactor do
+				for v = 0, componentVerticalSample - 1 do
+					for h = 0, componentHorizontalSample - 1 do
+						local mcuX = x + h + 1
+						local mcuY = y + v + 1
+
+						-- IDCT
+						local decodedMCU = table.create(64, 0)
+
+						for i, influence in pairs(mcus[mcuX][mcuY][actualID]) do
+							if influence == 0 then
+								continue
+							end
+
+							if i > 64 then
+								break
+							end
+
+							local zigzagIndex = zigzag1D[i]
+							local quantisedInfluence = influence * quantisationTable[i]
+
+							local idctLUT = idctTable[zigzagIndex]
+
+							for j = 1, 64 do
+								decodedMCU[j] = decodedMCU[j] + (idctLUT[j] * quantisedInfluence)
+							end
+						end
+
+						-- Fill in pixel image
+						for i = 0, iLimit do
+							for j = 0, jLimit do
+								local pixelX = (mcuX - 1) * 8 + j + 1
+								local pixelY = (mcuY - 1) * 8 + i + 1
+
+								if pixelX <= jpeg.ImageWidth and pixelY <= jpeg.ImageHeight then
+									local ii = math.floor(i / (subtractFromY - componentVerticalSample))
+									local jj = math.floor(j / (subtractFromX - componentHorizontalSample))
+
+									local index = jj * 8 + ii + 1
+
+									jpeg.ImageData[pixelX][pixelY][actualID] = decodedMCU[index]
+								end
+							end
+						end
+					end
+				end
+			end
+
+			-- if y % PREVENT_TIMEOUT_INTERVAL == 0 then
+			-- 	RUN_SERVICE.Stepped:Wait()
+			-- end
+		end
+	end
+
+    local bfr = buffer.create(jpeg.ImageWidth * jpeg.ImageHeight * 4)
+	for x = 1, jpeg.ImageWidth do
+		for y = 1, jpeg.ImageHeight do
+			if jpeg.ComponentCount == 3 then
+				local lum = jpeg.ImageData[x][y][1]
+				local cb = jpeg.ImageData[x][y][2]
+				local cr = jpeg.ImageData[x][y][3]
+
+				local r = lum + 1.402 * cr + 128
+				local g = lum - 0.34414 * cb - 0.71414 * cr + 128
+				local b = lum + 1.772 * cb + 128
+
+				r = math.floor(math.clamp(r, 0, 255))
+				g = math.floor(math.clamp(g, 0, 255))
+				b = math.floor(math.clamp(b, 0, 255))
+
+                buffer.writeu32(bfr, ((y-1) * (jpeg.ImageWidth) + (x-1))*4, util.createRGBAColor(r, g, b))
+			elseif jpeg.ComponentCount == 4 then
+				local c = jpeg.ImageData[x][y][1]
+				local m = jpeg.ImageData[x][y][2]
+				local Y = jpeg.ImageData[x][y][3]
+				local k = jpeg.ImageData[x][y][4]
+
+				local r, g, b
+
+				if colorTransform == 2 or colorTransform == 1 then
+					r = c + 1.402 * Y + 128
+					g = c - 0.34414 * m - 0.71414 * Y + 128
+					b = c + 1.772 * m + 128
+
+					r = math.clamp(r, 0, 255)
+					g = math.clamp(g, 0, 255)
+					b = math.clamp(b, 0, 255)
+
+					r = (255 - r) * ((k + 128) / 255)
+					g = (255 - g) * ((k + 128) / 255)
+					b = (255 - b) * ((k + 128) / 255)
+				elseif colorTransform == 0 then
+					r = (c + 128) * ((k + 128) / 255)
+					g = (m + 128) * ((k + 128) / 255)
+					b = (Y + 128) * ((k + 128) / 255)
+				end
+
+				r = math.floor(r)
+				g = math.floor(g)
+				b = math.floor(b)
+
+                buffer.writeu32(bfr, ((y-1) * (jpeg.ImageWidth-1) + (x-1))*4, util.createRGBAColor(r, g, b))
+			end
+		end
+	end
+	
+	return Result.okSmall(bfr)
+end
+
+return JPEG
+]])
+mod("BitStream", _13, [[
+local module = {}
+
+function module.CreateBitStream(data)
+	local stream = {}
+
+	stream.data = data
+	stream.pos = 0
+
+	local nextByte = 0
+	local nextBit = 0
+
+	function stream.ReadBit()
+		if nextByte >= #stream.data then
+			return -1
+		end
+
+		local index = bit32.rshift(stream.pos, 3) + 1
+
+		local bit = bit32.band(bit32.rshift(stream.data[nextByte + 1], (7 - nextBit)), 1)
+		nextBit = nextBit + 1
+
+		if nextBit == 8 then
+			nextBit = 0
+			nextByte = nextByte + 1
+		end
+
+		return bit
+	end
+
+	function stream.ReadBits(length)
+		local bits = 0
+
+		for i = 1, length do
+			local bit = stream.ReadBit()
+
+			if bit == -1 then
+				bits = -1
+				break
+			end
+
+			bits = bit32.bor(bit32.lshift(bits, 1), bit)
+		end
+
+		return bits
+	end
+	
+	function stream.Align()
+		if nextByte >= #stream.data then
+			return
+		end
+
+		if nextBit ~= 0 then
+			nextBit = 0
+			nextByte = nextByte + 1
+		end
+	end
+
+	return stream
+end
+
+return module]])
+mod("HuffmanTable", _13, [[
+local module = {}
+
+local function BitsFromLength(root, element, pos)
+	if type(root) == "table" then
+		if pos == 0 then
+			if #root < 2 then
+				table.insert(root, element)
+				return true
+			end
+
+			return false
+		end
+
+		for i = 0, 1 do
+			if #root == i then
+				table.insert(root, {})
+			end
+
+			if BitsFromLength(root[i + 1], element, pos - 1) == true then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
+function module.CreateHuffmanTable()
+	local huff = {}
+
+	huff.root = {}
+	huff.symbols = {}
+
+	return huff
+end
+
+function module.ConstructTree(huffmanTable, lengths, elements)
+	huffmanTable.elements = elements
+	local ii = 0
+
+	for i = 1, #lengths do
+		for j = 1, lengths[i] do
+			BitsFromLength(huffmanTable.root, elements[ii + 1], i - 1)
+			ii = ii + 1
+		end
+	end
+end
+
+function module.GetNextSymbolFromHuffmanTable(huffmanTable, bitStream)
+	if huffmanTable == nil then
+		error("HUFFMAN TABLE IS NIL.")
+	end
+	
+	local r = huffmanTable.root
+	
+	local length = 0
+
+	while type(r) == "table" do
+		r = r[bitStream.ReadBit() + 1]
+		length = length + 1
+	end
+
+	return r, length
+end
+
+function module.GetCode(huffmanTable, bitStream)
+	while true do
+		local result = module.GetNextSymbolFromHuffmanTable(huffmanTable, bitStream)
+		
+		if result == nil then
+			return -1
+		end
+		
+		return result
+	end
+end
+
+return module]])
+mod("types", _12, [[
+local Jpg = script.Parent
+local Reader = Jpg.Parent
+local ImageReader = Reader.Parent
+local ImageReaderStructs = require(ImageReader.structs)
+
+type Dimensions = ImageReaderStructs.Dimensions
+export type JpgHeader = {
+	versionMajor: number,
+	versionMinor: number,
+	density: number,
+	xDensity: number,
+	yDensity: number,
+	thumbnailWidth: number,
+	thumbnailHeight: number,
+	dimensions: Dimensions,
+	componentCount: number,
+	precision: number,
+}
+
+return nil]])
+local _14 = mod("Png", _11, [[
+local Reader = script.Parent
+local ImageReader = Reader.Parent
+local Cursor = require(ImageReader.Parent.Cursor)
+local ImageError = require(ImageReader.Parent.ImageError)
+local Result = require(ImageReader.Parent.Result)
+local ImageReaderStructs = require(ImageReader.structs)
+local IDHR = require(script.IDHR)
+local Deflate = require(script.Deflate)
+local Unfilter = require(script.Unfilter)
+local Interlacing = require(script.Interlacing)
+local ConvertBpp = require(script.BppConvert)
+local util = require(script.Parent.util)
+
+local beToLe32 = util.beToLe32
+
+local Png = {
+	canEncode = false,
+}
+
+type Result<T, E> = Result.Result<T, E>
+type SmallResult<T, E> = Result.SmallResult<T, E>
+type ImageResult<T> = ImageError.ImageResult<T>
+type Dimensions = ImageReaderStructs.Dimensions
+type Cursor = Cursor.Cursor
+export type PngHeader = {
+	dimensions: Dimensions,
+	bitDepth: number,
+	colorType: number,
+	interlaced: boolean,
+	compression: number,
+	filtering: number,
+	crc: number,
+	metadata: {
+		[string]: number,
+	},
+}
+
+function Png.getHeader(cursor: Cursor)
+	cursor.position = 0
+
+	local s, r = pcall(function(...)
+		local isPng = Png.isFile(cursor)
+		if not isPng then
+			return isPng
+		end
+
+		return Result.ok(IDHR(Png, cursor))
+	end)
+
+	if s then
+		return r
+	end
+
+	local words = string.split(r, " ")
+	return Result.err(tonumber(words[#words]))
+end
+
+function Png.isFile(cursor: Cursor)
+	cursor.position = 0
+
+	local s, r = pcall(cursor.ExpectBytesRaw, cursor, 137, 80, 78, 71, 13, 10, 26, 10)
+	if s then
+		return Result.ok(r)
+	else
+		local words = string.split(r, " ")
+		return Result.err(tonumber(words[#words]))
+	end
+end
+
+function Png.getDimensions(cursor: Cursor)
+	cursor.position = 16
+
+	local s, r = pcall(function(...)
+		local width = beToLe32(cursor:ReadU32())
+		local height = beToLe32(cursor:ReadU32())
+
+		return Result.ok({
+			width = width,
+			height = height,
+		})
+	end)
+
+	if s then
+		return r
+	end
+
+	local words = string.split(r, " ")
+	return Result.err(tonumber(words[#words]))
+end
+
+function getBytesPerPixel(colorType: number)
+	if colorType == 0 or colorType == 3 then
+		return 1
+	elseif colorType == 4 then
+		return 2
+	elseif colorType == 2 then
+		return 3
+	elseif colorType == 6 then
+		return 4
+	else
+		return 0
+	end
+end
+
+function Png.decode(cursor: Cursor)
+	local header: PngHeader = Png.getHeader(cursor):Unwrap()
+	local chunks = {}
+	local fileData = {
+		isReading = true,
+		zlibstream = "",
+		metadata = {},
+	}
+
+	local s = pcall(function(...)
+		while fileData.isReading do
+			local len = beToLe32(cursor:ReadU32())
+			local chunkType = cursor:ReadString(4)
+
+			local chunkCursor, crc
+
+			if len > 0 then
+				chunkCursor = cursor:Fork(len)
+				crc = beToLe32(cursor:ReadU32())
+			end
+
+			local chunkData = {
+				length = len,
+				header = chunkType,
+				chunkCursor = chunkCursor,
+				crc = crc,
+			}
+
+			local handler = script.Chunks:FindFirstChild(chunkType)
+
+			if handler then
+				handler = require(handler)
+				handler(chunkCursor, fileData, chunkData)
+			end
+
+			table.insert(chunks, chunkData)
+		end
+	end)
+
+	if not s then
+		return Result.err(ImageError.Decoding)
+	end
+
+	header.metadata = fileData.metadata
+
+	local bitDepth = header.bitDepth
+	local colorType = header.colorType
+	local channels = getBytesPerPixel(colorType)
+	local bppRaw = channels * (bitDepth / 8)
+	local bpp = math.max(1, bppRaw)
+
+	local dimensions = header.dimensions
+	local width, height = dimensions.width, dimensions.height
+	local success, response = pcall(function()
+		local interlaced = header.interlaced
+		local result = buffer.create(
+			if interlaced then Interlacing.calculateSize(width, height, bpp) else (height * (1 + width * bpp))
+		)
+
+		local offset = 0
+		local index = 1
+		local strLen = string.len(fileData.zlibstream)
+
+		local function ensureCapacity(needed)
+			if offset + needed <= buffer.len(result) then
+				return
+			end
+
+			local newBuffer = buffer.create(buffer.len(result) + needed)
+			buffer.copy(newBuffer, 0, result, 0, offset)
+			result = newBuffer
+		end
+
+		Deflate:InflateZlib({
+			Input = {
+				ReadByte = function()
+					if index > strLen then
+						return
+					end
+
+					local result = string.sub(fileData.zlibstream, index, index)
+					index += 1
+
+					return string.byte(result)
+				end,
+			},
+
+			Output = not interlaced and function(byte)
+				buffer.writeu8(result, offset, byte)
+				offset += 1
+			end or function(byte)
+				ensureCapacity(1)
+				buffer.writeu8(result, offset, byte)
+				offset += 1
+			end,
+		})
+
+		return result
+	end)
+
+	if not success then
+		return Result.err(ImageError.Decoding)
+	end
+
+	fileData.zlibstream = nil
+
+	local bitmap = buffer.create(width * height * 4)
+
+	-- Is this image interlaced?
+	if header.interlaced then
+		-- "un-interlace" the image and put it in bitmap
+		s = pcall(function(...)
+			bitmap = Interlacing.deinterlaceAdam7(response, width, height, bpp, fileData)
+		end)
+
+		if not s then
+			return Result.err(ImageError.Decoding)
+		end
+
+		return Result.ok(width, height, bitmap, header)
+	end
+
+	-- Unfilter & write
+	-- Preprocess all scanlines and convert them to RGBA
+
+	local newCursor = Cursor.new(response)
+	local scanlineWidth = math.ceil(width * bppRaw)
+	local protectAlpha = bpp ~= 4
+
+	local s = pcall(function(...)
+		for row = 0, height - 1 do
+			local filterType = newCursor:ReadByte()
+			local scanline = newCursor:ReadByteCollection(scanlineWidth)
+			if protectAlpha then
+				local newScan = buffer.create(width * 4)
+				if bppRaw == 0.5 then
+					ConvertBpp.fourBit(fileData, scanlineWidth, scanline, newScan)
+				elseif bppRaw == 0.25 then
+					ConvertBpp.twoBit(fileData, width, scanlineWidth, scanline, newScan)
+				elseif bppRaw == 0.125 then
+					ConvertBpp.oneBit(fileData, scanlineWidth, width, scanline, newScan)
+				else
+					ConvertBpp.trueColor(fileData, width, bpp, scanline, newScan)
+				end
+
+				scanline = newScan
+			end
+
+			Unfilter.unfilter(filterType, row, scanline, bitmap, width, height, protectAlpha)
+		end
+	end)
+
+	if not s then
+		return Result.err(ImageError.Decoding)
+	end
+
+	return Result.ok(width, height, bitmap, header)
+end
+
+return Png
+]])
+mod("BppConvert", _14, [[
+local Preprocess = require(script.Parent.Preprocess)
+local fourBit = Preprocess[0.5]
+local twoBit = Preprocess[0.25]
+
+local Convert = {}
+
+local function noneFilter(scanWidth: number, line: buffer, bitmap: buffer)
+	buffer.copy(bitmap, 0, line, 0, scanWidth)
+end
+
+function Convert.trueColor(fileData, imageWidth, bpp, line, newScan)
+	local preprocess = Preprocess[bpp]
+
+	for pixel = 0, imageWidth - 1 do
+		local rgba = preprocess(
+			fileData,
+			buffer.readu8(line, pixel * bpp),
+			bpp > 1 and buffer.readu8(line, pixel * bpp + 1) or nil,
+			bpp > 2 and buffer.readu8(line, pixel * bpp + 2) or nil
+		)
+		buffer.writeu32(newScan, pixel * 4, rgba)
+	end
+end
+
+function Convert.fourBit(fileData, scanlineWidth: number, scanline: buffer, newScan: buffer)
+	local testBuff = buffer.create(scanlineWidth)
+
+	noneFilter(scanlineWidth, scanline, testBuff)
+
+	for i = 0, scanlineWidth - 1 do
+		local byte = buffer.readu8(testBuff, i)
+		local index1 = bit32.rshift(byte, 4)
+		local index2 = bit32.band(byte, 0x0F)
+		local rgba1, rgba2 = fourBit(fileData, index1, index2)
+
+		-- pixel index, not byte index
+		local pixelIndex = i * 2
+		buffer.writeu32(newScan, pixelIndex * 4, rgba1) -- first pixel
+		if (pixelIndex + 1) * 4 < buffer.len(newScan) then
+			buffer.writeu32(newScan, (pixelIndex + 1) * 4, rgba2) -- second pixel
+		end
+	end
+end
+
+function Convert.twoBit(fileData, width: number, scanlineWidth: number, scanline: buffer, newScan: buffer)
+	local testBuff = buffer.create(scanlineWidth)
+	noneFilter(scanlineWidth, scanline, testBuff)
+
+	local fullBytes = math.floor(width / 4)
+	local extraPixels = width % 4
+	local totalBytesNeeded = fullBytes + (extraPixels > 0 and 1 or 0)
+
+	totalBytesNeeded = math.min(totalBytesNeeded, scanlineWidth)
+
+	local outputPos = 0
+
+	for i = 0, fullBytes - 1 do
+		local byte = buffer.readu8(testBuff, i)
+		local index1 = bit32.rshift(byte, 6)
+		local index2 = bit32.band(bit32.rshift(byte, 4), 0x03)
+		local index3 = bit32.band(bit32.rshift(byte, 2), 0x03)
+		local index4 = bit32.band(byte, 0x03)
+
+		buffer.writeu32(newScan, outputPos, twoBit(fileData, index1, 0, 0, 0))
+		buffer.writeu32(newScan, outputPos + 4, twoBit(fileData, index2, 0, 0, 0))
+		buffer.writeu32(newScan, outputPos + 8, twoBit(fileData, index3, 0, 0, 0))
+		buffer.writeu32(newScan, outputPos + 12, twoBit(fileData, index4, 0, 0, 0))
+		outputPos += 16
+	end
+
+	if extraPixels > 0 and fullBytes < scanlineWidth then
+		local byte = buffer.readu8(testBuff, fullBytes)
+		for p = 0, extraPixels - 1 do
+			local shift = 6 - (p * 2)
+			local index = bit32.band(bit32.rshift(byte, shift), 0x03)
+			buffer.writeu32(newScan, outputPos, twoBit(fileData, index, 0, 0, 0))
+			outputPos += 4
+		end
+	end
+end
+
+function Convert.oneBit(fileData, scanlineWidth: number, width: number, scanline: buffer, newScan: buffer)
+	local testBuff = buffer.create(scanlineWidth)
+	noneFilter(scanlineWidth, scanline, testBuff)
+
+	local totalBitsNeeded = width
+	local totalBytesNeeded = math.ceil(totalBitsNeeded / 8)
+	local outputPos = 0
+
+	for i = 0, totalBytesNeeded - 1 do
+		local byte = buffer.readu8(testBuff, i)
+
+		local remainingBits = totalBitsNeeded - outputPos
+		local bitsInThisByte = math.min(8, remainingBits)
+
+		for bit = 0, bitsInThisByte - 1 do
+			local index = bit32.band(bit32.rshift(byte, 7 - bit), 0x01)
+
+			local rgba = Preprocess[1](fileData, index)
+			buffer.writeu32(newScan, outputPos * 4, rgba)
+			outputPos += 1
+		end
+	end
+end
+
+return Convert
+]])
+local _15 = folder("Chunks", _14)
+mod("IDAT", _15, [[
+local Reader = script.Parent.Parent.Parent
+local ImageReader = Reader.Parent
+local Cursor = require(ImageReader.Parent.Cursor)
+
+type Cursor = Cursor.Cursor
+
+return function(cursor: Cursor, file, chunk)
+    local crc = chunk.crc
+	local hash = file.hash or 0
+	
+	local bfr = cursor.buffer
+	
+	file.hash = bit32.bxor(hash, crc)
+	file.zlibstream = file.zlibstream .. buffer.tostring(bfr)
+    return
+end
+]])
+mod("IEND", _15, [[
+local Reader = script.Parent.Parent.Parent
+local ImageReader = Reader.Parent
+local Cursor = require(ImageReader.Parent.Cursor)
+
+type Cursor = Cursor.Cursor
+
+return function(cursor: Cursor, file)
+    file.isReading = false
+    return
+end
+]])
+mod("PLTE", _15, [[
+local Reader = script.Parent.Parent.Parent
+local ImageReader = Reader.Parent
+local Cursor = require(ImageReader.Parent.Cursor)
+
+type Cursor = Cursor.Cursor
+
+return function(cursor: Cursor, file)
+    file.palette = cursor.buffer
+    return
+end
+]])
+mod("gAMA", _15, [[
+local Reader = script.Parent.Parent.Parent
+local ImageReader = Reader.Parent
+local Chunks = script.Parent
+local Cursor = require(ImageReader.Parent.Cursor)
+local util = require(Chunks.Parent.util)
+
+type Cursor = Cursor.Cursor
+
+return function(cursor: Cursor, file)
+    file.gamma = util.beToLe32(cursor:ReadByte()) / 10e4
+    return
+end
+]])
+mod("sRGB", _15, [[
+local Reader = script.Parent.Parent.Parent
+local ImageReader = Reader.Parent
+local Cursor = require(ImageReader.Parent.Cursor)
+
+type Cursor = Cursor.Cursor
+
+return function(cursor: Cursor, file)
+    file.renderIntent = cursor:ReadByte()
+    return
+end
+]])
+mod("tEXt", _15, [[
+local Reader = script.Parent.Parent.Parent
+local ImageReader = Reader.Parent
+local Cursor = require(ImageReader.Parent.Cursor)
+
+type Cursor = Cursor.Cursor
+
+return function(cursor: Cursor, file)
+    file.metadata = file.metadata or {}
+
+    local data = buffer.tostring(cursor.buffer)
+    local nullPos = string.find(data, "\0")
+    local key = string.sub(data, 1, nullPos - 1) or ""
+    local value = string.sub(data, nullPos + 1) or ""
+
+    file.metadata[key] = string.gsub(value, "[\r\n]+$", "")
+    return
+end
+]])
+mod("tRNS", _15, [[
+local Reader = script.Parent.Parent.Parent
+local ImageReader = Reader.Parent
+local Cursor = require(ImageReader.Parent.Cursor)
+
+type Cursor = Cursor.Cursor
+
+return function(cursor: Cursor, file, data)
+    local gray = -1
+	local red = -1
+	local green = -1
+	local blue = -1
+
+    local header = data.header
+    local colorType = header.colorType
+    local buff = cursor.buffer
+
+    local readU16 = buffer.readu16
+
+	if colorType then
+		gray = readU16(buff, 0, header.bitDepth)
+	elseif colorType == 2 then
+		red = readU16(buff, 0, header.bitDepth)
+		green = readU16(buff, 2, header.bitDepth)
+		blue = readU16(buff, 4, header.bitDepth)
+	end
+
+    file.alpha = {
+		gray = gray,
+		red = red,
+		green = green,
+		blue = blue,
+	}
+end
+]])
+mod("Deflate", _14, [=[
+--[[
+
+LUA MODULE
+
+compress.deflatelua - deflate (and zlib) implemented in Lua.
+
+DESCRIPTION
+
+This is a pure Lua implementation of decompressing the DEFLATE format,
+including the related zlib format.
+
+Note: This library only supports decompression.
+Compression is not currently implemented.
+
+REFERENCES
+
+[1] DEFLATE Compressed Data Format Specification version 1.3
+http://tools.ietf.org/html/rfc1951
+[2] GZIP file format specification version 4.3
+http://tools.ietf.org/html/rfc1952
+[3] http://en.wikipedia.org/wiki/DEFLATE
+[4] pyflate, by Paul Sladen
+http://www.paul.sladen.org/projects/pyflate/
+[5] Compress::Zlib::Perl - partial pure Perl implementation of
+Compress::Zlib
+http://search.cpan.org/~nwclark/Compress-Zlib-Perl/Perl.pm
+
+LICENSE
+
+(c) 2008-2011 David Manura.  Licensed under the same terms as Lua (MIT).
+    Heavily modified by Max G. (2019)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+(end license)
+--]]
+
+local Deflate = {}
+
+local band = bit32.band
+local lshift = bit32.lshift
+local rshift = bit32.rshift
+
+local BTYPE_NO_COMPRESSION = 0
+local BTYPE_FIXED_HUFFMAN = 1
+local BTYPE_DYNAMIC_HUFFMAN = 2
+
+local lens = -- Size base for length codes 257..285
+{
+	[0] = 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+	35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
+}
+
+local lext = -- Extra bits for length codes 257..285
+{
+	[0] = 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+	3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0
+}
+
+local dists = -- Offset base for distance codes 0..29
+{
+	[0] = 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+	257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+	8193, 12289, 16385, 24577
+}
+
+local dext = -- Extra bits for distance codes 0..29
+{
+	[0] = 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+	7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
+	12, 12, 13, 13
+}
+
+local order = -- Permutation of code length codes
+{
+	16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 
+	11, 4, 12, 3, 13, 2, 14, 1, 15
+}
+
+-- Fixed literal table for BTYPE_FIXED_HUFFMAN
+local fixedLit = {0, 8, 144, 9, 256, 7, 280, 8, 288}
+
+ -- Fixed distance table for BTYPE_FIXED_HUFFMAN
+local fixedDist = {0, 5, 32}
+
+local function createState(bitStream)
+	local state = 
+	{
+		Output = bitStream;
+		Window = {};
+		Pos = 1;
+	}
+	
+	return state
+end
+
+local function write(state, byte)
+	local pos = state.Pos
+	state.Output(byte)
+	state.Window[pos] = byte
+	state.Pos = pos % 32768 + 1  -- 32K
+end
+
+local function memoize(fn)
+	local meta = {}
+	local memoizer = setmetatable({}, meta)
+	
+	function meta:__index(k)
+		local v = fn(k)
+		memoizer[k] = v
+		
+		return v
+	end
+	
+	return memoizer
+end
+
+-- small optimization (lookup table for powers of 2)
+local pow2 = memoize(function (n) 
+	return 2 ^ n 
+end)
+
+-- weak metatable marking objects as bitstream type
+local isBitStream = setmetatable({}, { __mode = 'k' })
+
+local function createBitStream(reader)
+	local buffer = 0
+	local bitsLeft = 0
+	
+	local stream = {}
+	isBitStream[stream] = true
+	
+	function stream:GetBitsLeft()
+		return bitsLeft
+	end
+	
+	function stream:Read(count)
+		count = count or 1
+		
+		while bitsLeft < count do
+			local byte = reader:ReadByte()
+			
+			if not byte then 
+				return 
+			end
+			
+			buffer = buffer + lshift(byte, bitsLeft)
+			bitsLeft = bitsLeft + 8
+		end
+		
+		local bits
+		
+		if count == 0 then
+			bits = 0
+		elseif count == 32 then
+			bits = buffer
+			buffer = 0
+		else
+			bits = band(buffer, rshift(2^32 - 1, 32 - count))
+			buffer = rshift(buffer, count)
+		end
+		
+		bitsLeft = bitsLeft - count
+		return bits
+	end
+	
+	return stream
+end
+
+local function getBitStream(obj)
+	if isBitStream[obj] then
+		return obj
+	end
+	
+	return createBitStream(obj)
+end
+
+local function sortHuffman(a, b)
+	return a.NumBits == b.NumBits and a.Value < b.Value or a.NumBits < b.NumBits
+end
+
+local function msb(bits, numBits)
+	local res = 0
+		
+	for i = 1, numBits do
+		res = lshift(res, 1) + band(bits, 1)
+		bits = rshift(bits, 1)
+	end
+		
+	return res
+end
+
+local function createHuffmanTable(init, isFull)
+	local hTable = {}
+	
+	if isFull then
+		for val, numBits in pairs(init) do
+			if numBits ~= 0 then
+				hTable[#hTable + 1] = 
+				{
+					Value = val;
+					NumBits = numBits;
+				}
+			end
+		end
+	else
+		for i = 1, #init - 2, 2 do
+			local firstVal = init[i]
+			
+			local numBits = init[i + 1]
+			local nextVal = init[i + 2]
+			
+			if numBits ~= 0 then
+				for val = firstVal, nextVal - 1 do
+					hTable[#hTable + 1] = 
+					{
+						Value = val;
+						NumBits = numBits;
+					}
+				end
+			end
+		end
+	end
+	
+	table.sort(hTable, sortHuffman)
+	
+	local code = 1
+	local numBits = 0
+	
+	for i, slide in ipairs(hTable) do
+		if slide.NumBits ~= numBits then
+			code = code * pow2[slide.NumBits - numBits]
+			numBits = slide.NumBits
+		end
+		
+		slide.Code = code
+		code = code + 1
+	end
+	
+	local minBits = math.huge
+	local look = {}
+	
+	for i, slide in ipairs(hTable) do
+		minBits = math.min(minBits, slide.NumBits)
+		look[slide.Code] = slide.Value
+	end
+
+	local firstCode = memoize(function (bits) 
+		return pow2[minBits] + msb(bits, minBits) 
+	end)
+	
+	function hTable:Read(bitStream)
+		local code = 1 -- leading 1 marker
+		local numBits = 0
+		
+		while true do
+			if numBits == 0 then  -- small optimization (optional)
+				local index = bitStream:Read(minBits)
+				numBits = numBits + minBits
+				code = firstCode[index]
+			else
+				local bit = bitStream:Read()
+				numBits = numBits + 1
+				code = code * 2 + bit -- MSB first
+			end
+			
+			local val = look[code]
+			
+			if val then
+				return val
+			end
+		end
+	end
+	
+	return hTable
+end
+
+local function parseZlibHeader(bitStream)
+	-- Compression Method
+	local cm = bitStream:Read(4)
+	
+	-- Compression info
+	local cinfo = bitStream:Read(4)  
+	
+	-- FLaGs: FCHECK (check bits for CMF and FLG)   
+	local fcheck = bitStream:Read(5)
+	
+	-- FLaGs: FDICT (present dictionary)
+	local fdict = bitStream:Read(1)
+	
+	-- FLaGs: FLEVEL (compression level)
+	local flevel = bitStream:Read(2)
+	
+	-- CMF (Compresion Method and flags)
+	local cmf = cinfo * 16  + cm
+	
+	-- FLaGs
+	local flg = fcheck + fdict * 32 + flevel * 64 
+	
+	if cm ~= 8 then -- not "deflate"
+		error("unrecognized zlib compression method: " .. cm)
+	end
+	
+	if cinfo > 7 then
+		error("invalid zlib window size: cinfo=" .. cinfo)
+	end
+	
+	local windowSize = 2 ^ (cinfo + 8)
+	
+	if (cmf * 256 + flg) % 31 ~= 0 then
+		error("invalid zlib header (bad fcheck sum)")
+	end
+	
+	if fdict == 1 then
+		error("FIX:TODO - FDICT not currently implemented")
+	end
+	
+	return windowSize
+end
+
+local function parseHuffmanTables(bitStream)
+	local numLits  = bitStream:Read(5) -- # of literal/length codes - 257
+	local numDists = bitStream:Read(5) -- # of distance codes - 1
+	local numCodes = bitStream:Read(4) -- # of code length codes - 4
+	
+	local codeLens = {}
+	
+	for i = 1, numCodes + 4 do
+		local index = order[i]
+		codeLens[index] = bitStream:Read(3)
+	end
+	
+	codeLens = createHuffmanTable(codeLens, true)
+
+	local function decode(numCodes)
+		local init = {}
+		local numBits
+		local val = 0
+		
+		while val < numCodes do
+			local codeLen = codeLens:Read(bitStream)
+			local numRepeats
+			
+			if codeLen <= 15 then
+				numRepeats = 1
+				numBits = codeLen
+			elseif codeLen == 16 then
+				numRepeats = 3 + bitStream:Read(2)
+			elseif codeLen == 17 then
+				numRepeats = 3 + bitStream:Read(3)
+				numBits = 0
+			elseif codeLen == 18 then
+				numRepeats = 11 + bitStream:Read(7)
+				numBits = 0
+			end
+			
+			for i = 1, numRepeats do
+				init[val] = numBits
+				val = val + 1
+			end
+		end
+		
+		return createHuffmanTable(init, true)
+	end
+
+	local numLitCodes = numLits + 257
+	local numDistCodes = numDists + 1
+	
+	local litTable = decode(numLitCodes)
+	local distTable = decode(numDistCodes)
+	
+	return litTable, distTable
+end
+
+local function parseCompressedItem(bitStream, state, litTable, distTable)
+	local val = litTable:Read(bitStream)
+	
+	if val < 256 then -- literal
+		write(state, val)
+	elseif val == 256 then -- end of block
+		return true
+	else
+		local lenBase = lens[val - 257]
+		local numExtraBits = lext[val - 257]
+		
+		local extraBits = bitStream:Read(numExtraBits)
+		local len = lenBase + extraBits
+		
+		local distVal = distTable:Read(bitStream)
+		local distBase = dists[distVal]
+		
+		local distNumExtraBits = dext[distVal]
+		local distExtraBits = bitStream:Read(distNumExtraBits)
+		
+		local dist = distBase + distExtraBits
+		
+		for i = 1, len do
+			local pos = (state.Pos - 1 - dist) % 32768 + 1
+			local byte = assert(state.Window[pos], "invalid distance")
+			write(state, byte)
+		end
+	end
+	
+	return false
+end
+
+local function parseBlock(bitStream, state)
+	local bFinal = bitStream:Read(1)
+	local bType = bitStream:Read(2)
+	
+	if bType == BTYPE_NO_COMPRESSION then
+		local left = bitStream:GetBitsLeft()
+		bitStream:Read(left)
+		
+		local len = bitStream:Read(16)
+		local _ = bitStream:Read(16)
+
+		for i = 1, len do
+			local byte = bitStream:Read(8)
+			write(state, byte)
+		end
+	elseif bType == BTYPE_FIXED_HUFFMAN or bType == BTYPE_DYNAMIC_HUFFMAN then
+		local litTable, distTable
+
+		if bType == BTYPE_DYNAMIC_HUFFMAN then
+			litTable, distTable = parseHuffmanTables(bitStream)
+		else
+			litTable = createHuffmanTable(fixedLit)
+			distTable = createHuffmanTable(fixedDist)
+		end
+		
+		repeat until parseCompressedItem(bitStream, state, litTable, distTable)
+	else
+		error("unrecognized compression type")
+	end
+
+	return bFinal ~= 0
+end
+
+function Deflate:Inflate(io)
+	local state = createState(io.Output)
+	local bitStream = getBitStream(io.Input)
+	
+	repeat until parseBlock(bitStream, state)
+end
+
+function Deflate:InflateZlib(io)
+	local bitStream = getBitStream(io.Input)
+	local _ = parseZlibHeader(bitStream)
+	
+	self:Inflate
+	{
+		Input = bitStream;
+		Output = io.Output;
+	}
+	
+	local bitsLeft = bitStream:GetBitsLeft()
+	bitStream:Read(bitsLeft)
+end
+
+return Deflate]=])
+mod("IDHR", _14, [[
+local Reader = script.Parent.Parent
+local ImageReader = Reader.Parent
+local Cursor = require(ImageReader.Parent.Cursor)
+
+type Cursor = Cursor.Cursor
+
+-- Parse the `IDHR` chunk Luau
+return function(PNG, cursor: Cursor)
+    cursor:ExpectBytesRaw(0, 0, 0, 13)
+    cursor:ExpectBytes("IDHR")
+
+    local dimensions = PNG.getDimensions(cursor):Unwrap()
+    local bitDepth = cursor:ReadByte()
+    local colorType = cursor:ReadByte()
+    
+    local compression = cursor:ReadByte()
+    local filtering = cursor:ReadByte()
+
+    local interlaced = cursor:ReadByte()
+    local crc = cursor:ReadU32()
+
+    return {
+        dimensions = dimensions,
+        bitDepth = bitDepth,
+        colorType = colorType,
+        compression = compression,
+        filtering = filtering,
+        interlaced = interlaced == 1,
+        crc = crc,
+        metadata = {},
+    }
+end
+]])
+mod("Interlacing", _14, [[
+local Interlacing = {}
+
+local X_STEP = { 8, 8, 4, 4, 2, 2, 1 }
+local Y_STEP = { 8, 8, 8, 4, 4, 2, 2 }
+local X_OFF = { 0, 4, 0, 2, 0, 1, 0 }
+local Y_OFF = { 0, 0, 4, 0, 2, 0, 1 }
+
+function Interlacing.calculateSize(w, h, bpp)
+	local totalBytes = 0
+	for pass = 1, 7 do
+		local passW = math.ceil((w - X_OFF[pass]) / X_STEP[pass])
+		local passH = math.ceil((h - Y_OFF[pass]) / Y_STEP[pass])
+		if passW > 0 and passH > 0 then
+			totalBytes += passH * (1 + math.ceil((passW * bpp) / 8))
+		end
+	end
+	return totalBytes
+end
+
+function Interlacing.deinterlaceAdam7(responseBuffer, width, height, bpp, file, header)
+	local idx = 0
+	local channels = 4 -- RGBA
+	local bitDepth = 8
+	local working = responseBuffer
+	local map = buffer.create(width * height * channels)
+
+	for passNum = 1, 7 do
+		local sx, sy = X_OFF[passNum], Y_OFF[passNum]
+		local dx, dy = X_STEP[passNum], Y_STEP[passNum]
+
+		local w = math.ceil((width - sx) / dx)
+		local h = math.ceil((height - sy) / dy)
+		if w < 1 or h < 1 then
+			continue
+		else
+			local scanlineSize = math.ceil(w * channels * bitDepth / 8)
+			local newIdx = idx
+
+			for y = 1, h do
+				local rowFilter = buffer.readu8(working, idx)
+				idx += 1
+
+				if rowFilter == 0 or (rowFilter == 2 and y == 1) then
+					idx += scanlineSize
+				elseif rowFilter == 1 then
+					for x = 1, scanlineSize do
+						local sub = (x <= bpp) and 0 or buffer.readu8(working, idx - bpp)
+						local value = bit32.band(buffer.readu8(working, idx) + sub, 0xFF)
+						buffer.writeu8(working, idx, value)
+						idx += 1
+					end
+				elseif rowFilter == 2 then
+					for _ = 1, scanlineSize do
+						local up = buffer.readu8(working, idx - scanlineSize - 1)
+						local value = bit32.band(buffer.readu8(working, idx) + up, 0xFF)
+						buffer.writeu8(working, idx, value)
+						idx += 1
+					end
+				elseif rowFilter == 3 then
+					for x = 1, scanlineSize do
+						local sub = (x <= bpp) and 0 or buffer.readu8(working, idx - bpp)
+						local up = (y == 1) and 0 or buffer.readu8(working, idx - scanlineSize - 1)
+						local value = bit32.band(buffer.readu8(working, idx) + bit32.rshift(sub + up, 1), 0xFF)
+						buffer.writeu8(working, idx, value)
+						idx += 1
+					end
+				elseif rowFilter == 4 then
+					for x = 1, scanlineSize do
+						local sub = (x <= bpp) and 0 or buffer.readu8(working, idx - bpp)
+						local up = (y == 1) and 0 or buffer.readu8(working, idx - scanlineSize - 1)
+						local corner = (x <= bpp or y == 1) and 0
+							or buffer.readu8(working, idx - scanlineSize - bpp - 1)
+						local p0 = math.abs(up - corner)
+						local p1 = math.abs(sub - corner)
+						local p2 = math.abs(sub + up - 2 * corner)
+						local paeth = (p0 <= p1 and p0 <= p2) and sub or ((p1 <= p2) and up or corner)
+						local value = bit32.band(buffer.readu8(working, idx) + paeth, 0xFF)
+						buffer.writeu8(working, idx, value)
+						idx += 1
+					end
+				end
+			end
+
+			local bit = 8
+			local function readValue()
+				local b = buffer.readu8(working, newIdx)
+				if bitDepth < 8 then
+					b = bit32.extract(b, bit - bitDepth, bitDepth)
+					bit -= bitDepth
+					if bit == 0 then
+						bit = 8
+						newIdx += 1
+					end
+				elseif bitDepth == 8 then
+					newIdx += 1
+				else
+					b = bit32.bor(bit32.lshift(b, 8), buffer.readu8(working, newIdx + 1))
+					newIdx += 2
+				end
+				return b
+			end
+
+			local alpha = file.alpha
+
+			for y = 1, h do
+				newIdx += 1
+				if bit < 8 then
+					bit = 8
+					newIdx += 1
+				end
+
+				for x = 1, w do
+					local r, g, b, a
+
+					if header.colorType == 0 then
+						local gray = readValue()
+						r = gray
+						g = gray
+						b = gray
+						a = if gray == alpha.gray then 0 else 255
+					elseif header.colorType == 2 then
+						r = readValue()
+						g = readValue()
+						b = readValue()
+						a = if r == alpha.red and g == alpha.green and b == alpha.blue then 0 else 255
+					elseif header.colorType == 3 then
+						local originalOffset = readValue()
+						r, g, b, a =
+							buffer.readu8(file.palette, originalOffset),
+							buffer.readu8(file.palette, originalOffset + 1),
+							buffer.readu8(file.palette, originalOffset + 2),
+							buffer.readu8(file.palette, originalOffset + 3)
+					elseif header.colorType == 4 then
+						local gray = readValue()
+						r = gray
+						g = gray
+						b = gray
+						a = readValue()
+					elseif header.colorType == 6 then
+						r = readValue()
+						g = readValue()
+						b = readValue()
+						a = readValue()
+					end
+
+					local py = sy + (y - 1) * dy
+					local px = sx + (x - 1) * dx
+					local i = (py * width + px) * 4
+
+					if bitDepth == 16 then
+						r = bit32.rshift(r, 8)
+						g = bit32.rshift(g, 8)
+						b = bit32.rshift(b, 8)
+						a = bit32.rshift(a, 8)
+					end
+
+					buffer.writeu32(map, i, bit32.bor(bit32.lshift(a, 24), bit32.lshift(b, 16), bit32.lshift(g, 8), r))
+				end
+			end
+		end
+	end
+
+	return map
+end
+
+return Interlacing
+]])
+mod("Preprocess", _14, [[
+local util = require(script.Parent.Parent.util)
+
+local createRGBAColor = util.createRGBAColor
+
+local function getRGB2Bit(palette, index)
+	local offset = index * 3
+	return buffer.readu8(palette, offset), -- R
+		buffer.readu8(palette, offset + 1), -- G
+		buffer.readu8(palette, offset + 2) -- B
+end
+
+return {
+	[0.25] = function(file, i1, i2, i3, i4) -- Takes 4 indices (2 bits each)
+		local palette = file.palette
+		-- Generate 4 RGBA colors (assuming alpha = 255)
+		local r1, g1, b1 = getRGB2Bit(palette, i1)
+		local r2, g2, b2 = getRGB2Bit(palette, i2)
+		local r3, g3, b3 = getRGB2Bit(palette, i3)
+		local r4, g4, b4 = getRGB2Bit(palette, i4)
+
+		return createRGBAColor(r1, g1, b1), -- Pixel 1
+			createRGBAColor(r2, g2, b2), -- Pixel 2
+			createRGBAColor(r3, g3, b3), -- Pixel 3
+			createRGBAColor(r4, g4, b4) -- Pixel 4
+	end,
+
+	[0.5] = function(file, hi, lo)
+		local palette = file.palette
+
+		local high = hi * 3
+		local low = lo * 3
+		-- warn(hi, hi + 1, hi + 2, low, low + 1, low + 2, buffer.len(file.palette))
+		return createRGBAColor(
+			buffer.readu8(palette, high),
+			buffer.readu8(palette, high + 1),
+			buffer.readu8(palette, high + 2)
+		),
+			createRGBAColor(
+				buffer.readu8(palette, low),
+				buffer.readu8(palette, low + 1),
+				buffer.readu8(palette, low + 2)
+			)
+	end,
+
+	[1] = function(file, byte)
+		local palette = file.palette
+		local offset = byte * 3
+
+		local r = buffer.readu8(palette, offset)
+		local g = buffer.readu8(palette, offset + 1)
+		local b = buffer.readu8(palette, offset + 2)
+
+		return createRGBAColor(r, g, b)
+	end,
+
+	[3] = function(_, r: number, g: number, b: number)
+		return createRGBAColor(r, g, b)
+	end,
+}
+]])
+mod("Unfilter", _14, [[
+local Unfilter = {}
+
+-- 0
+function Unfilter.none(row, scanline: buffer, bitmap: buffer, width: number, height: number)
+	local rowIndex = width * row * 4
+	buffer.copy(bitmap, rowIndex, scanline, 0, width * 4)
+end
+
+-- 1
+function Unfilter.sub(row, scanline: buffer, bitmap: buffer, width: number, height: number, protectAlpha: boolean)
+	local rowStart = row * (width * 4)
+
+	buffer.writeu32(bitmap, rowStart, buffer.readu32(scanline, 0))
+
+	for i = 4, (width * 4) - 1 do
+		local filteredByte = buffer.readu8(scanline, i)
+		local leftByte = buffer.readu8(bitmap, rowStart + i - 4)
+		local reconstructedByte
+
+		if protectAlpha and (i % 4) == 3 then
+			reconstructedByte = filteredByte
+		else
+			reconstructedByte = (filteredByte + leftByte) % 256
+		end
+
+		buffer.writeu8(bitmap, rowStart + i, reconstructedByte)
+	end
+end
+
+-- 2
+function Unfilter.up(row, scanline: buffer, bitmap: buffer, width: number, height: number, protectAlpha: boolean)
+	if row > 0 then
+		local rowStride = width * 4
+		local upperRowOffset = (row - 1) * rowStride
+		local currentRowOffset = row * rowStride
+
+		for i = 0, rowStride - 1 do
+			local x = buffer.readu8(scanline, i)
+			local b = buffer.readu8(bitmap, upperRowOffset + i)
+			local reconstructedByte
+
+			if protectAlpha and (i % 4) == 3 then
+				reconstructedByte = x
+			else
+				reconstructedByte = bit32.band(x + b, 0xFF)
+			end
+
+			buffer.writeu8(bitmap, currentRowOffset + i, reconstructedByte)
+		end
+	else
+		Unfilter.none(row, scanline, bitmap, width, height)
+	end
+end
+
+-- 3
+function Unfilter.average(row, scanline: buffer, bitmap: buffer, width: number, height: number, protectAlpha: boolean)
+	local rowStride = width * 4
+	local currentRowOffset = row * rowStride
+
+	if row > 0 then
+		local upperRowOffset = (row - 1) * rowStride
+
+		for i = 0, 3 do
+			local x = buffer.readu8(scanline, i)
+			local b = buffer.readu8(bitmap, upperRowOffset + i)
+			local reconstructedByte
+
+			if protectAlpha and i == 3 then
+				reconstructedByte = x
+			else
+				local avg = bit32.rshift(b, 1)
+				reconstructedByte = bit32.band(x + avg, 0xFF)
+			end
+
+			buffer.writeu8(bitmap, currentRowOffset + i, reconstructedByte)
+		end
+
+		for i = 4, rowStride - 1 do
+			local x = buffer.readu8(scanline, i)
+			local a = buffer.readu8(bitmap, currentRowOffset + i - 4)
+			local b = buffer.readu8(bitmap, upperRowOffset + i)
+			local reconstructedByte
+
+			if protectAlpha and (i % 4) == 3 then
+				reconstructedByte = x
+			else
+				local avg = bit32.rshift(a + b, 1)
+				reconstructedByte = bit32.band(x + avg, 0xFF)
+			end
+
+			buffer.writeu8(bitmap, currentRowOffset + i, reconstructedByte)
+		end
+	else
+		for i = 0, 3 do
+			buffer.writeu8(bitmap, currentRowOffset + i, buffer.readu8(scanline, i))
+		end
+
+		for i = 4, rowStride - 1 do
+			local x = buffer.readu8(scanline, i)
+			local reconstructedByte
+
+			if protectAlpha and (i % 4) == 3 then
+				reconstructedByte = x
+			else
+				local b = buffer.readu8(bitmap, currentRowOffset + i)
+				local avg = bit32.rshift(b, 1)
+				reconstructedByte = bit32.band(x + avg, 0xFF)
+			end
+
+			buffer.writeu8(bitmap, currentRowOffset + i, reconstructedByte)
+		end
+	end
+end
+
+-- 4
+function Unfilter.paeth(row, scanline: buffer, bitmap: buffer, width: number, height: number, protectAlpha: boolean)
+	if row > 0 then
+		local rowStride = width * 4
+		local currentRowOffset = row * rowStride
+		local upperRowOffset = (row - 1) * rowStride
+
+		for i = 0, 3 do
+			local x = buffer.readu8(scanline, i)
+			local b = buffer.readu8(bitmap, upperRowOffset + i)
+			local reconstructedByte
+
+			if protectAlpha and i == 3 then
+				reconstructedByte = x
+			else
+				reconstructedByte = bit32.band(x + b, 0xFF)
+			end
+
+			buffer.writeu8(bitmap, currentRowOffset + i, reconstructedByte)
+		end
+
+		for i = 4, rowStride - 1 do
+			local isAlpha = protectAlpha and (i % 4) == 3
+
+			if isAlpha then
+				-- Directly copy for protected alpha :)
+				buffer.writeu8(bitmap, currentRowOffset + i, buffer.readu8(scanline, i))
+			else
+				-- Normal Paeth predictor!
+				local a = buffer.readu8(bitmap, currentRowOffset + i - 4)
+				local b = buffer.readu8(bitmap, upperRowOffset + i)
+				local c = buffer.readu8(bitmap, upperRowOffset + i - 4)
+
+				local x = buffer.readu8(scanline, i)
+				local p = a + b - c
+
+				local pa = math.abs(p - a)
+				local pb = math.abs(p - b)
+				local pc = math.abs(p - c)
+
+				local pr
+				if pa <= pb and pa <= pc then
+					pr = a
+				elseif pb <= pc then
+					pr = b
+				else
+					pr = c
+				end
+
+				buffer.writeu8(bitmap, currentRowOffset + i, bit32.band(x + pr, 0xFF))
+			end
+		end
+	else
+		Unfilter.sub(row, scanline, bitmap, width, height, protectAlpha)
+	end
+end
+
+local unfilteringFunctions = {
+	[0] = Unfilter.none,
+	[1] = Unfilter.sub,
+	[2] = Unfilter.up,
+	[3] = Unfilter.average,
+	[4] = Unfilter.paeth,
+}
+
+function Unfilter.unfilter(
+	t: number,
+	row: number,
+	scanline: buffer,
+	bitmap: buffer,
+	width: number,
+	height: number,
+	protectAlpha: boolean
+)
+    unfilteringFunctions[t](row, scanline, bitmap, width, height, protectAlpha)
+end
+
+return Unfilter
+]])
+mod("util", _14, [[
+return require(script.Parent.Parent.util)]])
+mod("Tga", _11, [[
+local Reader = script.Parent
+local ImageReader = Reader.Parent
+local Cursor = require(ImageReader.Parent.Cursor)
+local ImageError = require(ImageReader.Parent.ImageError)
+local Result = require(ImageReader.Parent.Result)
+local ImageReaderStructs = require(ImageReader.structs)
+local DynamicImageTypes = require(ImageReader.Parent.DynamicImage.types)
+local util = require(Reader.util)
+
+type Result<T, E> = Result.Result<T, E>
+type ImageResult<T> = ImageError.ImageResult<T>
+type DynamicImage<T> = DynamicImageTypes.DynamicImage<T>
+type Dimensions = ImageReaderStructs.Dimensions
+type Cursor = Cursor.Cursor
+export type TgaHeader = {
+	idLength: number,
+	colorMapType: number,
+	imageType: number,
+	colorMapFirstEntry: number,
+	colorMapLength: number,
+	colorMapEntrySize: number,
+	xOrigin: number,
+	yOrigin: number,
+	dimensions: Dimensions,
+	pixelDepth: number,
+	imageDescriptor: number,
+}
+
+local Tga = {
+	canEncode = false,
+}
+
+function Tga.getHeader(cursor: Cursor): ImageResult<TgaHeader>
+	local s, r = pcall(function(...)
+		cursor.position = 0
+
+		local bytestream = cursor:ReadByteCollection(18)
+		local headerCursor = Cursor.new(bytestream)
+
+		local idLength = headerCursor:ReadByte()
+		local colorMapType = headerCursor:ReadByte()
+		local imageType = headerCursor:ReadByte()
+
+		local colorMapFirstEntry = headerCursor:ReadU16()
+		local colorMapLength = headerCursor:ReadU16()
+		local colorMapEntrySize = headerCursor:ReadByte()
+
+		local xOrigin = headerCursor:ReadU16()
+		local yOrigin = headerCursor:ReadU16()
+
+		local dimensions = Tga.getDimensions(headerCursor):Unwrap()
+
+		local pixelDepth = headerCursor:ReadByte()
+		local imageDescriptor = headerCursor:ReadByte()
+		
+		local validPixelDepths = { [24] = true, [32] = true }
+
+		if not validPixelDepths[pixelDepth] then
+			return Result.err(ImageError.Unsupported)
+		end
+
+		local width, height = dimensions.width, dimensions.height
+		if width <= 0 or height <= 0 then
+			return Result.err(ImageError.Unsupported)
+		end
+
+		return Result.ok({
+			idLength = idLength,
+			colorMapType = colorMapType,
+			imageType = imageType,
+			colorMapFirstEntry = colorMapFirstEntry,
+			colorMapLength = colorMapLength,
+			colorMapEntrySize = colorMapEntrySize,
+			xOrigin = xOrigin,
+			yOrigin = yOrigin,
+			dimensions = dimensions,
+			pixelDepth = pixelDepth,
+			imageDescriptor = imageDescriptor,
+		})
+	end)
+
+	if not s then
+		return Result.err(ImageError.Decoding)
+	end
+
+	return r
+end
+
+function Tga.getDimensions(cursor: Cursor): ImageResult<Dimensions>
+	cursor.position = 12
+
+	local s, r = pcall(function(...)
+		local width, height = cursor:ReadU16(), cursor:ReadU16()
+		return Result.ok({ width = width, height = height })
+	end)
+
+	if not s then
+		return Result.err(ImageError.Decoding)
+	end
+
+	return r
+end
+
+function Tga.isFile(cursor: Cursor)
+	local s, r = pcall(function(...)
+		return Result.ok(Tga.getHeader(cursor).isOk)
+	end)
+
+	if not s then
+		return Result.err(ImageError.Decoding)
+	end
+
+	return r
+end
+
+local createRGBAColor = util.createRGBAColor
+
+function Tga.decode(cursor: Cursor)
+	local s, r = pcall(function(...)
+		local header = Tga.getHeader(cursor):Unwrap()
+		if header.idLength > 0 then
+			cursor:SkipBytes(header.idLength)
+		end
+
+		local is32Bit = header.pixelDepth == 32
+		local dimensions = header.dimensions
+		local width, height = dimensions.width, dimensions.height
+		local bfr = buffer.create(width * height * 4)
+		if header.imageType == 2 or header.imageType == 3 then
+			-- Uncompressed
+			local is24Bit = header.pixelDepth == 24
+			
+			local yStart, yEnd, yDir = 0, height - 1, 1
+			
+			if header.imageDescriptor == 0 then -- Image is vertically flipped
+				yStart, yEnd, yDir = yEnd, yStart, -1
+			end
+			
+			for y = yStart, yEnd, yDir do
+				for x = 0, width - 1 do
+					if is24Bit then
+						local b, g, r = cursor:ReadByte(), cursor:ReadByte(), cursor:ReadByte()
+						buffer.writeu32(bfr, (y * width + x) * 4, createRGBAColor(r, g, b))
+					elseif is32Bit then
+						local alphaBits = bit32.band(header.imageDescriptor, 0x0F)
+						local b, g, r, a = cursor:ReadByte(), cursor:ReadByte(), cursor:ReadByte(), cursor:ReadByte()
+						
+						if alphaBits == 0 then a = 255 end -- ignore alpha if alphaBits is blank
+					
+						buffer.writeu32(bfr, (y * width + x) * 4, createRGBAColor(r, g, b, a))
+					end
+				end
+			end
+
+			return Result.ok(width, height, bfr, header)
+		elseif header.imageType == 10 or header.imageType == 11 then
+			local totalPixels = width * height
+			local currentPixel = 0
+
+			while currentPixel < totalPixels do
+				local rlePacket = cursor:ReadByte()
+				local isRLE = bit32.band(rlePacket, 0x80) ~= 0
+				local count = bit32.band(rlePacket, 0x7f) + 1
+
+				if isRLE then
+					local b, g, r = cursor:ReadByte(), cursor:ReadByte(), cursor:ReadByte()
+					local a = is32Bit and cursor:ReadByte() or 255
+					local rgba = createRGBAColor(r, g, b, a)
+
+					for _ = 1, count do
+						buffer.writeu32(bfr, currentPixel * 4, rgba)
+						currentPixel += 1
+					end
+				else
+					for _ = 1, count do
+						local b, g, r = cursor:ReadByte(), cursor:ReadByte(), cursor:ReadByte()
+						local a = is32Bit and cursor:ReadByte() or 255
+						local rgba = createRGBAColor(r, g, b, a)
+						buffer.writeu32(bfr, currentPixel * 4, rgba)
+						currentPixel += 1
+					end
+				end
+			end
+			
+			-- Vertically flip the buffer
+			local bufferUnflipped = buffer.create(width * height * 4)
+			
+			for y = 0, height - 1 do
+				local sourceIndex = y * width * 4
+				local targetIndex = (height - 1 - y) * width * 4
+
+				-- Copy a row of the image straight onto the main buffer
+				buffer.copy(
+					bufferUnflipped,
+					targetIndex,
+					bfr,
+					sourceIndex,
+					width * 4
+				)
+			end
+
+			return Result.ok(width, height, bufferUnflipped, header)
+		else
+			return Result.err(ImageError.Unsupported)
+		end
+	end)
+
+	if s then
+		return r
+	end
+
+	return Result.err(ImageError.Decoding)
+end
+
+return Tga
+]])
+mod("util", _11, [[
+local util = {}
+
+function util.createRGBAColor(r: number, g: number, b: number, a: number?): number
+    return bit32.bor(
+        if a then a * 16777216 else 4278190080,
+        b * 65536,
+        g * 256,
+        r
+    )
+end
+
+function util.beToLe32(beValue: number)
+	return bit32.bor(
+		bit32.rshift(bit32.band(beValue, 0xFF000000), 24),
+		bit32.rshift(bit32.band(beValue, 0x00FF0000), 8),
+		bit32.lshift(bit32.band(beValue, 0x0000FF00), 8),
+		bit32.lshift(bit32.band(beValue, 0x000000FF), 24)
+	)
+end
+
+function util.beToLe16(beValue: number)
+    return bit32.bor(
+        bit32.rshift(bit32.band(beValue, 0xFF00), 8),
+        bit32.lshift(bit32.band(beValue, 0x00FF), 8)
+    )
+end
+
+return util]])
+mod("structs", _10, [[
+export type Dimensions = { width: number, height: number }
+
+export type function getAppropriateDecoder(ty: type, tys: type)
+    return tys:readproperty(ty)
+end
+
+return nil]])
+mod("types", _10, [[
+local ImageFormat = require(script.Parent.Parent.ImageFormat)
+local ImageError = require(script.Parent.Parent.ImageError)
+local Cursor = require(script.Parent.Parent.Cursor)
+local DynamicImageTypes = require(script.Parent.Parent.DynamicImage.types)
+local structs = require(script.Parent.structs)
+
+local Reader = script.Parent.Reader
+local Bmp = require(Reader.Bmp)
+local Png = require(Reader.Png)
+local Tga = require(Reader.Tga)
+local Jpg = require(Reader.Jpeg)
+
+type ImageResult<T> = ImageError.ImageResult<T>
+type ImageFormat = ImageFormat.ImageFormat
+type Cursor = Cursor.Cursor
+export type ReadableData = buffer | string
+
+export type HeaderTypes = {
+    ["BMP"]: Bmp.BmpHeader,
+    ["PNG"]: Png.PngHeader,
+    ["TGA"]: Tga.TgaHeader,
+    ["JPG"]: Jpg.JpgHeader,
+}
+
+export type ImageReader<T> = {
+	WithGuessedFormat: (self: ImageReader<T>) -> ImageResult<keyof<HeaderTypes>>,
+
+    Decode: (self: ImageReader<T>) -> ImageResult<DynamicImageTypes.DynamicImage<structs.getAppropriateDecoder<T, HeaderTypes>>>,
+    IntoDimensions: (self: ImageReader<T>) -> ImageResult<structs.Dimensions>,
+	IntoHeader: (self: ImageReader<T>) -> ImageResult<structs.getAppropriateDecoder<T, HeaderTypes>>,
+
+	buffer: buffer,
+	format: ImageFormat,
+    cursor: Cursor,
+}
+
+return nil]])
+mod("Result", _8, [[
+export type Result<T, E> = {
+    isOk: boolean,
+    value: {T | E},
+
+    Unwrap: (self: Result<T, E>) -> T,
+    Expect: (self: Result<T, E>, message: string) -> T,
+
+    UnwrapErr: (self: Result<T, E>) -> E,
+    ExpectErr: (self: Result<T, E>, message: string) -> E,
+}
+
+export type SmallResult<T, E> = {
+    isOk: boolean,
+    value: {T | E}
+}
+
+local Result = {}
+
+function Result.new<T, E>(isOk: boolean, ...: T | E): Result<T, E>
+    return Result.castSmallToDefault(
+        Result.newSmall(isOk, ...)
+    )
+end
+
+function Result.ok<T, E>(...: T | E): Result<T, E>
+    return Result.new(true, ...)
+end
+
+function Result.err<T, E>(...: T | E): Result<T, E>
+    return Result.new(false, ...)
+end
+
+function Result.newSmall<T, E>(isOk: boolean, ...: T | E): SmallResult<T, E>
+    return {
+        isOk = isOk,
+        value = {...},
+    }
+end
+
+function Result.okSmall<T, E>(...: T | E): SmallResult<T, E>
+    return Result.newSmall(true, ...)
+end
+
+function Result.errSmall<T, E>(...: T | E): SmallResult<T, E>
+    return Result.newSmall(false, ...)
+end
+
+function Result.castSmallToDefault<T, E>(result: SmallResult<T, E>): Result<T, E>
+    local res = result
+
+    function res:Unwrap()
+        return res:Expect("Attempt to `unwrap` an erroneous value")
+    end
+
+    function res:Expect(message: string)
+        if not res.isOk then
+            error(message, 3)
+        end
+
+        return table.unpack(res.value)
+    end
+
+    function res:UnwrapErr()
+        return res:ExpectErr("Attempt to unwrap an error out of a correct value")
+    end
+
+    function res:ExpectErr(message: string)
+        if not res.isOk then
+            return res.value[1]
+        end
+
+        error(message, 3)
+    end
+
+    return res
+end
+
+return Result]])
+mod("SafeEnum", _8, [[
+local counter = -1
+
+return function<T>(): T
+	counter += 1
+	return counter
+end
+]])
+local _16 = folder("_Patterns", _1)
+mod("Draw", _16, [[
 -- IMGN
 -- _Patterns/Draw.luau
 -- Plinko Labs
@@ -1980,7 +6194,7 @@ end
 
 return Draw
 ]])
-mod("Font", _7, [[
+mod("Font", _16, [[
 -- IMGN
 -- _Patterns/Font.luau
 -- Plinko Labs
@@ -2103,20 +6317,22 @@ end
 
 return Font
 ]])
-mod("Image", _7, [[
+mod("Image", _16, [[
 -- IMGN
 -- _Patterns/Image.luau
 -- Plinko Labs
 --
--- Adapter for loading real image files (PNG/BMP/TGA/JPG) onto a Canvas, via the osgl-rbx/image
--- deserializer (https://github.com/osgl-rbx/image). That library isn't on Wally and is a heavy
--- thing to vendor, so IMGN does NOT hard-depend on it: you install osgl yourself and pass the
--- required module in. This module just knows how to drive its API and copy the decoded RGBA8
--- buffer onto a Canvas (osgl's DynamicImage buffer is the same 4-bytes-per-pixel layout IMGN
--- uses, so it's a straight per-pixel copy with optional nearest-neighbour scaling).
+-- Adapter for loading real image files (PNG/BMP/TGA/JPG) onto a Canvas. The actual deserializer
+-- is osgl-rbx/image (https://github.com/osgl-rbx/image), vendored under _Packages/Image and used
+-- internally - so callers just pass bytes, no separate install. This module drives osgl's API and
+-- copies the decoded RGBA8 buffer onto a Canvas (osgl's DynamicImage buffer is the same
+-- 4-bytes-per-pixel layout IMGN uses, so it's a straight per-pixel copy with optional
+-- nearest-neighbour scaling).
 --
 -- Bytes come from you: HttpService:GetAsync(url) returns the file as a string, or bake the file
 -- into a ModuleScript - either a `string` or a `buffer` works.
+
+local Decoder = require(script.Parent.Parent._Packages.Image)
 
 --[=[
 	@class Image
@@ -2133,17 +6349,15 @@ export type LoadOptions = {
 	SkipTransparent: boolean?, -- don't write fully-transparent source pixels (composite instead of replace)
 }
 
--- Decode `bytes` (string|buffer) with the passed-in osgl `image` module into a DynamicImage.
-function Image.decode(image: any, bytes: string | buffer, format: string?): any
-	assert(image and image.ImageReader, "IMGN: pass the osgl-rbx/image module as the first argument")
-
+-- Decode `bytes` (string|buffer) with the bundled decoder into a DynamicImage.
+function Image.decode(bytes: string | buffer, format: string?): any
 	local reader
 	if format then
-		local fmt = image.ImageFormat[format]
+		local fmt = Decoder.ImageFormat[format]
 		assert(fmt, `IMGN: unknown image Format "{format}"`)
-		reader = image.ImageReader.withFormat(bytes, fmt)
+		reader = Decoder.ImageReader.withFormat(bytes, fmt)
 	else
-		reader = image.ImageReader.open(bytes)
+		reader = Decoder.ImageReader.open(bytes)
 		local guess = reader:WithGuessedFormat()
 		if guess and guess.isOk == false then
 			error("IMGN: could not detect the image format (pass Format = \"PNG\" to be explicit)")
@@ -2184,5 +6398,5 @@ end
 return Image
 ]])
 
-print("[IMGN] installed 14 modules under ReplicatedStorage.IMGN")
+print("[IMGN] installed 50 modules under ReplicatedStorage.IMGN")
 return true

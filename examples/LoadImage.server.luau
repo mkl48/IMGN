@@ -1,12 +1,11 @@
 -- LoadImage -- decode a real PNG onto a surface (no EditableImage, no verification).
 --
--- IMGN doesn't bundle a decoder; it drives osgl-rbx/image, which you install yourself.
+-- The image decoder (osgl-rbx/image) ships inside IMGN, so there's nothing extra to install -
+-- just hand IMGN the file bytes.
 --
 -- SETUP:
---   1. Get osgl: https://github.com/osgl-rbx/image (grab the v1.0 .rbxm release), and put it
---      under ReplicatedStorage named "Image".
---   2. Enable Game Settings -> Security -> Allow HTTP Requests (so we can fetch the file).
---   3. Put a Part named "Photo" in the Workspace, and set PNG_URL below to a SMALL png.
+--   1. Enable Game Settings -> Security -> Allow HTTP Requests (so we can fetch the file).
+--   2. Put a Part named "Photo" in the Workspace, and set PNG_URL below to a SMALL png.
 --
 -- Keep images small (<= ~128px on the long side, or use Scale < 1) -- a Frame-based canvas is
 -- bound by instance count. Drop this in ServerScriptService with IMGN under ReplicatedStorage.
@@ -18,11 +17,9 @@ local IMGN = ReplicatedStorage:FindFirstChild("Packages") and ReplicatedStorage.
 	or ReplicatedStorage:WaitForChild("IMGN")
 IMGN = require(IMGN)
 
-local Image = require(ReplicatedStorage:WaitForChild("Image")) -- the osgl-rbx/image module
-
 local PNG_URL = "https://example.com/your-small-image.png" -- <- set me to a real PNG
 
--- fetch the raw file bytes (a string is fine; osgl also accepts a buffer)
+-- fetch the raw file bytes (a string is fine; a buffer works too)
 local ok, bytes = pcall(function()
 	return HttpService:GetAsync(PNG_URL)
 end)
@@ -42,7 +39,7 @@ surface.Adornee = part
 surface.Parent = part
 
 -- Decode + draw in one call. Scale = 1 keeps native size; use e.g. 0.5 to halve a big image.
-local canvas = IMGN.ImageCanvas(Image, bytes, {
+local canvas = IMGN.ImageCanvas(bytes, {
 	Parent = surface,
 	Scale = 1,
 	Format = "PNG", -- skip auto-detection

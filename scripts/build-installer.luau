@@ -144,6 +144,9 @@ local header = [[
 --
 -- Paste this whole script into the Roblox Studio command bar to (re)install IMGN into
 -- ReplicatedStorage. A previous install named "IMGN" is replaced.
+--
+-- Bundles osgl-rbx/image (c) 2023-2025 OSGL Contributors, under the OSGL License
+-- (https://github.com/osgl-rbx/image), as ReplicatedStorage.IMGN._Packages.Image.
 
 local RS = game:GetService("ReplicatedStorage")
 

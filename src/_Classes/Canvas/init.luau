@@ -259,15 +259,14 @@ end
 
 --[=[
 	@within Canvas
-	Decodes a real image file and draws it onto this canvas. `image` is the
-	[osgl-rbx/image](https://github.com/osgl-rbx/image) module (IMGN doesn't bundle it - install it
-	and pass it in); `bytes` is the file as a `string` or `buffer` (e.g. from
+	Decodes a real image file (PNG/BMP/TGA/JPG) and draws it onto this canvas. The decoder is
+	bundled with IMGN - just pass `bytes`, the file as a `string` or `buffer` (e.g. from
 	`HttpService:GetAsync`). `options` (see [Image.LoadOptions]) sets `X`/`Y` offset, nearest-
 	neighbour `Scale`, an explicit `Format`, and `SkipTransparent`. Returns the drawn width/height.
 	Call `:Render()` afterwards.
 ]=]
-function Canvas.LoadImage(self: Canvas, image: any, bytes: string | buffer, options: Image.LoadOptions?): (number, number)
-	local decoded = Image.decode(image, bytes, options and options.Format)
+function Canvas.LoadImage(self: Canvas, bytes: string | buffer, options: Image.LoadOptions?): (number, number)
+	local decoded = Image.decode(bytes, options and options.Format)
 	return Image.blit(self, decoded, options)
 end
 

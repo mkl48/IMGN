@@ -159,17 +159,16 @@ A `section` is a 1-D view: `section.Index` (the row's y / column's x), `section.
 
 ## Loading real images
 
-IMGN can draw actual image files — PNG/BMP/TGA/JPG — onto a canvas. It doesn't bundle a decoder (that'd be a lot to vendor); instead it drives **[osgl-rbx/image](https://github.com/osgl-rbx/image)**, which you install yourself and pass in. No hard dependency, no `EditableImage`, no verification.
+IMGN can draw actual image files — PNG/BMP/TGA/JPG — onto a canvas. The decoder ([osgl-rbx/image](https://github.com/osgl-rbx/image)) is **bundled inside IMGN**, so there's nothing extra to install — just hand it the file bytes. No `EditableImage`, no verification.
 
 ```lua
-local Image = require(ReplicatedStorage.Image)   -- the osgl-rbx/image module
 local bytes = HttpService:GetAsync(pngUrl)        -- the file as a string (or a buffer)
 
 -- build a canvas sized to the decoded image:
-local canvas = IMGN.ImageCanvas(Image, bytes, { Parent = surfaceGui, Format = "PNG" })
+local canvas = IMGN.ImageCanvas(bytes, { Parent = surfaceGui, Format = "PNG" })
 
 -- or draw onto an existing canvas at an offset/scale:
-canvas:LoadImage(Image, bytes, { X = 4, Y = 4, Scale = 0.5, SkipTransparent = true })
+canvas:LoadImage(bytes, { X = 4, Y = 4, Scale = 0.5, SkipTransparent = true })
 canvas:Render()
 ```
 
@@ -230,12 +229,16 @@ See [`examples/`](examples):
 - **Mandelbrot** — a self-zooming fractal via `:Shader`.
 - **Snake** — the classic, with a bitmap-font scoreboard (WASD / arrows).
 - **Raycaster** — a Wolfenstein-style first-person 3D view (W/S walk, A/D turn).
-- **LoadImage** — decode a real PNG onto a part via osgl-rbx/image.
+- **LoadImage** — decode a real PNG onto a part (decoder bundled).
 
 - **GradientSurface** — procedural gradient on a part via `:Shader`.
 - **PaintCanvas** — click-drag finger paint on a `ScreenGui` with `AutoRender`.
 - **Sprite** — pixel-art heart via `RowMerge`.
 
+## Credits
+
+Image decoding is powered by **[osgl-rbx/image](https://github.com/osgl-rbx/image)** (© 2023–2025 OSGL Contributors), bundled under `src/_Packages/Image/`. It remains under its own [OSGL License](src/_Packages/Image/LICENSE) — only IMGN's own code is MIT.
+
 ## License
 
-MIT © 2026 kr3ative
+MIT © 2026 kr3ative — except the bundled `src/_Packages/Image/` (OSGL License, see above).
