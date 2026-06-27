@@ -123,6 +123,7 @@ function Liquid.new(config: LiquidConfig): Liquid
 		_dry = table.create(count, 0),
 		_shown = table.create(count, -1),
 		_delta = table.create(count, 0),
+		_active = false, -- sim sleeps when nothing is moving/drying; Add/Splat wakes it
 		_conn = nil,
 		_running = false,
 	}, Liquid)
@@ -139,6 +140,7 @@ function Liquid.Add(self: Liquid, x: number, y: number, amount: number)
 	local i = y * self.Width + x + 1
 	self._amount[i] = math.min(self.Capacity, self._amount[i] + amount)
 	self._dry[i] = 0 -- fresh again
+	self._active = true -- wake the sim
 end
 
 -- Add a soft radial blob of fluid.
@@ -183,9 +185,16 @@ end
 	directly for a fixed-step or headless sim.
 ]=]
 function Liquid.Step(self: Liquid, dt: number)
+	-- Sleep when fully settled + dried: stepping a static stain over and over is the difference
+	-- between "free" and "melts the game" when there are lots of surfaces.
+	if not self._active then
+		return
+	end
+
 	local W, H = self.Width, self.Height
 	local amount, dry, shown, delta = self._amount, self._dry, self._shown, self._delta
 	local CAP, CLING, SPREAD = self.Capacity, self.Cling, self.Spread
+	local cellCount = W * H
 
 	-- Gravity is an arbitrary canvas-space vector, so fluid drips along whatever direction the
 	-- surface's "downhill" maps to (walls, slopes, rotated parts). Its magnitude is the flow rate.
@@ -194,10 +203,8 @@ function Liquid.Step(self: Liquid, dt: number)
 	local sgnX = if gx > 1e-4 then 1 elseif gx < -1e-4 then -1 else 0
 	local sgnY = if gy > 1e-4 then 1 elseif gy < -1e-4 then -1 else 0
 
-	-- 1) directional flow via a delta buffer: each cell sends its movable fluid (everything above
-	-- the Cling film it leaves as a streak) toward the gravity direction, split across the vertical,
-	-- horizontal and diagonal downhill neighbours by weight. The delta buffer makes it order-free
-	-- and exactly mass-conserving, and the capacity check keeps cells from overflowing.
+	-- 1) directional flow via a delta buffer (mass-conserving, capacity-aware). Sends are inlined -
+	-- no per-cell closures or table allocations in the hot loop.
 	if gmag > 1e-4 then
 		local nx, ny = gx / gmag, gy / gmag
 		local wx, wy = math.abs(nx), math.abs(ny)
@@ -206,8 +213,9 @@ function Liquid.Step(self: Liquid, dt: number)
 		if total <= 0 then
 			total = 1
 		end
+		local fy, fx, fd = wy / total, wx / total, wd / total
 
-		for i = 1, W * H do
+		for i = 1, cellCount do
 			delta[i] = 0
 		end
 
@@ -219,34 +227,52 @@ function Liquid.Step(self: Liquid, dt: number)
 				if a > CLING then
 					local movable = a - CLING
 					local out = 0
-					local function send(tx: number, ty: number, weight: number)
-						if weight <= 0 or tx < 0 or ty < 0 or tx >= W or ty >= H then
-							return
-						end
-						local ti = ty * W + tx + 1
+					-- vertical
+					local ty = y + sgnY
+					if sgnY ~= 0 and ty >= 0 and ty < H then
+						local ti = ty * W + x + 1
 						local space = CAP - (amount[ti] + delta[ti])
 						if space > 0 then
-							local f = math.min(movable * weight / total, space)
+							local f = math.min(movable * fy, space)
 							delta[ti] += f
 							out += f
 						end
 					end
-					send(x, y + sgnY, wy)
-					send(x + sgnX, y, wx)
-					send(x + sgnX, y + sgnY, wd)
+					-- horizontal
+					local tx = x + sgnX
+					if sgnX ~= 0 and tx >= 0 and tx < W then
+						local ti = row + tx + 1
+						local space = CAP - (amount[ti] + delta[ti])
+						if space > 0 then
+							local f = math.min(movable * fx, space)
+							delta[ti] += f
+							out += f
+						end
+					end
+					-- diagonal
+					if sgnX ~= 0 and sgnY ~= 0 and tx >= 0 and tx < W and ty >= 0 and ty < H then
+						local ti = ty * W + tx + 1
+						local space = CAP - (amount[ti] + delta[ti])
+						if space > 0 then
+							local f = math.min(movable * fd, space)
+							delta[ti] += f
+							out += f
+						end
+					end
 					delta[i] -= out
 				end
 			end
 		end
 
-		for i = 1, W * H do
+		for i = 1, cellCount do
 			amount[i] += delta[i]
 		end
 	end
 
-	-- 2) lateral pooling, only when the downhill cell is blocked (or there's no gravity, e.g. a
-	-- floor) - this keeps drips narrow on walls but lets pools level out where fluid collects.
+	-- 2) lateral pooling, only where the downhill cell is blocked (or there's no gravity) - keeps
+	-- drips narrow on walls while pools level out. Neighbours inlined, no allocation.
 	if SPREAD > 0 then
+		local k = 0.25 * SPREAD
 		for y = 0, H - 1 do
 			local row = y * W
 			for x = 0, W - 1 do
@@ -263,16 +289,23 @@ function Liquid.Step(self: Liquid, dt: number)
 						end
 					end
 					if backed then
-						for _, nx2 in { x - 1, x + 1 } do
-							if nx2 >= 0 and nx2 < W then
-								local ni = row + nx2 + 1
-								local diff = a - amount[ni]
-								if diff > 0.05 then
-									local m = diff * 0.25 * SPREAD
-									amount[i] = a - m
-									amount[ni] += m
-									a = amount[i]
-								end
+						if x > 0 then
+							local ni = i - 1
+							local diff = a - amount[ni]
+							if diff > 0.05 then
+								local m = diff * k
+								amount[i] = a - m
+								amount[ni] += m
+								a = amount[i]
+							end
+						end
+						if x < W - 1 then
+							local ni = i + 1
+							local diff = a - amount[ni]
+							if diff > 0.05 then
+								local m = diff * k
+								amount[i] = a - m
+								amount[ni] += m
 							end
 						end
 					end
@@ -281,13 +314,14 @@ function Liquid.Step(self: Liquid, dt: number)
 		end
 	end
 
-	-- 3) evaporate, dry, and repaint changed cells
+	-- 3) evaporate, dry, repaint changed cells, and decide whether to keep simulating
 	local evap = self.Evaporation * dt
 	local dryStep = self.DryRate * dt
 	local stain = self.Stain
 	local alphaAt = self.AlphaAt
 	local fr, dr = self.Fresh, self.Dry
 	local canvas = self.Canvas
+	local active = false
 
 	for y = 0, H - 1 do
 		local row = y * W
@@ -295,15 +329,20 @@ function Liquid.Step(self: Liquid, dt: number)
 			local i = row + x + 1
 			local a = amount[i]
 			if a > 0 then
-				dry[i] = math.min(1, dry[i] + dryStep)
+				if dry[i] < 1 then
+					dry[i] = math.min(1, dry[i] + dryStep)
+				end
 				a = a - evap
 				if a < stain then
 					a = if dry[i] >= 0.999 then stain else math.max(a, 0)
 				end
 				amount[i] = a
+				-- still working if anything can still flow or is still drying
+				if a > CLING or dry[i] < 0.999 then
+					active = true
+				end
 			end
 
-			-- repaint only on a meaningful change
 			if math.abs(a - shown[i]) > 0.02 then
 				shown[i] = a
 				if a <= 0.001 then
@@ -313,7 +352,6 @@ function Liquid.Step(self: Liquid, dt: number)
 					local r = dr[1] + (fr[1] - dr[1]) * fresh
 					local g = dr[2] + (fr[2] - dr[2]) * fresh
 					local b = dr[3] + (fr[3] - dr[3]) * fresh
-					-- thicker = a touch darker (pooled blood reads deeper)
 					local thick = math.clamp(a / CAP, 0, 1) * 0.25
 					canvas:SetPixel(
 						x,
@@ -326,6 +364,7 @@ function Liquid.Step(self: Liquid, dt: number)
 		end
 	end
 
+	self._active = active
 	canvas:Render()
 end
 

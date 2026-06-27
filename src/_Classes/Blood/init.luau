@@ -27,20 +27,23 @@ local Surface = require(script.Surface)
 local Blood = {}
 
 local SETTINGS = {
-	PixelsPerStud = 10, -- canvas resolution per stud of surface
-	MaxResolution = 160, -- clamp so a big wall doesn't melt the renderer
+	PixelsPerStud = 4, -- canvas resolution per stud of surface (lower = far fewer Frames)
+	MaxResolution = 64, -- clamp so a big wall doesn't melt the renderer
 	Preset = "Blood",
 	DropletSize = 0.4,
 	DropletColor = Color3.fromRGB(120, 6, 8),
 	DropletLifetime = 6, -- seconds before a droplet that never lands is cleaned up
 	SplatAmount = 4,
-	Dynamic = true, -- recompute each surface's gravity per frame (drips react to rotation)
+	Dynamic = false, -- recompute a surface's gravity every frame (only needed for MOVING parts)
+	GravityTransform = nil :: (((Vector2, BasePart, Enum.NormalId) -> Vector2)?), -- correct face orientation
 }
 
 --[=[
 	@within Blood
 	Overrides engine defaults: `PixelsPerStud`, `MaxResolution`, `Preset`, `DropletSize`,
-	`DropletColor`, `DropletLifetime`, `SplatAmount`, `Dynamic`.
+	`DropletColor`, `DropletLifetime`, `SplatAmount`, `Dynamic`, and `GravityTransform` - a
+	`function(gravity, part, face) -> Vector2` to correct drip direction per face if the Top/Bottom
+	convention is off in your place (e.g. `return Vector2.new(g.Y, g.X)` to swap axes).
 ]=]
 function Blood.Configure(overrides: { [string]: any })
 	for key, value in overrides do
@@ -70,6 +73,16 @@ BloodSurface.__index = BloodSurface
 -- key a part/face pair to its BloodSurface
 local surfaces: { [BasePart]: { [Enum.NormalId]: any } } = setmetatable({}, { __mode = "k" })
 
+-- Canvas-space gravity for a face, with the optional user correction applied.
+local function computeGravity(part: BasePart, normalId: Enum.NormalId): Vector2
+	local _normal, right, down = Surface.faceVectors(part, normalId)
+	local g = Surface.gravityVector(right, down)
+	if SETTINGS.GravityTransform then
+		g = SETTINGS.GravityTransform(g, part, normalId)
+	end
+	return g
+end
+
 local function faceExtent(part: BasePart, right: Vector3, down: Vector3): (number, number)
 	local s = part.Size
 	local w = math.abs(right.X * s.X) + math.abs(right.Y * s.Y) + math.abs(right.Z * s.Z)
@@ -95,7 +108,7 @@ function BloodSurface.new(part: BasePart, normalId: Enum.NormalId)
 	local liquid = Liquid.new({
 		Canvas = canvas,
 		Preset = SETTINGS.Preset,
-		Gravity = Surface.gravityVector(right, down),
+		Gravity = computeGravity(part, normalId),
 	})
 	liquid:Start()
 
@@ -115,8 +128,7 @@ function BloodSurface.new(part: BasePart, normalId: Enum.NormalId)
 				self:Destroy()
 				return
 			end
-			local _n, r, d = Surface.faceVectors(part, normalId)
-			liquid.Gravity = Surface.gravityVector(r, d)
+			liquid.Gravity = computeGravity(part, normalId)
 		end)
 	end
 
@@ -124,6 +136,10 @@ function BloodSurface.new(part: BasePart, normalId: Enum.NormalId)
 end
 
 function BloodSurface.Splat(self: any, worldPos: Vector3, amount: number, velocity: Vector3?)
+	-- refresh gravity in case the part moved since last splat (cheap; only on splat)
+	if not SETTINGS.Dynamic then
+		self.Liquid.Gravity = computeGravity(self.Part, self.Face)
+	end
 	local px, py = Surface.worldToPixel(self.Part, self.Face, worldPos, self.Width, self.Height)
 	local canvasVel = Vector2.zero
 	if velocity then

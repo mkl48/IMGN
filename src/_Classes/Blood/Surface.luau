@@ -46,30 +46,38 @@ function Surface.faceFromNormal(part: BasePart, worldNormal: Vector3): Enum.Norm
 	return Surface.bestFace(faces, worldNormal)
 end
 
+-- A SurfaceGui's canvas axes in the part's LOCAL space: (right = canvas +X, up = canvas +Y-up).
+-- Canvas DOWN is -up. The vertical faces (Front/Back/Left/Right) are reliable; Top/Bottom depend
+-- on the exact SurfaceGui convention and NEED A STUDIO CHECK - if drips run the wrong way on a
+-- floor/ramp, flip these or use Blood's GravityTransform knob.
+local function localAxes(normalId: Enum.NormalId): (Vector3, Vector3)
+	if normalId == Enum.NormalId.Front then
+		return Vector3.new(1, 0, 0), Vector3.new(0, 1, 0)
+	elseif normalId == Enum.NormalId.Back then
+		return Vector3.new(-1, 0, 0), Vector3.new(0, 1, 0)
+	elseif normalId == Enum.NormalId.Right then
+		return Vector3.new(0, 0, -1), Vector3.new(0, 1, 0)
+	elseif normalId == Enum.NormalId.Left then
+		return Vector3.new(0, 0, 1), Vector3.new(0, 1, 0)
+	elseif normalId == Enum.NormalId.Top then
+		return Vector3.new(1, 0, 0), Vector3.new(0, 0, -1)
+	else -- Bottom
+		return Vector3.new(1, 0, 0), Vector3.new(0, 0, 1)
+	end
+end
+
 --[=[
 	@within Surface
 	World-space unit vectors for a face: its `normal`, the canvas `right` (+X) and canvas `down`
-	(+Y). `down` is flipped to actually point downward in the world for non-horizontal faces, so a
-	wall's canvas Y runs with gravity. NEEDS STUDIO CHECK on the tangent convention.
+	(+Y), taken from the SurfaceGui's per-face axis convention (no mirroring). NEEDS STUDIO CHECK on
+	Top/Bottom - see `localAxes`.
 ]=]
 function Surface.faceVectors(part: BasePart, normalId: Enum.NormalId): (Vector3, Vector3, Vector3)
 	local cf = part.CFrame
-	local normal = cf:VectorToWorldSpace(Vector3.fromNormalId(normalId)).Unit
-
-	-- a right tangent perpendicular to the normal (fall back to the part's own right axis when the
-	-- face is nearly horizontal and world-up is parallel to the normal)
-	local right = normal:Cross(Vector3.yAxis)
-	if right.Magnitude < 1e-3 then
-		right = cf.RightVector
-	end
-	right = right.Unit
-
-	local down = right:Cross(normal).Unit
-	if down:Dot(Vector3.new(0, -1, 0)) < 0 then
-		-- make canvas +Y point downward in the world (and keep the basis consistent)
-		down = -down
-		right = -right
-	end
+	local localRight, localUp = localAxes(normalId)
+	local normal = cf:VectorToWorldSpace(Vector3.fromNormalId(normalId))
+	local right = cf:VectorToWorldSpace(localRight)
+	local down = cf:VectorToWorldSpace(-localUp)
 	return normal, right, down
 end
 

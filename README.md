@@ -199,7 +199,19 @@ IMGN.Blood.Splat(part, Enum.NormalId.Front, worldPos, 4)
 
 How it works: `Emit` spawns a real droplet `Part` that flies under gravity; a per-frame raycast catches the surface it lands on; that face is turned (once, then cached) into an IMGN canvas with a `Liquid("Blood")` sim whose **gravity is the face's downhill direction** (`Surface.gravityVector` projects world-down onto the face — a wall gives `(0,1)`, a slope tilts it, a floor gives `(0,0)` so it pools). With `Dynamic` on (default) each surface re-reads its orientation every frame, so drips react live to rotation. The droplet then shrinks and is destroyed. Tune via `IMGN.Blood.Configure { PixelsPerStud = …, Preset = "Blood", DropletSize = …, … }`.
 
-> **Verified vs. needs-Studio:** the 2D sim and the gravity projection are unit-tested. The 3D pieces — droplet physics, the raycast landing, and the face/UV mapping in `Surface` — follow Roblox conventions (`Vector3.fromNormalId`, `CFrame`, `SurfaceGui` orientation) that can only be confirmed in a running place, so give the face axes a sanity check in Studio and tune from there.
+**Performance:** each surface's sim **sleeps** once its blood has settled and dried (a static stain costs ~nothing), and the hot loop is allocation-free. Resolution defaults are modest (`PixelsPerStud = 4`, capped at `64`) to keep Frame counts down — raise them for crisper blood, lower them if you have many surfaces. `Dynamic` is off by default (gravity is refreshed on each splat); turn it on only for parts that *move* while bloodied.
+
+**If drips run the wrong way** on a floor/ramp, it's the Top/Bottom face-axis convention (the one thing I can't confirm outside Studio). Correct it without touching the source:
+
+```lua
+IMGN.Blood.Configure({
+    GravityTransform = function(g, part, face)
+        return Vector2.new(-g.X, g.Y)   -- e.g. flip X, or Vector2.new(g.Y, g.X) to swap axes
+    end,
+})
+```
+
+> **Verified vs. needs-Studio:** the 2D sim and the gravity projection are unit-tested. The 3D pieces — droplet physics, the raycast landing, and the face/UV mapping in `Surface` (`Vector3.fromNormalId`, `CFrame`, `SurfaceGui` orientation) — can only be confirmed in a running place. Vertical walls are reliable; sanity-check Top/Bottom and use `GravityTransform` if needed.
 
 See `examples/KillBrick.server.luau`.
 

@@ -1132,20 +1132,23 @@ local Surface = require(script.Surface)
 local Blood = {}
 
 local SETTINGS = {
-	PixelsPerStud = 10, -- canvas resolution per stud of surface
-	MaxResolution = 160, -- clamp so a big wall doesn't melt the renderer
+	PixelsPerStud = 4, -- canvas resolution per stud of surface (lower = far fewer Frames)
+	MaxResolution = 64, -- clamp so a big wall doesn't melt the renderer
 	Preset = "Blood",
 	DropletSize = 0.4,
 	DropletColor = Color3.fromRGB(120, 6, 8),
 	DropletLifetime = 6, -- seconds before a droplet that never lands is cleaned up
 	SplatAmount = 4,
-	Dynamic = true, -- recompute each surface's gravity per frame (drips react to rotation)
+	Dynamic = false, -- recompute a surface's gravity every frame (only needed for MOVING parts)
+	GravityTransform = nil :: (((Vector2, BasePart, Enum.NormalId) -> Vector2)?), -- correct face orientation
 }
 
 --[=[
 	@within Blood
 	Overrides engine defaults: `PixelsPerStud`, `MaxResolution`, `Preset`, `DropletSize`,
-	`DropletColor`, `DropletLifetime`, `SplatAmount`, `Dynamic`.
+	`DropletColor`, `DropletLifetime`, `SplatAmount`, `Dynamic`, and `GravityTransform` - a
+	`function(gravity, part, face) -> Vector2` to correct drip direction per face if the Top/Bottom
+	convention is off in your place (e.g. `return Vector2.new(g.Y, g.X)` to swap axes).
 ]=]
 function Blood.Configure(overrides: { [string]: any })
 	for key, value in overrides do
@@ -1175,6 +1178,16 @@ BloodSurface.__index = BloodSurface
 -- key a part/face pair to its BloodSurface
 local surfaces: { [BasePart]: { [Enum.NormalId]: any } } = setmetatable({}, { __mode = "k" })
 
+-- Canvas-space gravity for a face, with the optional user correction applied.
+local function computeGravity(part: BasePart, normalId: Enum.NormalId): Vector2
+	local _normal, right, down = Surface.faceVectors(part, normalId)
+	local g = Surface.gravityVector(right, down)
+	if SETTINGS.GravityTransform then
+		g = SETTINGS.GravityTransform(g, part, normalId)
+	end
+	return g
+end
+
 local function faceExtent(part: BasePart, right: Vector3, down: Vector3): (number, number)
 	local s = part.Size
 	local w = math.abs(right.X * s.X) + math.abs(right.Y * s.Y) + math.abs(right.Z * s.Z)
@@ -1200,7 +1213,7 @@ function BloodSurface.new(part: BasePart, normalId: Enum.NormalId)
 	local liquid = Liquid.new({
 		Canvas = canvas,
 		Preset = SETTINGS.Preset,
-		Gravity = Surface.gravityVector(right, down),
+		Gravity = computeGravity(part, normalId),
 	})
 	liquid:Start()
 
@@ -1220,8 +1233,7 @@ function BloodSurface.new(part: BasePart, normalId: Enum.NormalId)
 				self:Destroy()
 				return
 			end
-			local _n, r, d = Surface.faceVectors(part, normalId)
-			liquid.Gravity = Surface.gravityVector(r, d)
+			liquid.Gravity = computeGravity(part, normalId)
 		end)
 	end
 
@@ -1229,6 +1241,10 @@ function BloodSurface.new(part: BasePart, normalId: Enum.NormalId)
 end
 
 function BloodSurface.Splat(self: any, worldPos: Vector3, amount: number, velocity: Vector3?)
+	-- refresh gravity in case the part moved since last splat (cheap; only on splat)
+	if not SETTINGS.Dynamic then
+		self.Liquid.Gravity = computeGravity(self.Part, self.Face)
+	end
 	local px, py = Surface.worldToPixel(self.Part, self.Face, worldPos, self.Width, self.Height)
 	local canvasVel = Vector2.zero
 	if velocity then
@@ -1430,30 +1446,38 @@ function Surface.faceFromNormal(part: BasePart, worldNormal: Vector3): Enum.Norm
 	return Surface.bestFace(faces, worldNormal)
 end
 
+-- A SurfaceGui's canvas axes in the part's LOCAL space: (right = canvas +X, up = canvas +Y-up).
+-- Canvas DOWN is -up. The vertical faces (Front/Back/Left/Right) are reliable; Top/Bottom depend
+-- on the exact SurfaceGui convention and NEED A STUDIO CHECK - if drips run the wrong way on a
+-- floor/ramp, flip these or use Blood's GravityTransform knob.
+local function localAxes(normalId: Enum.NormalId): (Vector3, Vector3)
+	if normalId == Enum.NormalId.Front then
+		return Vector3.new(1, 0, 0), Vector3.new(0, 1, 0)
+	elseif normalId == Enum.NormalId.Back then
+		return Vector3.new(-1, 0, 0), Vector3.new(0, 1, 0)
+	elseif normalId == Enum.NormalId.Right then
+		return Vector3.new(0, 0, -1), Vector3.new(0, 1, 0)
+	elseif normalId == Enum.NormalId.Left then
+		return Vector3.new(0, 0, 1), Vector3.new(0, 1, 0)
+	elseif normalId == Enum.NormalId.Top then
+		return Vector3.new(1, 0, 0), Vector3.new(0, 0, -1)
+	else -- Bottom
+		return Vector3.new(1, 0, 0), Vector3.new(0, 0, 1)
+	end
+end
+
 --[=[
 	@within Surface
 	World-space unit vectors for a face: its `normal`, the canvas `right` (+X) and canvas `down`
-	(+Y). `down` is flipped to actually point downward in the world for non-horizontal faces, so a
-	wall's canvas Y runs with gravity. NEEDS STUDIO CHECK on the tangent convention.
+	(+Y), taken from the SurfaceGui's per-face axis convention (no mirroring). NEEDS STUDIO CHECK on
+	Top/Bottom - see `localAxes`.
 ]=]
 function Surface.faceVectors(part: BasePart, normalId: Enum.NormalId): (Vector3, Vector3, Vector3)
 	local cf = part.CFrame
-	local normal = cf:VectorToWorldSpace(Vector3.fromNormalId(normalId)).Unit
-
-	-- a right tangent perpendicular to the normal (fall back to the part's own right axis when the
-	-- face is nearly horizontal and world-up is parallel to the normal)
-	local right = normal:Cross(Vector3.yAxis)
-	if right.Magnitude < 1e-3 then
-		right = cf.RightVector
-	end
-	right = right.Unit
-
-	local down = right:Cross(normal).Unit
-	if down:Dot(Vector3.new(0, -1, 0)) < 0 then
-		-- make canvas +Y point downward in the world (and keep the basis consistent)
-		down = -down
-		right = -right
-	end
+	local localRight, localUp = localAxes(normalId)
+	local normal = cf:VectorToWorldSpace(Vector3.fromNormalId(normalId))
+	local right = cf:VectorToWorldSpace(localRight)
+	local down = cf:VectorToWorldSpace(-localUp)
 	return normal, right, down
 end
 
@@ -2020,6 +2044,7 @@ function Liquid.new(config: LiquidConfig): Liquid
 		_dry = table.create(count, 0),
 		_shown = table.create(count, -1),
 		_delta = table.create(count, 0),
+		_active = false, -- sim sleeps when nothing is moving/drying; Add/Splat wakes it
 		_conn = nil,
 		_running = false,
 	}, Liquid)
@@ -2036,6 +2061,7 @@ function Liquid.Add(self: Liquid, x: number, y: number, amount: number)
 	local i = y * self.Width + x + 1
 	self._amount[i] = math.min(self.Capacity, self._amount[i] + amount)
 	self._dry[i] = 0 -- fresh again
+	self._active = true -- wake the sim
 end
 
 -- Add a soft radial blob of fluid.
@@ -2080,9 +2106,16 @@ end
 	directly for a fixed-step or headless sim.
 ]=]
 function Liquid.Step(self: Liquid, dt: number)
+	-- Sleep when fully settled + dried: stepping a static stain over and over is the difference
+	-- between "free" and "melts the game" when there are lots of surfaces.
+	if not self._active then
+		return
+	end
+
 	local W, H = self.Width, self.Height
 	local amount, dry, shown, delta = self._amount, self._dry, self._shown, self._delta
 	local CAP, CLING, SPREAD = self.Capacity, self.Cling, self.Spread
+	local cellCount = W * H
 
 	-- Gravity is an arbitrary canvas-space vector, so fluid drips along whatever direction the
 	-- surface's "downhill" maps to (walls, slopes, rotated parts). Its magnitude is the flow rate.
@@ -2091,10 +2124,8 @@ function Liquid.Step(self: Liquid, dt: number)
 	local sgnX = if gx > 1e-4 then 1 elseif gx < -1e-4 then -1 else 0
 	local sgnY = if gy > 1e-4 then 1 elseif gy < -1e-4 then -1 else 0
 
-	-- 1) directional flow via a delta buffer: each cell sends its movable fluid (everything above
-	-- the Cling film it leaves as a streak) toward the gravity direction, split across the vertical,
-	-- horizontal and diagonal downhill neighbours by weight. The delta buffer makes it order-free
-	-- and exactly mass-conserving, and the capacity check keeps cells from overflowing.
+	-- 1) directional flow via a delta buffer (mass-conserving, capacity-aware). Sends are inlined -
+	-- no per-cell closures or table allocations in the hot loop.
 	if gmag > 1e-4 then
 		local nx, ny = gx / gmag, gy / gmag
 		local wx, wy = math.abs(nx), math.abs(ny)
@@ -2103,8 +2134,9 @@ function Liquid.Step(self: Liquid, dt: number)
 		if total <= 0 then
 			total = 1
 		end
+		local fy, fx, fd = wy / total, wx / total, wd / total
 
-		for i = 1, W * H do
+		for i = 1, cellCount do
 			delta[i] = 0
 		end
 
@@ -2116,34 +2148,52 @@ function Liquid.Step(self: Liquid, dt: number)
 				if a > CLING then
 					local movable = a - CLING
 					local out = 0
-					local function send(tx: number, ty: number, weight: number)
-						if weight <= 0 or tx < 0 or ty < 0 or tx >= W or ty >= H then
-							return
-						end
-						local ti = ty * W + tx + 1
+					-- vertical
+					local ty = y + sgnY
+					if sgnY ~= 0 and ty >= 0 and ty < H then
+						local ti = ty * W + x + 1
 						local space = CAP - (amount[ti] + delta[ti])
 						if space > 0 then
-							local f = math.min(movable * weight / total, space)
+							local f = math.min(movable * fy, space)
 							delta[ti] += f
 							out += f
 						end
 					end
-					send(x, y + sgnY, wy)
-					send(x + sgnX, y, wx)
-					send(x + sgnX, y + sgnY, wd)
+					-- horizontal
+					local tx = x + sgnX
+					if sgnX ~= 0 and tx >= 0 and tx < W then
+						local ti = row + tx + 1
+						local space = CAP - (amount[ti] + delta[ti])
+						if space > 0 then
+							local f = math.min(movable * fx, space)
+							delta[ti] += f
+							out += f
+						end
+					end
+					-- diagonal
+					if sgnX ~= 0 and sgnY ~= 0 and tx >= 0 and tx < W and ty >= 0 and ty < H then
+						local ti = ty * W + tx + 1
+						local space = CAP - (amount[ti] + delta[ti])
+						if space > 0 then
+							local f = math.min(movable * fd, space)
+							delta[ti] += f
+							out += f
+						end
+					end
 					delta[i] -= out
 				end
 			end
 		end
 
-		for i = 1, W * H do
+		for i = 1, cellCount do
 			amount[i] += delta[i]
 		end
 	end
 
-	-- 2) lateral pooling, only when the downhill cell is blocked (or there's no gravity, e.g. a
-	-- floor) - this keeps drips narrow on walls but lets pools level out where fluid collects.
+	-- 2) lateral pooling, only where the downhill cell is blocked (or there's no gravity) - keeps
+	-- drips narrow on walls while pools level out. Neighbours inlined, no allocation.
 	if SPREAD > 0 then
+		local k = 0.25 * SPREAD
 		for y = 0, H - 1 do
 			local row = y * W
 			for x = 0, W - 1 do
@@ -2160,16 +2210,23 @@ function Liquid.Step(self: Liquid, dt: number)
 						end
 					end
 					if backed then
-						for _, nx2 in { x - 1, x + 1 } do
-							if nx2 >= 0 and nx2 < W then
-								local ni = row + nx2 + 1
-								local diff = a - amount[ni]
-								if diff > 0.05 then
-									local m = diff * 0.25 * SPREAD
-									amount[i] = a - m
-									amount[ni] += m
-									a = amount[i]
-								end
+						if x > 0 then
+							local ni = i - 1
+							local diff = a - amount[ni]
+							if diff > 0.05 then
+								local m = diff * k
+								amount[i] = a - m
+								amount[ni] += m
+								a = amount[i]
+							end
+						end
+						if x < W - 1 then
+							local ni = i + 1
+							local diff = a - amount[ni]
+							if diff > 0.05 then
+								local m = diff * k
+								amount[i] = a - m
+								amount[ni] += m
 							end
 						end
 					end
@@ -2178,13 +2235,14 @@ function Liquid.Step(self: Liquid, dt: number)
 		end
 	end
 
-	-- 3) evaporate, dry, and repaint changed cells
+	-- 3) evaporate, dry, repaint changed cells, and decide whether to keep simulating
 	local evap = self.Evaporation * dt
 	local dryStep = self.DryRate * dt
 	local stain = self.Stain
 	local alphaAt = self.AlphaAt
 	local fr, dr = self.Fresh, self.Dry
 	local canvas = self.Canvas
+	local active = false
 
 	for y = 0, H - 1 do
 		local row = y * W
@@ -2192,15 +2250,20 @@ function Liquid.Step(self: Liquid, dt: number)
 			local i = row + x + 1
 			local a = amount[i]
 			if a > 0 then
-				dry[i] = math.min(1, dry[i] + dryStep)
+				if dry[i] < 1 then
+					dry[i] = math.min(1, dry[i] + dryStep)
+				end
 				a = a - evap
 				if a < stain then
 					a = if dry[i] >= 0.999 then stain else math.max(a, 0)
 				end
 				amount[i] = a
+				-- still working if anything can still flow or is still drying
+				if a > CLING or dry[i] < 0.999 then
+					active = true
+				end
 			end
 
-			-- repaint only on a meaningful change
 			if math.abs(a - shown[i]) > 0.02 then
 				shown[i] = a
 				if a <= 0.001 then
@@ -2210,7 +2273,6 @@ function Liquid.Step(self: Liquid, dt: number)
 					local r = dr[1] + (fr[1] - dr[1]) * fresh
 					local g = dr[2] + (fr[2] - dr[2]) * fresh
 					local b = dr[3] + (fr[3] - dr[3]) * fresh
-					-- thicker = a touch darker (pooled blood reads deeper)
 					local thick = math.clamp(a / CAP, 0, 1) * 0.25
 					canvas:SetPixel(
 						x,
@@ -2223,6 +2285,7 @@ function Liquid.Step(self: Liquid, dt: number)
 		end
 	end
 
+	self._active = active
 	canvas:Render()
 end
 
