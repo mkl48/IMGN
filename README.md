@@ -157,6 +157,24 @@ A `section` is a 1-D view: `section.Index` (the row's y / column's x), `section.
 
 > **App backgrounds are solid.** Objects erase to `Background` each frame, so a static *image* backdrop behind moving objects isn't supported in 0.1.0 (a moving body would erase holes in it). Use a solid `Background`, or draw non-moving scenery as anchored Objects.
 
+## Loading real images
+
+IMGN can draw actual image files — PNG/BMP/TGA/JPG — onto a canvas. It doesn't bundle a decoder (that'd be a lot to vendor); instead it drives **[osgl-rbx/image](https://github.com/osgl-rbx/image)**, which you install yourself and pass in. No hard dependency, no `EditableImage`, no verification.
+
+```lua
+local Image = require(ReplicatedStorage.Image)   -- the osgl-rbx/image module
+local bytes = HttpService:GetAsync(pngUrl)        -- the file as a string (or a buffer)
+
+-- build a canvas sized to the decoded image:
+local canvas = IMGN.ImageCanvas(Image, bytes, { Parent = surfaceGui, Format = "PNG" })
+
+-- or draw onto an existing canvas at an offset/scale:
+canvas:LoadImage(Image, bytes, { X = 4, Y = 4, Scale = 0.5, SkipTransparent = true })
+canvas:Render()
+```
+
+**Getting the bytes is on you** — Roblox can't read an uploaded decal's pixels without `EditableImage`, so the file has to come from somewhere else: `HttpService:GetAsync(url)` (needs *Allow HTTP Requests*), or baked into a ModuleScript as a string/buffer. `LoadImage` options: `X`, `Y`, nearest-neighbour `Scale` (use `< 1` to shrink big images — remember the instance-count ceiling), explicit `Format`, and `SkipTransparent` (composite instead of replace).
+
 ## Global config
 
 ```lua
@@ -171,7 +189,7 @@ IMGN.Configure({
 ## Limits
 
 - **Instance count is the ceiling.** Keep canvases modest (≤ ~128×128). Not for photo-resolution images.
-- **No reading asset pixels.** IMGN can't decode an existing decal/texture — that still needs `EditableImage`. Loading a real `.png` would mean decoding it in pure Luau and feeding the bytes to `:Blit` (a possible future addition, not in 0.1.0).
+- **Real images need their bytes supplied.** IMGN can decode actual PNG/BMP/TGA/JPG files (see [Loading real images](#loading-real-images)), but it can't read the pixels of an *already-uploaded* Roblox decal/texture — that still needs `EditableImage`. You provide the file bytes yourself (HttpService or baked into a module).
 
 ## Building from source
 
@@ -212,6 +230,7 @@ See [`examples/`](examples):
 - **Mandelbrot** — a self-zooming fractal via `:Shader`.
 - **Snake** — the classic, with a bitmap-font scoreboard (WASD / arrows).
 - **Raycaster** — a Wolfenstein-style first-person 3D view (W/S walk, A/D turn).
+- **LoadImage** — decode a real PNG onto a part via osgl-rbx/image.
 
 - **GradientSurface** — procedural gradient on a part via `:Shader`.
 - **PaintCanvas** — click-drag finger paint on a `ScreenGui` with `AutoRender`.

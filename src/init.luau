@@ -16,6 +16,7 @@
 
 local Canvas = require(script._Classes.Canvas)
 local AppClass = require(script._Classes.App)
+local ImageHelper = require(script._Patterns.Image)
 local ConfigModule = require(script._Core.Config)
 
 local IMGN = {}
@@ -54,6 +55,39 @@ end
 ]=]
 function IMGN.App(config: AppConfig): App
 	return AppClass.new(config)
+end
+
+--[=[
+	@within IMGN
+	Decodes a real image file and returns a [Canvas] sized to it (times `Scale`), already drawn and
+	rendered. `image` is the [osgl-rbx/image](https://github.com/osgl-rbx/image) module (install it
+	yourself and pass it in - IMGN doesn't bundle it); `bytes` is the file as a `string`/`buffer`.
+	`config` accepts `Parent`, `Driver`, `AutoRender`, plus image `Scale`/`Format`/`SkipTransparent`.
+	For finer placement onto an existing canvas, use [Canvas:LoadImage] instead.
+]=]
+function IMGN.ImageCanvas(image: any, bytes: string | buffer, config: {
+	Parent: Instance?,
+	Driver: any?,
+	AutoRender: boolean?,
+	Scale: number?,
+	Format: string?,
+	SkipTransparent: boolean?,
+}?): Canvas
+	config = config or {}
+	local decoded = ImageHelper.decode(image, bytes, config.Format)
+	local scale = config.Scale or 1
+	local width = math.max(1, math.floor(decoded.width * scale + 0.5))
+	local height = math.max(1, math.floor(decoded.height * scale + 0.5))
+
+	local canvas = Canvas.new({
+		Resolution = Vector2.new(width, height),
+		Parent = config.Parent,
+		Driver = config.Driver,
+		AutoRender = config.AutoRender,
+	})
+	ImageHelper.blit(canvas, decoded, { Scale = scale, SkipTransparent = config.SkipTransparent })
+	canvas:Render()
+	return canvas
 end
 
 --[=[

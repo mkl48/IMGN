@@ -15,6 +15,7 @@ local ConfigModule = require(script.Parent.Parent._Core.Config)
 local Drivers = require(script.Parent.Parent._Drivers)
 local Draw = require(script.Parent.Parent._Patterns.Draw)
 local Font = require(script.Parent.Parent._Patterns.Font)
+local Image = require(script.Parent.Parent._Patterns.Image)
 
 local Config = ConfigModule.Config
 
@@ -254,6 +255,20 @@ function Canvas.Blit(self: Canvas, source: Canvas, dx: number, dy: number)
 			Canvas.SetPixel(self, dx + sx, dy + sy, color, alpha)
 		end
 	end
+end
+
+--[=[
+	@within Canvas
+	Decodes a real image file and draws it onto this canvas. `image` is the
+	[osgl-rbx/image](https://github.com/osgl-rbx/image) module (IMGN doesn't bundle it - install it
+	and pass it in); `bytes` is the file as a `string` or `buffer` (e.g. from
+	`HttpService:GetAsync`). `options` (see [Image.LoadOptions]) sets `X`/`Y` offset, nearest-
+	neighbour `Scale`, an explicit `Format`, and `SkipTransparent`. Returns the drawn width/height.
+	Call `:Render()` afterwards.
+]=]
+function Canvas.LoadImage(self: Canvas, image: any, bytes: string | buffer, options: Image.LoadOptions?): (number, number)
+	local decoded = Image.decode(image, bytes, options and options.Format)
+	return Image.blit(self, decoded, options)
 end
 
 --[=[

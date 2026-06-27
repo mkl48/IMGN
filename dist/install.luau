@@ -55,6 +55,7 @@ local _1 = mod("IMGN", RS, [[
 
 local Canvas = require(script._Classes.Canvas)
 local AppClass = require(script._Classes.App)
+local ImageHelper = require(script._Patterns.Image)
 local ConfigModule = require(script._Core.Config)
 
 local IMGN = {}
@@ -93,6 +94,39 @@ end
 ]=]
 function IMGN.App(config: AppConfig): App
 	return AppClass.new(config)
+end
+
+--[=[
+	@within IMGN
+	Decodes a real image file and returns a [Canvas] sized to it (times `Scale`), already drawn and
+	rendered. `image` is the [osgl-rbx/image](https://github.com/osgl-rbx/image) module (install it
+	yourself and pass it in - IMGN doesn't bundle it); `bytes` is the file as a `string`/`buffer`.
+	`config` accepts `Parent`, `Driver`, `AutoRender`, plus image `Scale`/`Format`/`SkipTransparent`.
+	For finer placement onto an existing canvas, use [Canvas:LoadImage] instead.
+]=]
+function IMGN.ImageCanvas(image: any, bytes: string | buffer, config: {
+	Parent: Instance?,
+	Driver: any?,
+	AutoRender: boolean?,
+	Scale: number?,
+	Format: string?,
+	SkipTransparent: boolean?,
+}?): Canvas
+	config = config or {}
+	local decoded = ImageHelper.decode(image, bytes, config.Format)
+	local scale = config.Scale or 1
+	local width = math.max(1, math.floor(decoded.width * scale + 0.5))
+	local height = math.max(1, math.floor(decoded.height * scale + 0.5))
+
+	local canvas = Canvas.new({
+		Resolution = Vector2.new(width, height),
+		Parent = config.Parent,
+		Driver = config.Driver,
+		AutoRender = config.AutoRender,
+	})
+	ImageHelper.blit(canvas, decoded, { Scale = scale, SkipTransparent = config.SkipTransparent })
+	canvas:Render()
+	return canvas
 end
 
 --[=[
@@ -958,6 +992,7 @@ local ConfigModule = require(script.Parent.Parent._Core.Config)
 local Drivers = require(script.Parent.Parent._Drivers)
 local Draw = require(script.Parent.Parent._Patterns.Draw)
 local Font = require(script.Parent.Parent._Patterns.Font)
+local Image = require(script.Parent.Parent._Patterns.Image)
 
 local Config = ConfigModule.Config
 
@@ -1197,6 +1232,20 @@ function Canvas.Blit(self: Canvas, source: Canvas, dx: number, dy: number)
 			Canvas.SetPixel(self, dx + sx, dy + sy, color, alpha)
 		end
 	end
+end
+
+--[=[
+	@within Canvas
+	Decodes a real image file and draws it onto this canvas. `image` is the
+	[osgl-rbx/image](https://github.com/osgl-rbx/image) module (IMGN doesn't bundle it - install it
+	and pass it in); `bytes` is the file as a `string` or `buffer` (e.g. from
+	`HttpService:GetAsync`). `options` (see [Image.LoadOptions]) sets `X`/`Y` offset, nearest-
+	neighbour `Scale`, an explicit `Format`, and `SkipTransparent`. Returns the drawn width/height.
+	Call `:Render()` afterwards.
+]=]
+function Canvas.LoadImage(self: Canvas, image: any, bytes: string | buffer, options: Image.LoadOptions?): (number, number)
+	local decoded = Image.decode(image, bytes, options and options.Format)
+	return Image.blit(self, decoded, options)
 end
 
 --[=[
@@ -2054,6 +2103,86 @@ end
 
 return Font
 ]])
+mod("Image", _7, [[
+-- IMGN
+-- _Patterns/Image.luau
+-- Plinko Labs
+--
+-- Adapter for loading real image files (PNG/BMP/TGA/JPG) onto a Canvas, via the osgl-rbx/image
+-- deserializer (https://github.com/osgl-rbx/image). That library isn't on Wally and is a heavy
+-- thing to vendor, so IMGN does NOT hard-depend on it: you install osgl yourself and pass the
+-- required module in. This module just knows how to drive its API and copy the decoded RGBA8
+-- buffer onto a Canvas (osgl's DynamicImage buffer is the same 4-bytes-per-pixel layout IMGN
+-- uses, so it's a straight per-pixel copy with optional nearest-neighbour scaling).
+--
+-- Bytes come from you: HttpService:GetAsync(url) returns the file as a string, or bake the file
+-- into a ModuleScript - either a `string` or a `buffer` works.
 
-print("[IMGN] installed 13 modules under ReplicatedStorage.IMGN")
+--[=[
+	@class Image
+	Internal helper behind [Canvas:LoadImage] and [IMGN.ImageCanvas]. Not part of the public
+	surface; you reach it through those two entry points.
+]=]
+local Image = {}
+
+export type LoadOptions = {
+	X: number?, -- destination top-left x (default 0)
+	Y: number?, -- destination top-left y (default 0)
+	Scale: number?, -- nearest-neighbour scale (default 1; <1 shrinks, >1 enlarges)
+	Format: ("PNG" | "BMP" | "TGA" | "JPG")?, -- skip format auto-detection
+	SkipTransparent: boolean?, -- don't write fully-transparent source pixels (composite instead of replace)
+}
+
+-- Decode `bytes` (string|buffer) with the passed-in osgl `image` module into a DynamicImage.
+function Image.decode(image: any, bytes: string | buffer, format: string?): any
+	assert(image and image.ImageReader, "IMGN: pass the osgl-rbx/image module as the first argument")
+
+	local reader
+	if format then
+		local fmt = image.ImageFormat[format]
+		assert(fmt, `IMGN: unknown image Format "{format}"`)
+		reader = image.ImageReader.withFormat(bytes, fmt)
+	else
+		reader = image.ImageReader.open(bytes)
+		local guess = reader:WithGuessedFormat()
+		if guess and guess.isOk == false then
+			error("IMGN: could not detect the image format (pass Format = \"PNG\" to be explicit)")
+		end
+	end
+
+	local result = reader:Decode()
+	assert(result.isOk, "IMGN: image decode failed (is the data a valid image of that format?)")
+	return result:Unwrap()
+end
+
+-- Copy a decoded DynamicImage onto `canvas` at the given offset/scale. Returns drawn width/height.
+function Image.blit(canvas: any, img: any, options: LoadOptions?): (number, number)
+	local opts = options or {}
+	local ox = opts.X or 0
+	local oy = opts.Y or 0
+	local scale = opts.Scale or 1
+	local skip = opts.SkipTransparent
+	assert(scale > 0, "IMGN: image Scale must be > 0")
+
+	local destW = math.max(1, math.floor(img.width * scale + 0.5))
+	local destH = math.max(1, math.floor(img.height * scale + 0.5))
+
+	for dy = 0, destH - 1 do
+		local sy = math.min(img.height - 1, math.floor(dy / scale))
+		for dx = 0, destW - 1 do
+			local sx = math.min(img.width - 1, math.floor(dx / scale))
+			local r, g, b, a = img:ReadPixelRGBA(sx, sy)
+			if not (skip and a == 0) then
+				canvas:SetPixel(ox + dx, oy + dy, Color3.fromRGB(r, g, b), a / 255)
+			end
+		end
+	end
+
+	return destW, destH
+end
+
+return Image
+]])
+
+print("[IMGN] installed 14 modules under ReplicatedStorage.IMGN")
 return true
