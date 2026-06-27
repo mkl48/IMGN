@@ -104,10 +104,16 @@ Coordinates are **0-indexed**, `(0, 0)` top-left. Out-of-bounds writes are clipp
 
 ## Drivers
 
-A driver turns the pixel buffer into instances. Pick per canvas via `Driver`:
+A driver turns the pixel buffer into instances. Pick per canvas via `Driver`. The last three are the classic "render images without melting the engine" tricks — fewer instances, at the cost of rebuilding on change (great for static images, not animation):
 
-- **`PixelGrid`** *(default)* — one `Frame` per pixel, dirty-tracked. A brush stroke updates only the Frames under it. Best for **live drawing** and frequently-changing content.
-- **`RowMerge`** — run-length-merges each row into wide Frames; fully-transparent runs cost nothing. Far fewer instances. Best for **flat-colour sprites and static art**. A flush rebuilds whole dirty rows, so it's less suited to noisy every-pixel churn.
+| Driver | Instances | Best for |
+| --- | --- | --- |
+| **`PixelGrid`** *(default)* | one `Frame` per pixel | **live drawing** / animation — dirty-tracked, a brush stroke touches only its pixels |
+| **`RowMerge`** | one Frame per horizontal colour run | flat **sprites**; this is "box compression" along rows |
+| **`GreedyMesh`** | one Frame per merged 2D **rectangle** | **static / flat images** — merges runs in *both* axes (a 50×50 flat block → 1 Frame, not 50). 90%+ fewer instances on pixel art |
+| **`RichText`** | **one `TextLabel`** for the whole image | **lowest** instance count — the image is block glyphs (█) with per-pixel `<font>` colour, RLE-compressed. Approximate alignment (monospace + `TextScaled`), low-res only (~64×64; RichText has a ~16k-char ceiling). Not pixel-perfect |
+
+So for loading a photo/sprite once, `GreedyMesh` is usually the sweet spot; for a tiny icon where instance count must be near-zero, try `RichText`. For anything that animates, stay on `PixelGrid`.
 
 ## The App layer
 

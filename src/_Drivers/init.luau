@@ -9,6 +9,8 @@
 
 local PixelGrid = require(script.PixelGrid)
 local RowMerge = require(script.RowMerge)
+local GreedyMesh = require(script.GreedyMesh)
+local RichText = require(script.RichText)
 local PixelBuffer = require(script.Parent._Core.PixelBuffer)
 type PixelBuffer = PixelBuffer.PixelBuffer
 
@@ -16,9 +18,11 @@ type PixelBuffer = PixelBuffer.PixelBuffer
 	@class Drivers
 	@within Canvas
 	The renderer lookup. `"PixelGrid"` (default) is one Frame per pixel - best for live drawing;
-	`"RowMerge"` is run-length-merged rows - best for flat-colour sprites.
+	`"RowMerge"` merges same-colour rows; `"GreedyMesh"` merges same-colour rectangles in 2D (fewest
+	Frames, best for static/flat images); `"RichText"` is the whole image in one TextLabel (lowest
+	instance count, approximate, low-res only).
 ]=]
-export type DriverType = "PixelGrid" | "RowMerge"
+export type DriverType = "PixelGrid" | "RowMerge" | "GreedyMesh" | "RichText"
 
 -- The common shape every Driver implements. Both concrete drivers are structurally compatible
 -- with this; Canvas only ever calls through these methods.
@@ -33,6 +37,8 @@ export type Driver = {
 local constructors: { [string]: (PixelBuffer) -> Driver } = {
 	PixelGrid = PixelGrid.new :: any,
 	RowMerge = RowMerge.new :: any,
+	GreedyMesh = GreedyMesh.new :: any,
+	RichText = RichText.new :: any,
 }
 
 local Drivers = {}
@@ -44,7 +50,7 @@ local Drivers = {}
 ]=]
 function Drivers.get(name: string, pixelBuffer: PixelBuffer): Driver
 	local constructor = constructors[name]
-	assert(constructor, `IMGN: unknown Driver "{tostring(name)}" (expected "PixelGrid" or "RowMerge")`)
+	assert(constructor, `IMGN: unknown Driver "{tostring(name)}" (expected PixelGrid, RowMerge, GreedyMesh or RichText)`)
 	return constructor(pixelBuffer)
 end
 

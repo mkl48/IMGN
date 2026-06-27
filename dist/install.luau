@@ -1565,6 +1565,8 @@ local _6 = mod("_Drivers", _1, [[
 
 local PixelGrid = require(script.PixelGrid)
 local RowMerge = require(script.RowMerge)
+local GreedyMesh = require(script.GreedyMesh)
+local RichText = require(script.RichText)
 local PixelBuffer = require(script.Parent._Core.PixelBuffer)
 type PixelBuffer = PixelBuffer.PixelBuffer
 
@@ -1572,9 +1574,11 @@ type PixelBuffer = PixelBuffer.PixelBuffer
 	@class Drivers
 	@within Canvas
 	The renderer lookup. `"PixelGrid"` (default) is one Frame per pixel - best for live drawing;
-	`"RowMerge"` is run-length-merged rows - best for flat-colour sprites.
+	`"RowMerge"` merges same-colour rows; `"GreedyMesh"` merges same-colour rectangles in 2D (fewest
+	Frames, best for static/flat images); `"RichText"` is the whole image in one TextLabel (lowest
+	instance count, approximate, low-res only).
 ]=]
-export type DriverType = "PixelGrid" | "RowMerge"
+export type DriverType = "PixelGrid" | "RowMerge" | "GreedyMesh" | "RichText"
 
 -- The common shape every Driver implements. Both concrete drivers are structurally compatible
 -- with this; Canvas only ever calls through these methods.
@@ -1589,6 +1593,8 @@ export type Driver = {
 local constructors: { [string]: (PixelBuffer) -> Driver } = {
 	PixelGrid = PixelGrid.new :: any,
 	RowMerge = RowMerge.new :: any,
+	GreedyMesh = GreedyMesh.new :: any,
+	RichText = RichText.new :: any,
 }
 
 local Drivers = {}
@@ -1600,11 +1606,196 @@ local Drivers = {}
 ]=]
 function Drivers.get(name: string, pixelBuffer: PixelBuffer): Driver
 	local constructor = constructors[name]
-	assert(constructor, `IMGN: unknown Driver "{tostring(name)}" (expected "PixelGrid" or "RowMerge")`)
+	assert(constructor, `IMGN: unknown Driver "{tostring(name)}" (expected PixelGrid, RowMerge, GreedyMesh or RichText)`)
 	return constructor(pixelBuffer)
 end
 
 return Drivers
+]])
+mod("GreedyMesh", _6, [[
+-- IMGN
+-- _Drivers/GreedyMesh.luau
+-- Plinko Labs
+--
+-- The fewest-Frames renderer: true 2D greedy meshing. Where RowMerge merges same-colour pixels
+-- along each row (1D runs), this merges them into maximal rectangles in BOTH axes - a 50x50 flat
+-- sky becomes one Frame, not 50. For flat / pixel-art images that's a 90%+ cut in instance count.
+--
+-- The trade-off: a mesh is global, so any change rebuilds the whole thing (clear every Frame,
+-- re-mesh the buffer). That's ideal for a static image loaded once, and wrong for per-frame
+-- animation - use PixelGrid there. Frames are pooled across rebuilds; fully-transparent regions
+-- cost nothing.
+
+local GreedyMesh = {}
+GreedyMesh.__index = GreedyMesh
+
+local PixelBuffer = require(script.Parent.Parent._Core.PixelBuffer)
+type PixelBuffer = PixelBuffer.PixelBuffer
+
+export type GreedyMesh = typeof(setmetatable(
+	{} :: {
+		_buffer: PixelBuffer,
+		_width: number,
+		_height: number,
+		_frames: { Frame },
+		_used: number,
+		_visited: { boolean },
+		_dirty: boolean,
+		_container: Frame?,
+	},
+	GreedyMesh
+))
+
+--[=[
+	@class GreedyMesh
+	@within Canvas
+	2D rectangle merging - the lowest Frame count for flat/static images. Selected with
+	`Driver = "GreedyMesh"`.
+]=]
+function GreedyMesh.new(pixelBuffer: PixelBuffer): GreedyMesh
+	return setmetatable({
+		_buffer = pixelBuffer,
+		_width = pixelBuffer.Width,
+		_height = pixelBuffer.Height,
+		_frames = {},
+		_used = 0,
+		_visited = {},
+		_dirty = false,
+		_container = nil,
+	}, GreedyMesh)
+end
+
+--[=[
+	@within GreedyMesh
+	Builds an empty container; rectangles are created lazily on the first flush.
+]=]
+function GreedyMesh.Mount(self: GreedyMesh, parent: Instance): Frame
+	local container = Instance.new("Frame")
+	container.Name = "IMGNCanvas"
+	container.Size = UDim2.fromScale(1, 1)
+	container.BackgroundTransparency = 1
+	container.BorderSizePixel = 0
+	container.ClipsDescendants = true
+	container.Parent = parent
+	self._container = container
+	return container
+end
+
+-- Any pixel change dirties the whole mesh (greedy meshing is global).
+function GreedyMesh.SetDirty(self: GreedyMesh)
+	self._dirty = true
+end
+
+function GreedyMesh.SetAllDirty(self: GreedyMesh)
+	self._dirty = true
+end
+
+local function acquire(self: GreedyMesh): Frame
+	self._used += 1
+	local frame = self._frames[self._used]
+	if not frame then
+		frame = Instance.new("Frame")
+		frame.BorderSizePixel = 0
+		frame.ZIndex = 1
+		frame.Parent = self._container
+		self._frames[self._used] = frame
+	end
+	frame.Visible = true
+	return frame
+end
+
+--[=[
+	@within GreedyMesh
+	Re-meshes the whole buffer into maximal same-colour rectangles and lays them out as pooled
+	Frames. Surplus Frames from a previous, busier mesh are hidden.
+]=]
+function GreedyMesh.Flush(self: GreedyMesh)
+	if not self._dirty or not self._container then
+		return
+	end
+	self._dirty = false
+
+	local pixelBuffer = self._buffer
+	local width, height = self._width, self._height
+	local sx, sy = 1 / width, 1 / height
+	local visited = self._visited
+	table.clear(visited)
+	self._used = 0
+
+	local function matches(x: number, y: number, r0, g0, b0, a0): boolean
+		local r, g, b, a = PixelBuffer.GetBytes(pixelBuffer, x, y)
+		return r == r0 and g == g0 and b == b0 and a == a0
+	end
+
+	for y = 0, height - 1 do
+		for x = 0, width - 1 do
+			local base = y * width + x
+			if visited[base] then
+				continue
+			end
+			local r, g, b, a = PixelBuffer.GetBytes(pixelBuffer, x, y)
+
+			-- widest run on this row
+			local w = 1
+			while x + w < width and not visited[base + w] and matches(x + w, y, r, g, b, a) do
+				w += 1
+			end
+
+			-- extend downward while the full [x, x+w) span matches and is free
+			local h = 1
+			local growing = true
+			while growing and y + h < height do
+				for xx = x, x + w - 1 do
+					local j = (y + h) * width + xx
+					if visited[j] or not matches(xx, y + h, r, g, b, a) then
+						growing = false
+						break
+					end
+				end
+				if growing then
+					h += 1
+				end
+			end
+
+			-- claim the rectangle
+			for yy = y, y + h - 1 do
+				local row = yy * width
+				for xx = x, x + w - 1 do
+					visited[row + xx] = true
+				end
+			end
+
+			-- emit it (skip fully-transparent regions)
+			if a > 0 then
+				local frame = acquire(self)
+				frame.Position = UDim2.fromScale(x * sx, y * sy)
+				frame.Size = UDim2.new(w * sx, 1, h * sy, 1)
+				frame.BackgroundColor3 = Color3.fromRGB(r, g, b)
+				frame.BackgroundTransparency = 1 - a / 255
+			end
+		end
+	end
+
+	for i = self._used + 1, #self._frames do
+		self._frames[i].Visible = false
+	end
+end
+
+--[=[
+	@within GreedyMesh
+	Destroys every Frame and the container.
+]=]
+function GreedyMesh.Destroy(self: GreedyMesh)
+	if self._container then
+		self._container:Destroy()
+		self._container = nil
+	end
+	self._frames = {}
+	self._visited = {}
+	self._used = 0
+end
+
+return GreedyMesh
 ]])
 mod("PixelGrid", _6, [[
 -- IMGN
@@ -1817,6 +2008,173 @@ function PixelGrid.Destroy(self: PixelGrid)
 end
 
 return PixelGrid
+]])
+mod("RichText", _6, [[
+-- IMGN
+-- _Drivers/RichText.luau
+-- Plinko Labs
+--
+-- The one-instance renderer: the entire image is a single TextLabel full of block glyphs (U+2588),
+-- coloured per-pixel with RichText <font> tags. A 100x100 image is ONE instance instead of 10,000.
+-- Same-colour runs share a tag (RLE), so flat art compresses hard; transparent pixels are block
+-- glyphs made invisible with transparency="1" so every column keeps the same width.
+--
+-- Caveats, be honest: alignment is font-metric dependent (we use the monospace Code font with
+-- TextScaled, so it's APPROXIMATE, not pixel-perfect - you may need to tune the part's aspect),
+-- and RichText has a practical per-label string-length ceiling (~16k chars), so this is for low
+-- resolutions (~64x64 and under). For pixel-perfect output use PixelGrid / GreedyMesh. Like
+-- GreedyMesh, any change rebuilds the whole string - great for static images, not animation.
+
+local RichText = {}
+RichText.__index = RichText
+
+local PixelBuffer = require(script.Parent.Parent._Core.PixelBuffer)
+type PixelBuffer = PixelBuffer.PixelBuffer
+
+local BLOCK = utf8.char(0x2588) -- █
+local LENGTH_WARN = 16000
+
+export type RichText = typeof(setmetatable(
+	{} :: {
+		_buffer: PixelBuffer,
+		_width: number,
+		_height: number,
+		_label: TextLabel?,
+		_container: Frame?,
+		_dirty: boolean,
+		_warned: boolean,
+	},
+	RichText
+))
+
+--[=[
+	@class RichText
+	@within Canvas
+	The whole image as a single RichText TextLabel - the lowest possible instance count. Selected
+	with `Driver = "RichText"`. Approximate alignment; best for static, low-resolution images.
+]=]
+function RichText.new(pixelBuffer: PixelBuffer): RichText
+	return setmetatable({
+		_buffer = pixelBuffer,
+		_width = pixelBuffer.Width,
+		_height = pixelBuffer.Height,
+		_label = nil,
+		_container = nil,
+		_dirty = false,
+		_warned = false,
+	}, RichText)
+end
+
+--[=[
+	@within RichText
+	Builds the container and the single TextLabel the image is rendered into.
+]=]
+function RichText.Mount(self: RichText, parent: Instance): Frame
+	local container = Instance.new("Frame")
+	container.Name = "IMGNCanvas"
+	container.Size = UDim2.fromScale(1, 1)
+	container.BackgroundTransparency = 1
+	container.BorderSizePixel = 0
+	container.ClipsDescendants = true
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Pixels"
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.RichText = true
+	label.Font = Enum.Font.Code -- monospace, so columns line up
+	label.TextScaled = true
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextWrapped = false
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Top
+	label.Text = ""
+	label.Parent = container
+
+	container.Parent = parent
+	self._container = container
+	self._label = label
+	return container
+end
+
+-- Any change rebuilds the whole string.
+function RichText.SetDirty(self: RichText)
+	self._dirty = true
+end
+
+function RichText.SetAllDirty(self: RichText)
+	self._dirty = true
+end
+
+--[=[
+	@within RichText
+	Rebuilds the RichText string from the buffer (RLE per row) and assigns it to the label.
+]=]
+function RichText.Flush(self: RichText)
+	if not self._dirty or not self._label then
+		return
+	end
+	self._dirty = false
+
+	local pixelBuffer = self._buffer
+	local width, height = self._width, self._height
+	local parts: { string } = {}
+
+	for y = 0, height - 1 do
+		local r0, g0, b0, a0 = PixelBuffer.GetBytes(pixelBuffer, 0, y)
+		local runStart = 0
+
+		local function emit(fromX: number, toX: number, r: number, g: number, b: number, a: number)
+			local count = toX - fromX + 1
+			local hex = string.format("#%02X%02X%02X", r, g, b)
+			if a >= 255 then
+				table.insert(parts, `<font color="{hex}">`)
+			else
+				table.insert(parts, `<font color="{hex}" transparency="{1 - a / 255}">`)
+			end
+			table.insert(parts, string.rep(BLOCK, count))
+			table.insert(parts, "</font>")
+		end
+
+		for x = 1, width - 1 do
+			local r, g, b, a = PixelBuffer.GetBytes(pixelBuffer, x, y)
+			if r ~= r0 or g ~= g0 or b ~= b0 or a ~= a0 then
+				emit(runStart, x - 1, r0, g0, b0, a0)
+				runStart = x
+				r0, g0, b0, a0 = r, g, b, a
+			end
+		end
+		emit(runStart, width - 1, r0, g0, b0, a0)
+
+		if y < height - 1 then
+			table.insert(parts, "\n")
+		end
+	end
+
+	local text = table.concat(parts)
+	if not self._warned and #text > LENGTH_WARN then
+		self._warned = true
+		warn(
+			`IMGN RichText: the image string is {#text} chars, past the ~{LENGTH_WARN} RichText limit - `
+				.. `it may be truncated. Use a lower resolution, or the GreedyMesh/PixelGrid driver.`
+		)
+	end
+	self._label.Text = text
+end
+
+--[=[
+	@within RichText
+	Destroys the label and container.
+]=]
+function RichText.Destroy(self: RichText)
+	if self._container then
+		self._container:Destroy()
+		self._container = nil
+	end
+	self._label = nil
+end
+
+return RichText
 ]])
 mod("RowMerge", _6, [[
 -- IMGN
@@ -6628,5 +6986,5 @@ end
 return Image
 ]])
 
-print("[IMGN] installed 50 modules under ReplicatedStorage.IMGN")
+print("[IMGN] installed 52 modules under ReplicatedStorage.IMGN")
 return true
