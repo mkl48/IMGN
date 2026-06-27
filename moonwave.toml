@@ -1,0 +1,48 @@
+title = "IMGN"
+gitRepoUrl = "https://github.com/mkl48/IMGN"
+gitSourceBranch = "master"
+changelog = true
+# order the API sidebar: the entry point first, the Canvas you hold, then supporting pieces
+classOrder = [
+    "IMGN",
+    "Canvas",
+    "PixelGrid",
+    "RowMerge",
+    "Drivers",
+    "Draw",
+    "PixelBuffer",
+    "Config",
+]
+[docusaurus]
+onBrokenLinks = "warn"
+onBrokenMarkdownLinks = "warn"
+onBrokenAnchors = "warn"
+organizationName = "mkl48"
+projectName = "IMGN"
+url = "https://mkl48.github.io"
+baseUrl = "/IMGN/"
+tagline = "verification-free editable images for Roblox"
+
+[home]
+enabled = true
+includeReadme = true
+
+[[home.features]]
+title = "No verification"
+description = "drawn from GUI Frames instead of EditableImage, so a writable runtime canvas needs no age/ID verification"
+
+[[home.features]]
+title = "Edit then flush"
+description = "every edit dirties pixels; one :Render() pushes only what changed, so a brush stroke touches a handful of Frames"
+
+[[home.features]]
+title = "Pluggable drivers"
+description = "PixelGrid (one Frame per pixel) for live drawing, RowMerge (run-length rows) for flat sprites"
+
+[[home.features]]
+title = "Draw + Shader + Blit"
+description = "SetPixel, lines, rects, circles, a per-pixel Shader for procedural art, and Blit to compose canvases"
+
+[footer]
+style = "dark"
+copyright = "Copyright © 2026 mkl48. Built with Moonwave."

@@ -1,0 +1,16 @@
+{
+	"name": "IMGN (dev place)",
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"IMGN": {
+				"$path": "src"
+			}
+		},
+		"ServerScriptService": {
+			"IMGNShowcase": {
+				"$path": "examples/Showcase.server.luau"
+			}
+		}
+	}
+}

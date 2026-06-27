@@ -1,0 +1,10 @@
+[package]
+name = "kr3ative/imgn"
+version = "0.1.0"
+description = "Verification-free editable images for Roblox - a writable pixel canvas rendered from GUI frames, no EditableImage required"
+license = "MIT"
+authors = ["kr3ative"]
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+
+[dependencies]
