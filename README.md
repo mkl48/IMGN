@@ -202,6 +202,7 @@ See [`examples/`](examples):
 - **Showcase** — self-contained animated plasma surface; what the dev place runs.
 - **AppBounce** — the App engine: 5 balls bouncing off the walls and each other around a center wall.
 - **CombWipe** — `App:Comb` painting a scrolling rainbow one row at a time.
+- **Breakout** — a full mini-game: paddle, ball, and bricks that delete themselves via `OnCollide`.
 
 - **GradientSurface** — procedural gradient on a part via `:Shader`.
 - **PaintCanvas** — click-drag finger paint on a `ScreenGui` with `AutoRender`.
