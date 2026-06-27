@@ -17,6 +17,7 @@
 local Canvas = require(script._Classes.Canvas)
 local AppClass = require(script._Classes.App)
 local LiquidClass = require(script._Classes.Liquid)
+local BloodModule = require(script._Classes.Blood)
 local ImageHelper = require(script._Patterns.Image)
 local ConfigModule = require(script._Core.Config)
 
@@ -69,6 +70,15 @@ end
 function IMGN.Liquid(config: LiquidConfig): Liquid
 	return LiquidClass.new(config)
 end
+
+--[=[
+	@within IMGN
+	The blood engine (built on [Liquid]): `IMGN.Blood.Emit(origin, velocity)` throws a 3D droplet
+	that lands and drips, `IMGN.Blood.KillBrick(part)` makes a brick that spurts blood when stepped
+	on, `IMGN.Blood.Splat(part, face, worldPos, amount)` paints a surface directly, and
+	`IMGN.Blood.Configure{ … }` tunes it. Drips follow the surface's downhill (walls/slopes/rotation).
+]=]
+IMGN.Blood = BloodModule
 
 --[=[
 	@within IMGN

@@ -122,6 +122,7 @@ function Liquid.new(config: LiquidConfig): Liquid
 		_amount = table.create(count, 0),
 		_dry = table.create(count, 0),
 		_shown = table.create(count, -1),
+		_delta = table.create(count, 0),
 		_conn = nil,
 		_running = false,
 	}, Liquid)
@@ -183,31 +184,68 @@ end
 ]=]
 function Liquid.Step(self: Liquid, dt: number)
 	local W, H = self.Width, self.Height
-	local amount, dry, shown = self._amount, self._dry, self._shown
+	local amount, dry, shown, delta = self._amount, self._dry, self._shown, self._delta
 	local CAP, CLING, SPREAD = self.Capacity, self.Cling, self.Spread
-	local gravity = math.clamp(self.Gravity.Y, 0, 1)
 
-	-- 1) downward flow, processed bottom-up so a column can drain in one step
-	if gravity > 0 then
-		for y = H - 2, 0, -1 do
+	-- Gravity is an arbitrary canvas-space vector, so fluid drips along whatever direction the
+	-- surface's "downhill" maps to (walls, slopes, rotated parts). Its magnitude is the flow rate.
+	local gx, gy = self.Gravity.X, self.Gravity.Y
+	local gmag = math.sqrt(gx * gx + gy * gy)
+	local sgnX = if gx > 1e-4 then 1 elseif gx < -1e-4 then -1 else 0
+	local sgnY = if gy > 1e-4 then 1 elseif gy < -1e-4 then -1 else 0
+
+	-- 1) directional flow via a delta buffer: each cell sends its movable fluid (everything above
+	-- the Cling film it leaves as a streak) toward the gravity direction, split across the vertical,
+	-- horizontal and diagonal downhill neighbours by weight. The delta buffer makes it order-free
+	-- and exactly mass-conserving, and the capacity check keeps cells from overflowing.
+	if gmag > 1e-4 then
+		local nx, ny = gx / gmag, gy / gmag
+		local wx, wy = math.abs(nx), math.abs(ny)
+		local wd = wx * wy
+		local total = wx + wy + wd
+		if total <= 0 then
+			total = 1
+		end
+
+		for i = 1, W * H do
+			delta[i] = 0
+		end
+
+		for y = 0, H - 1 do
 			local row = y * W
 			for x = 0, W - 1 do
 				local i = row + x + 1
 				local a = amount[i]
 				if a > CLING then
-					local bi = (y + 1) * W + x + 1
-					local space = CAP - amount[bi]
-					if space > 0 then
-						local flow = math.min(a - CLING, space)
-						amount[i] = a - flow
-						amount[bi] += flow
+					local movable = a - CLING
+					local out = 0
+					local function send(tx: number, ty: number, weight: number)
+						if weight <= 0 or tx < 0 or ty < 0 or tx >= W or ty >= H then
+							return
+						end
+						local ti = ty * W + tx + 1
+						local space = CAP - (amount[ti] + delta[ti])
+						if space > 0 then
+							local f = math.min(movable * weight / total, space)
+							delta[ti] += f
+							out += f
+						end
 					end
+					send(x, y + sgnY, wy)
+					send(x + sgnX, y, wx)
+					send(x + sgnX, y + sgnY, wd)
+					delta[i] -= out
 				end
 			end
 		end
+
+		for i = 1, W * H do
+			amount[i] += delta[i]
+		end
 	end
 
-	-- 2) lateral pooling, only when backed up (below full / at floor) - keeps drips narrow
+	-- 2) lateral pooling, only when the downhill cell is blocked (or there's no gravity, e.g. a
+	-- floor) - this keeps drips narrow on walls but lets pools level out where fluid collects.
 	if SPREAD > 0 then
 		for y = 0, H - 1 do
 			local row = y * W
@@ -215,25 +253,26 @@ function Liquid.Step(self: Liquid, dt: number)
 				local i = row + x + 1
 				local a = amount[i]
 				if a > CLING then
-					local backed = gravity <= 0 or y == H - 1 or (CAP - amount[(y + 1) * W + x + 1]) < 0.01
-					if backed then
-						if x > 0 then
-							local ni = row + x - 1 + 1
-							local diff = a - amount[ni]
-							if diff > 0.05 then
-								local m = diff * 0.25 * SPREAD
-								amount[i] = a - m
-								amount[ni] += m
-								a = amount[i]
-							end
+					local backed = gmag <= 1e-4
+					if not backed then
+						local dx, dy = x + sgnX, y + sgnY
+						if dx < 0 or dy < 0 or dx >= W or dy >= H then
+							backed = true
+						else
+							backed = (CAP - amount[dy * W + dx + 1]) < 0.01
 						end
-						if x < W - 1 then
-							local ni = row + x + 1 + 1
-							local diff = a - amount[ni]
-							if diff > 0.05 then
-								local m = diff * 0.25 * SPREAD
-								amount[i] = a - m
-								amount[ni] += m
+					end
+					if backed then
+						for _, nx2 in { x - 1, x + 1 } do
+							if nx2 >= 0 and nx2 < W then
+								local ni = row + nx2 + 1
+								local diff = a - amount[ni]
+								if diff > 0.05 then
+									local m = diff * 0.25 * SPREAD
+									amount[i] = a - m
+									amount[ni] += m
+									a = amount[i]
+								end
 							end
 						end
 					end

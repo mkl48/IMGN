@@ -182,6 +182,27 @@ How it looks right: each step fluid transfers downward but leaves a thin **`Clin
 
 See `examples/BloodDrip.server.luau`.
 
+### Blood engine (`IMGN.Blood`)
+
+A full droplet-and-drip system built on `Liquid`: throw 3D blood that lands on surfaces and drips down them, correctly following each surface's **downhill** — walls, slopes, and rotated/moving parts.
+
+```lua
+-- a kill brick that sprays blood when stepped on
+IMGN.Blood.KillBrick(brick, { Droplets = 18, Up = 26, Spread = 18 })
+
+-- or throw a droplet yourself; it falls, lands, and drips
+IMGN.Blood.Emit(origin, Vector3.new(10, 20, 0))
+
+-- or paint a surface directly
+IMGN.Blood.Splat(part, Enum.NormalId.Front, worldPos, 4)
+```
+
+How it works: `Emit` spawns a real droplet `Part` that flies under gravity; a per-frame raycast catches the surface it lands on; that face is turned (once, then cached) into an IMGN canvas with a `Liquid("Blood")` sim whose **gravity is the face's downhill direction** (`Surface.gravityVector` projects world-down onto the face — a wall gives `(0,1)`, a slope tilts it, a floor gives `(0,0)` so it pools). With `Dynamic` on (default) each surface re-reads its orientation every frame, so drips react live to rotation. The droplet then shrinks and is destroyed. Tune via `IMGN.Blood.Configure { PixelsPerStud = …, Preset = "Blood", DropletSize = …, … }`.
+
+> **Verified vs. needs-Studio:** the 2D sim and the gravity projection are unit-tested. The 3D pieces — droplet physics, the raycast landing, and the face/UV mapping in `Surface` — follow Roblox conventions (`Vector3.fromNormalId`, `CFrame`, `SurfaceGui` orientation) that can only be confirmed in a running place, so give the face axes a sanity check in Studio and tune from there.
+
+See `examples/KillBrick.server.luau`.
+
 ## Loading real images
 
 IMGN can draw actual image files — PNG/BMP/TGA/JPG — onto a canvas. The decoder ([osgl-rbx/image](https://github.com/osgl-rbx/image)) is **bundled inside IMGN**, so there's nothing extra to install — just hand it the file bytes. No `EditableImage`, no verification.
@@ -310,6 +331,7 @@ See [`examples/`](examples):
 - **LoadImage** — decode a real PNG onto a part (decoder bundled).
 - **WebImage** — load an image by URL through the bundled web service (`server/`).
 - **BloodDrip** — realistic dripping blood via the `Liquid` sim (`IMGN.Liquid`).
+- **KillBrick** — step on it, die, and spray blood that drips downhill (`IMGN.Blood`).
 
 - **GradientSurface** — procedural gradient on a part via `:Shader`.
 - **PaintCanvas** — click-drag finger paint on a `ScreenGui` with `AutoRender`.

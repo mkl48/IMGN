@@ -59,6 +59,7 @@ local _1 = mod("IMGN", RS, [[
 local Canvas = require(script._Classes.Canvas)
 local AppClass = require(script._Classes.App)
 local LiquidClass = require(script._Classes.Liquid)
+local BloodModule = require(script._Classes.Blood)
 local ImageHelper = require(script._Patterns.Image)
 local ConfigModule = require(script._Core.Config)
 
@@ -111,6 +112,15 @@ end
 function IMGN.Liquid(config: LiquidConfig): Liquid
 	return LiquidClass.new(config)
 end
+
+--[=[
+	@within IMGN
+	The blood engine (built on [Liquid]): `IMGN.Blood.Emit(origin, velocity)` throws a 3D droplet
+	that lands and drips, `IMGN.Blood.KillBrick(part)` makes a brick that spurts blood when stepped
+	on, `IMGN.Blood.Splat(part, face, worldPos, amount)` paints a surface directly, and
+	`IMGN.Blood.Configure{ … }` tunes it. Drips follow the surface's downhill (walls/slopes/rotation).
+]=]
+IMGN.Blood = BloodModule
 
 --[=[
 	@within IMGN
@@ -1092,7 +1102,402 @@ end
 
 return Section
 ]])
-local _4 = mod("Canvas", _2, [[
+local _4 = mod("Blood", _2, [[
+-- IMGN
+-- _Classes/Blood/init.luau
+-- Plinko Labs
+--
+-- A small blood engine built on the Liquid sim. The flow: emit a real 3D droplet Part that flies
+-- and falls under Roblox gravity; a per-frame raycast catches the surface it lands on; that
+-- surface is turned (once) into an IMGN canvas with a Liquid("Blood") sim whose Gravity is the
+-- face's downhill direction (so it drips correctly on walls, slopes, rotated parts); the droplet
+-- shrinks and is destroyed. KillBrick wires all this to a Touched kill.
+--
+-- The 2D simulation + the gravity projection are verified; the 3D parts (droplet physics, the
+-- raycast landing, face/UV mapping in Surface) follow Roblox conventions that need a Studio pass.
+
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+
+local Canvas = require(script.Parent.Canvas)
+local Liquid = require(script.Parent.Liquid)
+local Surface = require(script.Surface)
+
+--[=[
+	@class Blood
+	A droplet-and-drip blood engine over [Liquid]. `Blood.Emit` throws a droplet, `Blood.KillBrick`
+	makes a brick that spurts blood when stepped on, `Blood.Splat` paints directly onto a surface.
+]=]
+local Blood = {}
+
+local SETTINGS = {
+	PixelsPerStud = 10, -- canvas resolution per stud of surface
+	MaxResolution = 160, -- clamp so a big wall doesn't melt the renderer
+	Preset = "Blood",
+	DropletSize = 0.4,
+	DropletColor = Color3.fromRGB(120, 6, 8),
+	DropletLifetime = 6, -- seconds before a droplet that never lands is cleaned up
+	SplatAmount = 4,
+	Dynamic = true, -- recompute each surface's gravity per frame (drips react to rotation)
+}
+
+--[=[
+	@within Blood
+	Overrides engine defaults: `PixelsPerStud`, `MaxResolution`, `Preset`, `DropletSize`,
+	`DropletColor`, `DropletLifetime`, `SplatAmount`, `Dynamic`.
+]=]
+function Blood.Configure(overrides: { [string]: any })
+	for key, value in overrides do
+		assert(SETTINGS[key] ~= nil, `IMGN Blood.Configure: unknown key "{tostring(key)}"`)
+		SETTINGS[key] = value
+	end
+end
+
+-- a folder to hold droplets, so raycasts can ignore them all at once
+local dropletFolder: Folder
+
+local function getDropletFolder(): Folder
+	if not dropletFolder or not dropletFolder.Parent then
+		dropletFolder = Instance.new("Folder")
+		dropletFolder.Name = "IMGNBloodDroplets"
+		dropletFolder.Parent = Workspace
+	end
+	return dropletFolder
+end
+
+-- ============================ BloodSurface ============================
+-- One canvas + Liquid sim bound to a part's face. Created lazily on first splat, then reused.
+
+local BloodSurface = {}
+BloodSurface.__index = BloodSurface
+
+-- key a part/face pair to its BloodSurface
+local surfaces: { [BasePart]: { [Enum.NormalId]: any } } = setmetatable({}, { __mode = "k" })
+
+local function faceExtent(part: BasePart, right: Vector3, down: Vector3): (number, number)
+	local s = part.Size
+	local w = math.abs(right.X * s.X) + math.abs(right.Y * s.Y) + math.abs(right.Z * s.Z)
+	local h = math.abs(down.X * s.X) + math.abs(down.Y * s.Y) + math.abs(down.Z * s.Z)
+	return w, h
+end
+
+function BloodSurface.new(part: BasePart, normalId: Enum.NormalId)
+	local _normal, right, down = Surface.faceVectors(part, normalId)
+	local wStuds, hStuds = faceExtent(part, right, down)
+	local resW = math.clamp(math.floor(wStuds * SETTINGS.PixelsPerStud), 8, SETTINGS.MaxResolution)
+	local resH = math.clamp(math.floor(hStuds * SETTINGS.PixelsPerStud), 8, SETTINGS.MaxResolution)
+
+	local gui = Instance.new("SurfaceGui")
+	gui.Name = "IMGNBlood"
+	gui.Face = normalId
+	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	gui.PixelsPerStud = 50
+	gui.Adornee = part
+	gui.Parent = part
+
+	local canvas = Canvas.new({ Resolution = Vector2.new(resW, resH), Parent = gui })
+	local liquid = Liquid.new({
+		Canvas = canvas,
+		Preset = SETTINGS.Preset,
+		Gravity = Surface.gravityVector(right, down),
+	})
+	liquid:Start()
+
+	local self = setmetatable({
+		Part = part,
+		Face = normalId,
+		Liquid = liquid,
+		Width = resW,
+		Height = resH,
+		_gui = gui,
+	}, BloodSurface)
+
+	-- drips react to the part's current orientation
+	if SETTINGS.Dynamic then
+		self._conn = RunService.Heartbeat:Connect(function()
+			if not part.Parent then
+				self:Destroy()
+				return
+			end
+			local _n, r, d = Surface.faceVectors(part, normalId)
+			liquid.Gravity = Surface.gravityVector(r, d)
+		end)
+	end
+
+	return self
+end
+
+function BloodSurface.Splat(self: any, worldPos: Vector3, amount: number, velocity: Vector3?)
+	local px, py = Surface.worldToPixel(self.Part, self.Face, worldPos, self.Width, self.Height)
+	local canvasVel = Vector2.zero
+	if velocity then
+		local _n, right, down = Surface.faceVectors(self.Part, self.Face)
+		canvasVel = Vector2.new(velocity:Dot(right), velocity:Dot(down)) * 0.5
+	end
+	self.Liquid:Splat(px, py, amount, { Spread = 4 + amount, Velocity = canvasVel })
+end
+
+function BloodSurface.Destroy(self: any)
+	if self._conn then
+		self._conn:Disconnect()
+	end
+	if surfaces[self.Part] then
+		surfaces[self.Part][self.Face] = nil
+	end
+	self.Liquid:Destroy()
+	if self._gui then
+		self._gui:Destroy()
+	end
+end
+
+--[=[
+	@within Blood
+	The [BloodSurface] for a part's face, creating and caching it on first use. Use this (or
+	`Blood.Splat`) to paint onto a surface without going through a droplet.
+]=]
+function Blood.SurfaceFor(part: BasePart, normalId: Enum.NormalId): any
+	local byFace = surfaces[part]
+	if not byFace then
+		byFace = {}
+		surfaces[part] = byFace
+	end
+	if not byFace[normalId] then
+		byFace[normalId] = BloodSurface.new(part, normalId)
+	end
+	return byFace[normalId]
+end
+
+--[=[
+	@within Blood
+	Splats `amount` of blood at `worldPos` on `part`'s `normalId` face (optionally biased by a 3D
+	`velocity`), turning that face into a dripping canvas if it isn't one already.
+]=]
+function Blood.Splat(part: BasePart, normalId: Enum.NormalId, worldPos: Vector3, amount: number?, velocity: Vector3?)
+	Blood.SurfaceFor(part, normalId):Splat(worldPos, amount or SETTINGS.SplatAmount, velocity)
+end
+
+-- shrink a landed droplet, then destroy it
+local function popDroplet(drop: BasePart)
+	local tween = TweenService:Create(drop, TweenInfo.new(0.12, Enum.EasingStyle.Quad), { Size = Vector3.new(0.01, 0.01, 0.01) })
+	tween.Completed:Connect(function()
+		drop:Destroy()
+	end)
+	tween:Play()
+end
+
+--[=[
+	@within Blood
+	Emits a real 3D blood droplet from `origin` with initial `velocity`. It falls under gravity;
+	when it lands on a surface it splats there (drips down that surface) and is destroyed.
+	`options.Amount` sets the splat size.
+]=]
+function Blood.Emit(origin: Vector3, velocity: Vector3, options: { Amount: number? }?)
+	local opts = options or {}
+	local drop = Instance.new("Part")
+	drop.Name = "BloodDroplet"
+	drop.Shape = Enum.PartType.Ball
+	drop.Size = Vector3.new(SETTINGS.DropletSize, SETTINGS.DropletSize, SETTINGS.DropletSize)
+	drop.Color = SETTINGS.DropletColor
+	drop.Material = Enum.Material.Glass
+	drop.CanCollide = false
+	drop.CanQuery = false
+	drop.CFrame = CFrame.new(origin)
+	drop.Parent = getDropletFolder()
+	drop.AssemblyLinearVelocity = velocity
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { getDropletFolder() }
+
+	local last = origin
+	local born = os.clock()
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		if not drop.Parent then
+			conn:Disconnect()
+			return
+		end
+		if os.clock() - born > SETTINGS.DropletLifetime then
+			conn:Disconnect()
+			drop:Destroy()
+			return
+		end
+
+		local cur = drop.Position
+		local step = cur - last
+		if step.Magnitude > 1e-3 then
+			local hit = Workspace:Raycast(last, step, params)
+			if hit and hit.Instance then
+				conn:Disconnect()
+				local face = Surface.faceFromNormal(hit.Instance, hit.Normal)
+				Blood.Splat(hit.Instance, face, hit.Position, opts.Amount or SETTINGS.SplatAmount, velocity)
+				drop.Anchored = true
+				popDroplet(drop)
+				return
+			end
+		end
+		last = cur
+	end)
+end
+
+--[=[
+	@within Blood
+	Turns `part` into a kill brick: when a character with a Humanoid touches it, the Humanoid is
+	killed and a spray of droplets bursts from the contact point, landing and dripping on whatever
+	they hit. `options`: `Droplets` (count), `Spread` (sideways speed), `Up` (upward speed),
+	`Amount` (per-splat).
+]=]
+function Blood.KillBrick(part: BasePart, options: { Droplets: number?, Spread: number?, Up: number?, Amount: number? }?)
+	local opts = options or {}
+	local droplets = opts.Droplets or 14
+	local spread = opts.Spread or 16
+	local up = opts.Up or 24
+	local debounce: { [Instance]: boolean } = setmetatable({}, { __mode = "k" }) :: any
+
+	part.Touched:Connect(function(hit)
+		local character = hit.Parent
+		if not character then
+			return
+		end
+		local humanoid = character:FindFirstChildOfType("Humanoid")
+		if not humanoid or humanoid.Health <= 0 or debounce[character] then
+			return
+		end
+		debounce[character] = true
+
+		local origin = (hit.Position + Vector3.new(0, 2, 0))
+		humanoid.Health = 0
+		for _ = 1, droplets do
+			local v = Vector3.new(
+				(math.random() - 0.5) * spread,
+				up * (0.5 + math.random() * 0.5),
+				(math.random() - 0.5) * spread
+			)
+			Blood.Emit(origin, v, { Amount = opts.Amount })
+		end
+	end)
+end
+
+return Blood
+]])
+mod("Surface", _4, [[
+-- IMGN
+-- _Classes/Blood/Surface.luau
+-- Plinko Labs
+--
+-- The 3D<->canvas math the blood engine needs: which face a hit landed on, where on that face's
+-- canvas a world point sits, and - the important one for realism - the canvas-space gravity for a
+-- face, so drips run downhill on walls, slopes and rotated parts alike.
+--
+-- gravityVector is pure and verified. The CFrame/face-axis bits (faceVectors, worldToPixel) follow
+-- Roblox conventions that need a Studio sanity check - flagged below - since the exact tangent of
+-- each NormalId and the SurfaceGui canvas orientation can't be exercised outside a running place.
+
+local Surface = {}
+
+--[=[
+	@class Surface
+	@within Blood
+	Internal 3D<->canvas helpers for the blood engine.
+]=]
+
+-- Pick, from a precomputed list of `{ id, normal }`, the face whose world normal best matches
+-- `worldNormal`. Pure - the testable core of faceFromNormal.
+function Surface.bestFace(faces: { { id: any, normal: Vector3 } }, worldNormal: Vector3): any
+	local best, bestDot = faces[1].id, -math.huge
+	for _, face in faces do
+		local d = face.normal:Dot(worldNormal)
+		if d > bestDot then
+			bestDot = d
+			best = face.id
+		end
+	end
+	return best
+end
+
+--[=[
+	@within Surface
+	The NormalId of `part` whose world-space normal is closest to `worldNormal` (e.g. a raycast hit
+	normal). NEEDS STUDIO CHECK: relies on `Vector3.fromNormalId` + the part's CFrame.
+]=]
+function Surface.faceFromNormal(part: BasePart, worldNormal: Vector3): Enum.NormalId
+	local cf = part.CFrame
+	local faces = {}
+	for _, id in Enum.NormalId:GetEnumItems() do
+		table.insert(faces, { id = id, normal = cf:VectorToWorldSpace(Vector3.fromNormalId(id)) })
+	end
+	return Surface.bestFace(faces, worldNormal)
+end
+
+--[=[
+	@within Surface
+	World-space unit vectors for a face: its `normal`, the canvas `right` (+X) and canvas `down`
+	(+Y). `down` is flipped to actually point downward in the world for non-horizontal faces, so a
+	wall's canvas Y runs with gravity. NEEDS STUDIO CHECK on the tangent convention.
+]=]
+function Surface.faceVectors(part: BasePart, normalId: Enum.NormalId): (Vector3, Vector3, Vector3)
+	local cf = part.CFrame
+	local normal = cf:VectorToWorldSpace(Vector3.fromNormalId(normalId)).Unit
+
+	-- a right tangent perpendicular to the normal (fall back to the part's own right axis when the
+	-- face is nearly horizontal and world-up is parallel to the normal)
+	local right = normal:Cross(Vector3.yAxis)
+	if right.Magnitude < 1e-3 then
+		right = cf.RightVector
+	end
+	right = right.Unit
+
+	local down = right:Cross(normal).Unit
+	if down:Dot(Vector3.new(0, -1, 0)) < 0 then
+		-- make canvas +Y point downward in the world (and keep the basis consistent)
+		down = -down
+		right = -right
+	end
+	return normal, right, down
+end
+
+--[=[
+	@within Surface
+	The canvas-space gravity (Vector2) for a face: world-down projected onto its `right`/`down`
+	axes. A vertical wall gives `(0, 1)` (drips straight down); a slope tilts it; a floor gives
+	about `(0, 0)` (no in-plane gravity → the fluid just pools). Pure + verified.
+]=]
+function Surface.gravityVector(right: Vector3, down: Vector3): Vector2
+	local worldDown = Vector3.new(0, -1, 0)
+	return Vector2.new(worldDown:Dot(right), worldDown:Dot(down))
+end
+
+--[=[
+	@within Surface
+	Converts a world point on `part`'s `normalId` face to a `(x, y)` pixel on a `resW` x `resH`
+	canvas. NEEDS STUDIO CHECK: face-axis -> UV mapping depends on Roblox conventions.
+]=]
+function Surface.worldToPixel(
+	part: BasePart,
+	normalId: Enum.NormalId,
+	worldPos: Vector3,
+	resW: number,
+	resH: number
+): (number, number)
+	local _normal, right, down = Surface.faceVectors(part, normalId)
+	-- vector from the part centre to the hit, in world space
+	local rel = worldPos - part.Position
+	-- how far along the face's right/down axes (in studs), then to 0..1 using the face's extent
+	local along = rel:Dot(right)
+	local downAmt = rel:Dot(down)
+	-- face extent along each axis: project the part size onto right/down (abs of each component)
+	local size = part.Size
+	local widthStuds = math.abs(right.X * size.X) + math.abs(right.Y * size.Y) + math.abs(right.Z * size.Z)
+	local heightStuds = math.abs(down.X * size.X) + math.abs(down.Y * size.Y) + math.abs(down.Z * size.Z)
+	local u = if widthStuds > 0 then along / widthStuds + 0.5 else 0.5
+	local v = if heightStuds > 0 then downAmt / heightStuds + 0.5 else 0.5
+	return math.clamp(math.floor(u * resW), 0, resW - 1), math.clamp(math.floor(v * resH), 0, resH - 1)
+end
+
+return Surface
+]])
+local _5 = mod("Canvas", _2, [[
 -- IMGN
 -- _Classes/Canvas/init.luau
 -- Plinko Labs
@@ -1489,7 +1894,7 @@ end
 
 return Canvas
 ]])
-local _5 = mod("Liquid", _2, [[
+local _6 = mod("Liquid", _2, [[
 -- IMGN
 -- _Classes/Liquid/init.luau
 -- Plinko Labs
@@ -1614,6 +2019,7 @@ function Liquid.new(config: LiquidConfig): Liquid
 		_amount = table.create(count, 0),
 		_dry = table.create(count, 0),
 		_shown = table.create(count, -1),
+		_delta = table.create(count, 0),
 		_conn = nil,
 		_running = false,
 	}, Liquid)
@@ -1675,31 +2081,68 @@ end
 ]=]
 function Liquid.Step(self: Liquid, dt: number)
 	local W, H = self.Width, self.Height
-	local amount, dry, shown = self._amount, self._dry, self._shown
+	local amount, dry, shown, delta = self._amount, self._dry, self._shown, self._delta
 	local CAP, CLING, SPREAD = self.Capacity, self.Cling, self.Spread
-	local gravity = math.clamp(self.Gravity.Y, 0, 1)
 
-	-- 1) downward flow, processed bottom-up so a column can drain in one step
-	if gravity > 0 then
-		for y = H - 2, 0, -1 do
+	-- Gravity is an arbitrary canvas-space vector, so fluid drips along whatever direction the
+	-- surface's "downhill" maps to (walls, slopes, rotated parts). Its magnitude is the flow rate.
+	local gx, gy = self.Gravity.X, self.Gravity.Y
+	local gmag = math.sqrt(gx * gx + gy * gy)
+	local sgnX = if gx > 1e-4 then 1 elseif gx < -1e-4 then -1 else 0
+	local sgnY = if gy > 1e-4 then 1 elseif gy < -1e-4 then -1 else 0
+
+	-- 1) directional flow via a delta buffer: each cell sends its movable fluid (everything above
+	-- the Cling film it leaves as a streak) toward the gravity direction, split across the vertical,
+	-- horizontal and diagonal downhill neighbours by weight. The delta buffer makes it order-free
+	-- and exactly mass-conserving, and the capacity check keeps cells from overflowing.
+	if gmag > 1e-4 then
+		local nx, ny = gx / gmag, gy / gmag
+		local wx, wy = math.abs(nx), math.abs(ny)
+		local wd = wx * wy
+		local total = wx + wy + wd
+		if total <= 0 then
+			total = 1
+		end
+
+		for i = 1, W * H do
+			delta[i] = 0
+		end
+
+		for y = 0, H - 1 do
 			local row = y * W
 			for x = 0, W - 1 do
 				local i = row + x + 1
 				local a = amount[i]
 				if a > CLING then
-					local bi = (y + 1) * W + x + 1
-					local space = CAP - amount[bi]
-					if space > 0 then
-						local flow = math.min(a - CLING, space)
-						amount[i] = a - flow
-						amount[bi] += flow
+					local movable = a - CLING
+					local out = 0
+					local function send(tx: number, ty: number, weight: number)
+						if weight <= 0 or tx < 0 or ty < 0 or tx >= W or ty >= H then
+							return
+						end
+						local ti = ty * W + tx + 1
+						local space = CAP - (amount[ti] + delta[ti])
+						if space > 0 then
+							local f = math.min(movable * weight / total, space)
+							delta[ti] += f
+							out += f
+						end
 					end
+					send(x, y + sgnY, wy)
+					send(x + sgnX, y, wx)
+					send(x + sgnX, y + sgnY, wd)
+					delta[i] -= out
 				end
 			end
 		end
+
+		for i = 1, W * H do
+			amount[i] += delta[i]
+		end
 	end
 
-	-- 2) lateral pooling, only when backed up (below full / at floor) - keeps drips narrow
+	-- 2) lateral pooling, only when the downhill cell is blocked (or there's no gravity, e.g. a
+	-- floor) - this keeps drips narrow on walls but lets pools level out where fluid collects.
 	if SPREAD > 0 then
 		for y = 0, H - 1 do
 			local row = y * W
@@ -1707,25 +2150,26 @@ function Liquid.Step(self: Liquid, dt: number)
 				local i = row + x + 1
 				local a = amount[i]
 				if a > CLING then
-					local backed = gravity <= 0 or y == H - 1 or (CAP - amount[(y + 1) * W + x + 1]) < 0.01
-					if backed then
-						if x > 0 then
-							local ni = row + x - 1 + 1
-							local diff = a - amount[ni]
-							if diff > 0.05 then
-								local m = diff * 0.25 * SPREAD
-								amount[i] = a - m
-								amount[ni] += m
-								a = amount[i]
-							end
+					local backed = gmag <= 1e-4
+					if not backed then
+						local dx, dy = x + sgnX, y + sgnY
+						if dx < 0 or dy < 0 or dx >= W or dy >= H then
+							backed = true
+						else
+							backed = (CAP - amount[dy * W + dx + 1]) < 0.01
 						end
-						if x < W - 1 then
-							local ni = row + x + 1 + 1
-							local diff = a - amount[ni]
-							if diff > 0.05 then
-								local m = diff * 0.25 * SPREAD
-								amount[i] = a - m
-								amount[ni] += m
+					end
+					if backed then
+						for _, nx2 in { x - 1, x + 1 } do
+							if nx2 >= 0 and nx2 < W then
+								local ni = row + nx2 + 1
+								local diff = a - amount[ni]
+								if diff > 0.05 then
+									local m = diff * 0.25 * SPREAD
+									amount[i] = a - m
+									amount[ni] += m
+									a = amount[i]
+								end
 							end
 						end
 					end
@@ -1835,8 +2279,8 @@ end
 
 return Liquid
 ]])
-local _6 = folder("_Core", _1)
-mod("Config", _6, [[
+local _7 = folder("_Core", _1)
+mod("Config", _7, [[
 -- IMGN
 -- _Core/Config.luau
 -- Plinko Labs
@@ -1927,7 +2371,7 @@ return {
 	configure = configure,
 }
 ]])
-mod("PixelBuffer", _6, [[
+mod("PixelBuffer", _7, [[
 -- IMGN
 -- _Core/PixelBuffer.luau
 -- Plinko Labs
@@ -2035,7 +2479,7 @@ end
 
 return PixelBuffer
 ]])
-local _7 = mod("_Drivers", _1, [[
+local _8 = mod("_Drivers", _1, [[
 -- IMGN
 -- _Drivers/init.luau
 -- Plinko Labs
@@ -2094,7 +2538,7 @@ end
 
 return Drivers
 ]])
-mod("GreedyMesh", _7, [[
+mod("GreedyMesh", _8, [[
 -- IMGN
 -- _Drivers/GreedyMesh.luau
 -- Plinko Labs
@@ -2279,7 +2723,7 @@ end
 
 return GreedyMesh
 ]])
-mod("PixelGrid", _7, [[
+mod("PixelGrid", _8, [[
 -- IMGN
 -- _Drivers/PixelGrid.luau
 -- Plinko Labs
@@ -2474,7 +2918,7 @@ end
 
 return PixelGrid
 ]])
-mod("RichText", _7, [[
+mod("RichText", _8, [[
 -- IMGN
 -- _Drivers/RichText.luau
 -- Plinko Labs
@@ -2641,7 +3085,7 @@ end
 
 return RichText
 ]])
-mod("RowMerge", _7, [[
+mod("RowMerge", _8, [[
 -- IMGN
 -- _Drivers/RowMerge.luau
 -- Plinko Labs
@@ -2825,8 +3269,8 @@ end
 
 return RowMerge
 ]])
-local _8 = folder("_Packages", _1)
-local _9 = mod("Image", _8, [[
+local _9 = folder("_Packages", _1)
+local _10 = mod("Image", _9, [[
 local Reader = script.ImageReader.Reader
 
 local ImageReader = require(script.ImageReader)
@@ -2846,7 +3290,7 @@ return {
     ImageFormat = require(script.ImageFormat),
     ImageError = require(script.ImageError)
 }]])
-mod("Cursor", _9, [[
+mod("Cursor", _10, [[
 local ImageError = require(script.Parent.ImageError)
 
 type ImageError = ImageError.ImageError
@@ -3049,7 +3493,7 @@ return {
 	new = new
 }
 ]])
-mod("DataReader", _9, [[
+mod("DataReader", _10, [[
 local ImageReader = script.Parent.ImageReader
 local ImageReaderTypes = require(ImageReader.types)
 
@@ -3064,7 +3508,7 @@ function DataReader.convertToBuffer(dataStream: ImageReaderTypes.ReadableData): 
 end
 
 return DataReader]])
-local _10 = mod("DynamicImage", _9, [[
+local _11 = mod("DynamicImage", _10, [[
 local Reader = require(script.Parent.ImageReader.Reader)
 local ImageFormat = require(script.Parent.ImageFormat)
 local ImageError = require(script.Parent.ImageError)
@@ -3117,7 +3561,7 @@ return {
 	end,
 }
 ]])
-mod("types", _10, [[
+mod("types", _11, [[
 local ImageFormat = require(script.Parent.Parent.ImageFormat)
 
 export type DynamicImage<T> = {
@@ -3133,7 +3577,7 @@ export type DynamicImage<T> = {
 }
 
 return nil]])
-mod("ImageError", _9, [[
+mod("ImageError", _10, [[
 local Result = require(script.Parent.Result)
 local SafeEnum = require(script.Parent.SafeEnum)
 
@@ -3148,7 +3592,7 @@ local ImageError = {
 }
 
 return ImageError]])
-mod("ImageFormat", _9, [[
+mod("ImageFormat", _10, [[
 local SafeEnum = require(script.Parent.SafeEnum)
 
 type Extensions = "BMP"
@@ -3184,7 +3628,7 @@ end
 
 return ImageFormat :: typeof(ImageFormat)
 ]])
-local _11 = mod("ImageReader", _9, [[
+local _12 = mod("ImageReader", _10, [[
 local types = require(script.types)
 local structs = require(script.structs)
 
@@ -3270,7 +3714,7 @@ return {
 	end,
 }
 ]])
-local _12 = mod("Reader", _11, [[
+local _13 = mod("Reader", _12, [[
 --!strict
 
 local ImageReader = script.Parent
@@ -3315,7 +3759,7 @@ return {
         return CODECS
     end
 }]])
-mod("Bmp", _12, [[
+mod("Bmp", _13, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -3747,7 +4191,7 @@ end
 
 return Bmp
 ]])
-local _13 = mod("Jpeg", _12, [[
+local _14 = mod("Jpeg", _13, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -3917,7 +4361,7 @@ end
 
 return Jpg
 ]])
-local _14 = mod("Decoder", _13, [[
+local _15 = mod("Decoder", _14, [[
 local JPEG = {}
 
 local HUFFMAN_MODULE = require(script.HuffmanTable)
@@ -5063,7 +5507,7 @@ end
 
 return JPEG
 ]])
-mod("BitStream", _14, [[
+mod("BitStream", _15, [[
 local module = {}
 
 function module.CreateBitStream(data)
@@ -5125,7 +5569,7 @@ function module.CreateBitStream(data)
 end
 
 return module]])
-mod("HuffmanTable", _14, [[
+mod("HuffmanTable", _15, [[
 local module = {}
 
 local function BitsFromLength(root, element, pos)
@@ -5204,7 +5648,7 @@ function module.GetCode(huffmanTable, bitStream)
 end
 
 return module]])
-mod("types", _13, [[
+mod("types", _14, [[
 local Jpg = script.Parent
 local Reader = Jpg.Parent
 local ImageReader = Reader.Parent
@@ -5225,7 +5669,7 @@ export type JpgHeader = {
 }
 
 return nil]])
-local _15 = mod("Png", _12, [[
+local _16 = mod("Png", _13, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5491,7 +5935,7 @@ end
 
 return Png
 ]])
-mod("BppConvert", _15, [[
+mod("BppConvert", _16, [[
 local Preprocess = require(script.Parent.Preprocess)
 local fourBit = Preprocess[0.5]
 local twoBit = Preprocess[0.25]
@@ -5599,8 +6043,8 @@ end
 
 return Convert
 ]])
-local _16 = folder("Chunks", _15)
-mod("IDAT", _16, [[
+local _17 = folder("Chunks", _16)
+mod("IDAT", _17, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5618,7 +6062,7 @@ return function(cursor: Cursor, file, chunk)
     return
 end
 ]])
-mod("IEND", _16, [[
+mod("IEND", _17, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5630,7 +6074,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("PLTE", _16, [[
+mod("PLTE", _17, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5642,7 +6086,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("gAMA", _16, [[
+mod("gAMA", _17, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Chunks = script.Parent
@@ -5656,7 +6100,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("sRGB", _16, [[
+mod("sRGB", _17, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5668,7 +6112,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("tEXt", _16, [[
+mod("tEXt", _17, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5687,7 +6131,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("tRNS", _16, [[
+mod("tRNS", _17, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5722,7 +6166,7 @@ return function(cursor: Cursor, file, data)
 	}
 end
 ]])
-mod("Deflate", _15, [=[
+mod("Deflate", _16, [=[
 --[[
 
 LUA MODULE
@@ -6199,7 +6643,7 @@ function Deflate:InflateZlib(io)
 end
 
 return Deflate]=])
-mod("IDHR", _15, [[
+mod("IDHR", _16, [[
 local Reader = script.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -6233,7 +6677,7 @@ return function(PNG, cursor: Cursor)
     }
 end
 ]])
-mod("Interlacing", _15, [[
+mod("Interlacing", _16, [[
 local Interlacing = {}
 
 local X_STEP = { 8, 8, 4, 4, 2, 2, 1 }
@@ -6401,7 +6845,7 @@ end
 
 return Interlacing
 ]])
-mod("Preprocess", _15, [[
+mod("Preprocess", _16, [[
 local util = require(script.Parent.Parent.util)
 
 local createRGBAColor = util.createRGBAColor
@@ -6462,7 +6906,7 @@ return {
 	end,
 }
 ]])
-mod("Unfilter", _15, [[
+mod("Unfilter", _16, [[
 local Unfilter = {}
 
 -- 0
@@ -6656,9 +7100,9 @@ end
 
 return Unfilter
 ]])
-mod("util", _15, [[
+mod("util", _16, [[
 return require(script.Parent.Parent.util)]])
-mod("Tga", _12, [[
+mod("Tga", _13, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -6875,7 +7319,7 @@ end
 
 return Tga
 ]])
-mod("util", _12, [[
+mod("util", _13, [[
 local util = {}
 
 function util.createRGBAColor(r: number, g: number, b: number, a: number?): number
@@ -6904,7 +7348,7 @@ function util.beToLe16(beValue: number)
 end
 
 return util]])
-mod("structs", _11, [[
+mod("structs", _12, [[
 export type Dimensions = { width: number, height: number }
 
 export type function getAppropriateDecoder(ty: type, tys: type)
@@ -6912,7 +7356,7 @@ export type function getAppropriateDecoder(ty: type, tys: type)
 end
 
 return nil]])
-mod("types", _11, [[
+mod("types", _12, [[
 local ImageFormat = require(script.Parent.Parent.ImageFormat)
 local ImageError = require(script.Parent.Parent.ImageError)
 local Cursor = require(script.Parent.Parent.Cursor)
@@ -6950,7 +7394,7 @@ export type ImageReader<T> = {
 }
 
 return nil]])
-mod("Result", _9, [[
+mod("Result", _10, [[
 export type Result<T, E> = {
     isOk: boolean,
     value: {T | E},
@@ -7029,7 +7473,7 @@ function Result.castSmallToDefault<T, E>(result: SmallResult<T, E>): Result<T, E
 end
 
 return Result]])
-mod("SafeEnum", _9, [[
+mod("SafeEnum", _10, [[
 local counter = -1
 
 return function<T>(): T
@@ -7037,8 +7481,8 @@ return function<T>(): T
 	return counter
 end
 ]])
-local _17 = folder("_Patterns", _1)
-mod("Draw", _17, [[
+local _18 = folder("_Patterns", _1)
+mod("Draw", _18, [[
 -- IMGN
 -- _Patterns/Draw.luau
 -- Plinko Labs
@@ -7172,7 +7616,7 @@ end
 
 return Draw
 ]])
-mod("Font", _17, [[
+mod("Font", _18, [[
 -- IMGN
 -- _Patterns/Font.luau
 -- Plinko Labs
@@ -7295,7 +7739,7 @@ end
 
 return Font
 ]])
-mod("Image", _17, [[
+mod("Image", _18, [[
 -- IMGN
 -- _Patterns/Image.luau
 -- Plinko Labs
@@ -7525,5 +7969,5 @@ end
 return Image
 ]])
 
-print("[IMGN] installed 53 modules under ReplicatedStorage.IMGN")
+print("[IMGN] installed 55 modules under ReplicatedStorage.IMGN")
 return true
