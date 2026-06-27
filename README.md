@@ -96,6 +96,7 @@ Coordinates are **0-indexed**, `(0, 0)` top-left. Out-of-bounds writes are clipp
 | `:DrawLine(x0, y0, x1, y1, color, alpha?)` | Bresenham line. |
 | `:DrawRect(x, y, w, h, color, filled?, alpha?)` | Rectangle (border or filled). |
 | `:DrawCircle(cx, cy, r, color, filled?, alpha?)` | Circle (outline or disc). |
+| `:Text(text, x, y, color, scale?, alpha?)` | Draw text in the built-in 3×5 bitmap font (uppercase, digits, punctuation). |
 | `:Blit(source, dx, dy)` | Copy another canvas in at `(dx, dy)`. |
 | `:Render()` | Flush dirty pixels to instances. |
 | `:Mount(parent)` | Build instances under `parent` (if you skipped `Parent`). |
@@ -203,6 +204,14 @@ See [`examples/`](examples):
 - **AppBounce** — the App engine: 5 balls bouncing off the walls and each other around a center wall.
 - **CombWipe** — `App:Comb` painting a scrolling rainbow one row at a time.
 - **Breakout** — a full mini-game: paddle, ball, and bricks that delete themselves via `OnCollide`.
+- **DoomFire** — the classic PSX fire effect.
+- **FallingSand** — a powder-game sand simulation pouring through a funnel.
+- **GameOfLife** — Conway's Life on a wrapping grid.
+- **MatrixRain** — falling green code using the bitmap font.
+- **Starfield** — a warp-speed flight through projected 3D stars.
+- **Mandelbrot** — a self-zooming fractal via `:Shader`.
+- **Snake** — the classic, with a bitmap-font scoreboard (WASD / arrows).
+- **Raycaster** — a Wolfenstein-style first-person 3D view (W/S walk, A/D turn).
 
 - **GradientSurface** — procedural gradient on a part via `:Shader`.
 - **PaintCanvas** — click-drag finger paint on a `ScreenGui` with `AutoRender`.

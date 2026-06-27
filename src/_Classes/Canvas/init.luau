@@ -14,6 +14,7 @@ local PixelBuffer = require(script.Parent.Parent._Core.PixelBuffer)
 local ConfigModule = require(script.Parent.Parent._Core.Config)
 local Drivers = require(script.Parent.Parent._Drivers)
 local Draw = require(script.Parent.Parent._Patterns.Draw)
+local Font = require(script.Parent.Parent._Patterns.Font)
 
 local Config = ConfigModule.Config
 
@@ -226,6 +227,18 @@ function Canvas.DrawCircle(self: Canvas, cx: number, cy: number, radius: number,
 	Draw.circle(function(x, y)
 		Canvas.SetPixel(self, x, y, color, alpha)
 	end, cx, cy, radius, filled)
+end
+
+--[=[
+	@within Canvas
+	Draws `text` in the built-in 3x5 bitmap font with its top-left at `(x, y)`. `scale` (default 1)
+	enlarges each font pixel into a block. Letters are uppercase-only; see [Font]. Returns the x
+	just past the text, for chaining.
+]=]
+function Canvas.Text(self: Canvas, text: string, x: number, y: number, color: Color3, scale: number?, alpha: number?): number
+	return Font.draw(function(px, py)
+		Canvas.SetPixel(self, px, py, color, alpha)
+	end, text, math.floor(x), math.floor(y), scale)
 end
 
 --[=[
