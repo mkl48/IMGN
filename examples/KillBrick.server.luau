@@ -34,9 +34,9 @@ local brick = makePart("KillBrick", Vector3.new(8, 1, 8), CFrame.new(0, 0.5, 0),
 brick.Material = Enum.Material.Neon
 
 IMGN.Blood.KillBrick(brick, {
-	Droplets = 18,
-	Spread = 18,
-	Up = 26,
+	Droplets = 6, -- keep it low: each droplet can spawn a canvas, and canvases are the cost
+	Spread = 14,
+	Up = 20,
 	Amount = 4,
 })
 

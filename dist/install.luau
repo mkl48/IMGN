@@ -1132,8 +1132,8 @@ local Surface = require(script.Surface)
 local Blood = {}
 
 local SETTINGS = {
-	PixelsPerStud = 4, -- canvas resolution per stud of surface (lower = far fewer Frames)
-	MaxResolution = 64, -- clamp so a big wall doesn't melt the renderer
+	PixelsPerStud = 3, -- canvas resolution per stud of surface (lower = far fewer Frames)
+	MaxResolution = 48, -- clamp so a big wall doesn't melt the renderer (48x48 = 2304 Frames)
 	Preset = "Blood",
 	DropletSize = 0.4,
 	DropletColor = Color3.fromRGB(120, 6, 8),
@@ -1315,7 +1315,7 @@ function Blood.Emit(origin: Vector3, velocity: Vector3, options: { Amount: numbe
 	drop.Shape = Enum.PartType.Ball
 	drop.Size = Vector3.new(SETTINGS.DropletSize, SETTINGS.DropletSize, SETTINGS.DropletSize)
 	drop.Color = SETTINGS.DropletColor
-	drop.Material = Enum.Material.Glass
+	drop.Material = Enum.Material.SmoothPlastic -- Glass is expensive to render on many small parts
 	drop.CanCollide = false
 	drop.CanQuery = false
 	drop.CFrame = CFrame.new(origin)
@@ -1366,18 +1366,20 @@ end
 ]=]
 function Blood.KillBrick(part: BasePart, options: { Droplets: number?, Spread: number?, Up: number?, Amount: number? }?)
 	local opts = options or {}
-	local droplets = opts.Droplets or 14
+	local droplets = opts.Droplets or 6 -- fewer drops = fewer surfaces/canvases = far less lag
 	local spread = opts.Spread or 16
 	local up = opts.Up or 24
 	local debounce: { [Instance]: boolean } = setmetatable({}, { __mode = "k" }) :: any
 
 	part.Touched:Connect(function(hit)
 		local character = hit.Parent
+		-- Touched fires constantly, so bail fast: a direct hashed FindFirstChild beats
+		-- FindFirstChildOfType (which walks children) on the hot path.
 		if not character then
 			return
 		end
-		local humanoid = character:FindFirstChildOfType("Humanoid")
-		if not humanoid or humanoid.Health <= 0 or debounce[character] then
+		local humanoid = character:FindFirstChild("Humanoid")
+		if not humanoid or not humanoid:IsA("Humanoid") or humanoid.Health <= 0 or debounce[character] then
 			return
 		end
 		debounce[character] = true
@@ -2045,6 +2047,7 @@ function Liquid.new(config: LiquidConfig): Liquid
 		_shown = table.create(count, -1),
 		_delta = table.create(count, 0),
 		_active = false, -- sim sleeps when nothing is moving/drying; Add/Splat wakes it
+		_settledFlow = false, -- once flow stops we skip the flow/spread passes (just keep drying)
 		_conn = nil,
 		_running = false,
 	}, Liquid)
@@ -2062,6 +2065,7 @@ function Liquid.Add(self: Liquid, x: number, y: number, amount: number)
 	self._amount[i] = math.min(self.Capacity, self._amount[i] + amount)
 	self._dry[i] = 0 -- fresh again
 	self._active = true -- wake the sim
+	self._settledFlow = false -- new fluid may flow again
 end
 
 -- Add a soft radial blob of fluid.
@@ -2124,9 +2128,14 @@ function Liquid.Step(self: Liquid, dt: number)
 	local sgnX = if gx > 1e-4 then 1 elseif gx < -1e-4 then -1 else 0
 	local sgnY = if gy > 1e-4 then 1 elseif gy < -1e-4 then -1 else 0
 
+	-- Once the fluid has stopped flowing we keep drying/repainting but skip the two expensive flow
+	-- passes entirely (a settling pool no longer pays for flow + spread every frame).
+	local doFlow = not self._settledFlow
+	local moved = false
+
 	-- 1) directional flow via a delta buffer (mass-conserving, capacity-aware). Sends are inlined -
 	-- no per-cell closures or table allocations in the hot loop.
-	if gmag > 1e-4 then
+	if doFlow and gmag > 1e-4 then
 		local nx, ny = gx / gmag, gy / gmag
 		local wx, wy = math.abs(nx), math.abs(ny)
 		local wd = wx * wy
@@ -2186,13 +2195,19 @@ function Liquid.Step(self: Liquid, dt: number)
 		end
 
 		for i = 1, cellCount do
-			amount[i] += delta[i]
+			local d = delta[i]
+			if d ~= 0 then
+				amount[i] += d
+				if d > 1e-4 or d < -1e-4 then
+					moved = true
+				end
+			end
 		end
 	end
 
 	-- 2) lateral pooling, only where the downhill cell is blocked (or there's no gravity) - keeps
 	-- drips narrow on walls while pools level out. Neighbours inlined, no allocation.
-	if SPREAD > 0 then
+	if doFlow and SPREAD > 0 then
 		local k = 0.25 * SPREAD
 		for y = 0, H - 1 do
 			local row = y * W
@@ -2218,6 +2233,7 @@ function Liquid.Step(self: Liquid, dt: number)
 								amount[i] = a - m
 								amount[ni] += m
 								a = amount[i]
+								moved = true
 							end
 						end
 						if x < W - 1 then
@@ -2227,12 +2243,18 @@ function Liquid.Step(self: Liquid, dt: number)
 								local m = diff * k
 								amount[i] = a - m
 								amount[ni] += m
+								moved = true
 							end
 						end
 					end
 				end
 			end
 		end
+	end
+
+	-- flow has stopped: stop paying for the flow/spread passes (drying continues below)
+	if doFlow and not moved then
+		self._settledFlow = true
 	end
 
 	-- 3) evaporate, dry, repaint changed cells, and decide whether to keep simulating

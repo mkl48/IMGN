@@ -124,6 +124,7 @@ function Liquid.new(config: LiquidConfig): Liquid
 		_shown = table.create(count, -1),
 		_delta = table.create(count, 0),
 		_active = false, -- sim sleeps when nothing is moving/drying; Add/Splat wakes it
+		_settledFlow = false, -- once flow stops we skip the flow/spread passes (just keep drying)
 		_conn = nil,
 		_running = false,
 	}, Liquid)
@@ -141,6 +142,7 @@ function Liquid.Add(self: Liquid, x: number, y: number, amount: number)
 	self._amount[i] = math.min(self.Capacity, self._amount[i] + amount)
 	self._dry[i] = 0 -- fresh again
 	self._active = true -- wake the sim
+	self._settledFlow = false -- new fluid may flow again
 end
 
 -- Add a soft radial blob of fluid.
@@ -203,9 +205,14 @@ function Liquid.Step(self: Liquid, dt: number)
 	local sgnX = if gx > 1e-4 then 1 elseif gx < -1e-4 then -1 else 0
 	local sgnY = if gy > 1e-4 then 1 elseif gy < -1e-4 then -1 else 0
 
+	-- Once the fluid has stopped flowing we keep drying/repainting but skip the two expensive flow
+	-- passes entirely (a settling pool no longer pays for flow + spread every frame).
+	local doFlow = not self._settledFlow
+	local moved = false
+
 	-- 1) directional flow via a delta buffer (mass-conserving, capacity-aware). Sends are inlined -
 	-- no per-cell closures or table allocations in the hot loop.
-	if gmag > 1e-4 then
+	if doFlow and gmag > 1e-4 then
 		local nx, ny = gx / gmag, gy / gmag
 		local wx, wy = math.abs(nx), math.abs(ny)
 		local wd = wx * wy
@@ -265,13 +272,19 @@ function Liquid.Step(self: Liquid, dt: number)
 		end
 
 		for i = 1, cellCount do
-			amount[i] += delta[i]
+			local d = delta[i]
+			if d ~= 0 then
+				amount[i] += d
+				if d > 1e-4 or d < -1e-4 then
+					moved = true
+				end
+			end
 		end
 	end
 
 	-- 2) lateral pooling, only where the downhill cell is blocked (or there's no gravity) - keeps
 	-- drips narrow on walls while pools level out. Neighbours inlined, no allocation.
-	if SPREAD > 0 then
+	if doFlow and SPREAD > 0 then
 		local k = 0.25 * SPREAD
 		for y = 0, H - 1 do
 			local row = y * W
@@ -297,6 +310,7 @@ function Liquid.Step(self: Liquid, dt: number)
 								amount[i] = a - m
 								amount[ni] += m
 								a = amount[i]
+								moved = true
 							end
 						end
 						if x < W - 1 then
@@ -306,12 +320,18 @@ function Liquid.Step(self: Liquid, dt: number)
 								local m = diff * k
 								amount[i] = a - m
 								amount[ni] += m
+								moved = true
 							end
 						end
 					end
 				end
 			end
 		end
+	end
+
+	-- flow has stopped: stop paying for the flow/spread passes (drying continues below)
+	if doFlow and not moved then
+		self._settledFlow = true
 	end
 
 	-- 3) evaporate, dry, repaint changed cells, and decide whether to keep simulating
