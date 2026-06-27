@@ -58,6 +58,7 @@ local _1 = mod("IMGN", RS, [[
 
 local Canvas = require(script._Classes.Canvas)
 local AppClass = require(script._Classes.App)
+local LiquidClass = require(script._Classes.Liquid)
 local ImageHelper = require(script._Patterns.Image)
 local ConfigModule = require(script._Core.Config)
 
@@ -69,6 +70,8 @@ export type App = AppClass.App
 export type AppConfig = AppClass.AppConfig
 export type Object = AppClass.Object
 export type ObjectConfig = AppClass.ObjectConfig
+export type Liquid = LiquidClass.Liquid
+export type LiquidConfig = LiquidClass.LiquidConfig
 export type Config = ConfigModule.Config
 
 --[=[
@@ -97,6 +100,16 @@ end
 ]=]
 function IMGN.App(config: AppConfig): App
 	return AppClass.new(config)
+end
+
+--[=[
+	@within IMGN
+	Creates a [Liquid] simulation (see [LiquidConfig]) - splatting, dripping, pooling, drying fluid
+	on a canvas. `Preset` picks the fluid ("Blood" default, plus Water/Paint/Lava/Slime/Honey).
+	Pass an existing `Canvas` or `Resolution`/`Parent`. `:Splat` to add fluid, `:Start` to run it.
+]=]
+function IMGN.Liquid(config: LiquidConfig): Liquid
+	return LiquidClass.new(config)
 end
 
 --[=[
@@ -1476,8 +1489,354 @@ end
 
 return Canvas
 ]])
-local _5 = folder("_Core", _1)
-mod("Config", _5, [[
+local _5 = mod("Liquid", _2, [[
+-- IMGN
+-- _Classes/Liquid/init.luau
+-- Plinko Labs
+--
+-- A liquid cellular simulation on a Canvas - splats that flow, drip, pool and dry. Each cell holds
+-- an AMOUNT of fluid; every step it transfers downward (gravity), leaving a thin CLING film behind
+-- so drips streak instead of sliding off clean, spreads sideways only when backed up (high surface
+-- tension = narrow rivulets, not a watery sheet), slowly EVAPORATES, and DRIES from its fresh
+-- colour toward its dry colour. Blood is the headline preset; Water/Paint/Lava/Slime/Honey reuse
+-- the same engine with different constants.
+--
+-- Gravity is a canvas-space direction: a wall SurfaceGui uses (0, 1) (down), a floor uses (0, 0)
+-- so fluid just pools where it lands. Only changed cells are repainted, so once it dries the sim
+-- costs almost nothing.
+
+local RunService = game:GetService("RunService")
+
+local Canvas = require(script.Parent.Canvas)
+
+--[=[
+	@class Liquid
+	A flowing/dripping fluid on a [Canvas]. Create with [IMGN.Liquid], `:Splat` to add fluid, and
+	`:Start` to run the sim. `Canvas`, `Width`, `Height` are readable; tuning fields (`Capacity`,
+	`Cling`, `Evaporation`, `DryRate`, `Spread`, `Gravity`) are writable live.
+]=]
+local Liquid = {}
+Liquid.__index = Liquid
+
+type RGB = { number }
+
+type Preset = {
+	Capacity: number, -- max fluid per cell
+	Cling: number, -- film left behind when fluid flows down (the streak)
+	Evaporation: number, -- fluid lost per second
+	DryRate: number, -- how fast it dries (0..1 per second)
+	Spread: number, -- lateral pooling strength (0 = none, 1 = watery)
+	Stain: number, -- faint permanent mark left after drying (0 = none)
+	Fresh: RGB, -- colour when wet
+	Dry: RGB, -- colour when dried
+	AlphaAt: number, -- amount at which the fluid is fully opaque
+}
+
+local PRESETS: { [string]: Preset } = {
+	-- Dark, clingy, dries to brown. The good stuff.
+	Blood = { Capacity = 4, Cling = 0.55, Evaporation = 0.03, DryRate = 0.06, Spread = 0.35, Stain = 0.2, Fresh = { 140, 8, 10 }, Dry = { 58, 18, 14 }, AlphaAt = 1.4 },
+	-- Thin, spreads flat, evaporates fast, barely stains.
+	Water = { Capacity = 4, Cling = 0.15, Evaporation = 0.12, DryRate = 0.04, Spread = 0.9, Stain = 0, Fresh = { 90, 150, 235 }, Dry = { 90, 150, 235 }, AlphaAt = 1.8 },
+	-- Sticky, slow, vivid, never dries (override Fresh for colour).
+	Paint = { Capacity = 5, Cling = 0.9, Evaporation = 0, DryRate = 0.02, Spread = 0.25, Stain = 1, Fresh = { 230, 40, 60 }, Dry = { 200, 36, 54 }, AlphaAt = 1.2 },
+	-- Glowing, viscous, hardly spreads, permanent.
+	Lava = { Capacity = 5, Cling = 0.8, Evaporation = 0, DryRate = 0.015, Spread = 0.2, Stain = 1, Fresh = { 255, 150, 40 }, Dry = { 120, 30, 20 }, AlphaAt = 1 },
+	-- Very clingy, slow ooze.
+	Slime = { Capacity = 5, Cling = 1.0, Evaporation = 0.01, DryRate = 0.02, Spread = 0.3, Stain = 0.5, Fresh = { 80, 220, 90 }, Dry = { 60, 150, 70 }, AlphaAt = 1.2 },
+	-- Thick, golden, the slowest drip.
+	Honey = { Capacity = 6, Cling = 1.3, Evaporation = 0, DryRate = 0.01, Spread = 0.2, Stain = 1, Fresh = { 235, 170, 30 }, Dry = { 205, 140, 20 }, AlphaAt = 1.1 },
+}
+
+export type LiquidConfig = {
+	Canvas: Canvas.Canvas?, -- an existing canvas to flow on; else built from the fields below
+	Resolution: Vector2?,
+	Parent: Instance?,
+	Driver: any?,
+	Preset: string?, -- "Blood" (default), "Water", "Paint", "Lava", "Slime", "Honey"
+	Gravity: Vector2?, -- canvas-space down (default (0,1)); use (0,0) for a floor (pool, no drip)
+	Color: (Color3 | RGB)?, -- override the fresh colour (handy for Paint)
+	-- any Preset field can be overridden directly:
+	Capacity: number?,
+	Cling: number?,
+	Evaporation: number?,
+	DryRate: number?,
+	Spread: number?,
+}
+
+export type Liquid = typeof(setmetatable({} :: any, Liquid))
+
+local function pick<T>(value: T?, fallback: T): T
+	if value == nil then
+		return fallback
+	end
+	return value
+end
+
+local function asRGB(color: (Color3 | RGB)?): RGB?
+	if color == nil then
+		return nil
+	end
+	if typeof(color) == "Color3" then
+		return { math.floor(color.R * 255 + 0.5), math.floor(color.G * 255 + 0.5), math.floor(color.B * 255 + 0.5) }
+	end
+	return color :: RGB
+end
+
+--[=[
+	@within Liquid
+	Builds a Liquid. Pass an existing `Canvas`, or `Resolution`/`Parent` to build one.
+]=]
+function Liquid.new(config: LiquidConfig): Liquid
+	local preset = PRESETS[config.Preset or "Blood"]
+	assert(preset, `IMGN.Liquid: unknown Preset "{tostring(config.Preset)}"`)
+
+	local canvas = config.Canvas
+	if not canvas then
+		assert(config.Resolution, "IMGN.Liquid: pass a Canvas or a Resolution")
+		canvas = Canvas.new({ Resolution = config.Resolution, Parent = config.Parent, Driver = config.Driver })
+	end
+
+	local count = canvas.Width * canvas.Height
+	local self = setmetatable({
+		Canvas = canvas,
+		Width = canvas.Width,
+		Height = canvas.Height,
+		Capacity = pick(config.Capacity, preset.Capacity),
+		Cling = pick(config.Cling, preset.Cling),
+		Evaporation = pick(config.Evaporation, preset.Evaporation),
+		DryRate = pick(config.DryRate, preset.DryRate),
+		Spread = pick(config.Spread, preset.Spread),
+		Stain = preset.Stain,
+		AlphaAt = preset.AlphaAt,
+		Fresh = asRGB(config.Color) or preset.Fresh,
+		Dry = preset.Dry,
+		Gravity = config.Gravity or Vector2.new(0, 1),
+		_amount = table.create(count, 0),
+		_dry = table.create(count, 0),
+		_shown = table.create(count, -1),
+		_conn = nil,
+		_running = false,
+	}, Liquid)
+
+	return self
+end
+
+-- Add fluid to one cell (clamped to capacity), no-op out of bounds.
+function Liquid.Add(self: Liquid, x: number, y: number, amount: number)
+	x, y = math.floor(x), math.floor(y)
+	if x < 0 or y < 0 or x >= self.Width or y >= self.Height then
+		return
+	end
+	local i = y * self.Width + x + 1
+	self._amount[i] = math.min(self.Capacity, self._amount[i] + amount)
+	self._dry[i] = 0 -- fresh again
+end
+
+-- Add a soft radial blob of fluid.
+function Liquid._blob(self: Liquid, cx: number, cy: number, radius: number, amount: number)
+	local r2 = radius * radius
+	for y = math.floor(cy - radius), math.ceil(cy + radius) do
+		for x = math.floor(cx - radius), math.ceil(cx + radius) do
+			local dx, dy = x - cx, y - cy
+			local d2 = dx * dx + dy * dy
+			if d2 <= r2 then
+				Liquid.Add(self, x, y, amount * (1 - d2 / r2))
+			end
+		end
+	end
+end
+
+--[=[
+	@within Liquid
+	Splats fluid around `(x, y)`: a central blob plus scattered droplets. `options.Spread` sets the
+	splatter radius, `options.Velocity` (Vector2) biases the spray direction (a hit's momentum), and
+	`options.Droplets` the number of satellites.
+]=]
+function Liquid.Splat(self: Liquid, x: number, y: number, amount: number, options: { Spread: number?, Velocity: Vector2?, Droplets: number? }?)
+	local opts = options or {}
+	local spread = opts.Spread or 6
+	local vel = opts.Velocity or Vector2.zero
+	local droplets = opts.Droplets or math.clamp(math.floor(amount * 1.5), 4, 24)
+
+	Liquid._blob(self, x, y, spread * 0.4, amount)
+	for _ = 1, droplets do
+		local ang = math.random() * math.pi * 2
+		local dist = math.random() * spread
+		local px = x + math.cos(ang) * dist + vel.X * math.random()
+		local py = y + math.sin(ang) * dist + vel.Y * math.random()
+		Liquid._blob(self, px, py, math.random() + 0.5, amount * 0.35)
+	end
+end
+
+--[=[
+	@within Liquid
+	Advances the simulation one step (`dt` seconds). Called for you by the loop when running; call
+	directly for a fixed-step or headless sim.
+]=]
+function Liquid.Step(self: Liquid, dt: number)
+	local W, H = self.Width, self.Height
+	local amount, dry, shown = self._amount, self._dry, self._shown
+	local CAP, CLING, SPREAD = self.Capacity, self.Cling, self.Spread
+	local gravity = math.clamp(self.Gravity.Y, 0, 1)
+
+	-- 1) downward flow, processed bottom-up so a column can drain in one step
+	if gravity > 0 then
+		for y = H - 2, 0, -1 do
+			local row = y * W
+			for x = 0, W - 1 do
+				local i = row + x + 1
+				local a = amount[i]
+				if a > CLING then
+					local bi = (y + 1) * W + x + 1
+					local space = CAP - amount[bi]
+					if space > 0 then
+						local flow = math.min(a - CLING, space)
+						amount[i] = a - flow
+						amount[bi] += flow
+					end
+				end
+			end
+		end
+	end
+
+	-- 2) lateral pooling, only when backed up (below full / at floor) - keeps drips narrow
+	if SPREAD > 0 then
+		for y = 0, H - 1 do
+			local row = y * W
+			for x = 0, W - 1 do
+				local i = row + x + 1
+				local a = amount[i]
+				if a > CLING then
+					local backed = gravity <= 0 or y == H - 1 or (CAP - amount[(y + 1) * W + x + 1]) < 0.01
+					if backed then
+						if x > 0 then
+							local ni = row + x - 1 + 1
+							local diff = a - amount[ni]
+							if diff > 0.05 then
+								local m = diff * 0.25 * SPREAD
+								amount[i] = a - m
+								amount[ni] += m
+								a = amount[i]
+							end
+						end
+						if x < W - 1 then
+							local ni = row + x + 1 + 1
+							local diff = a - amount[ni]
+							if diff > 0.05 then
+								local m = diff * 0.25 * SPREAD
+								amount[i] = a - m
+								amount[ni] += m
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	-- 3) evaporate, dry, and repaint changed cells
+	local evap = self.Evaporation * dt
+	local dryStep = self.DryRate * dt
+	local stain = self.Stain
+	local alphaAt = self.AlphaAt
+	local fr, dr = self.Fresh, self.Dry
+	local canvas = self.Canvas
+
+	for y = 0, H - 1 do
+		local row = y * W
+		for x = 0, W - 1 do
+			local i = row + x + 1
+			local a = amount[i]
+			if a > 0 then
+				dry[i] = math.min(1, dry[i] + dryStep)
+				a = a - evap
+				if a < stain then
+					a = if dry[i] >= 0.999 then stain else math.max(a, 0)
+				end
+				amount[i] = a
+			end
+
+			-- repaint only on a meaningful change
+			if math.abs(a - shown[i]) > 0.02 then
+				shown[i] = a
+				if a <= 0.001 then
+					canvas:SetPixel(x, y, Color3.new(0, 0, 0), 0)
+				else
+					local fresh = 1 - dry[i]
+					local r = dr[1] + (fr[1] - dr[1]) * fresh
+					local g = dr[2] + (fr[2] - dr[2]) * fresh
+					local b = dr[3] + (fr[3] - dr[3]) * fresh
+					-- thicker = a touch darker (pooled blood reads deeper)
+					local thick = math.clamp(a / CAP, 0, 1) * 0.25
+					canvas:SetPixel(
+						x,
+						y,
+						Color3.fromRGB(r * (1 - thick), g * (1 - thick), b * (1 - thick)),
+						math.clamp(a / alphaAt, 0, 1)
+					)
+				end
+			end
+		end
+	end
+
+	canvas:Render()
+end
+
+--[=[
+	@within Liquid
+	Starts the per-frame simulation loop. Idempotent.
+]=]
+function Liquid.Start(self: Liquid)
+	if self._running then
+		return
+	end
+	self._running = true
+	self._conn = RunService.Heartbeat:Connect(function(dt)
+		Liquid.Step(self, math.min(dt, 1 / 30)) -- clamp dt so a lag spike doesn't teleport fluid
+	end)
+end
+
+--[=[
+	@within Liquid
+	Stops the loop.
+]=]
+function Liquid.Stop(self: Liquid)
+	if self._conn then
+		self._conn:Disconnect()
+		self._conn = nil
+	end
+	self._running = false
+end
+
+--[=[
+	@within Liquid
+	Clears all fluid.
+]=]
+function Liquid.Clear(self: Liquid)
+	for i = 1, self.Width * self.Height do
+		self._amount[i] = 0
+		self._dry[i] = 0
+	end
+	self.Canvas:Fill(Color3.new(0, 0, 0), 0)
+	for i = 1, self.Width * self.Height do
+		self._shown[i] = 0
+	end
+	self.Canvas:Render()
+end
+
+--[=[
+	@within Liquid
+	Stops the loop and destroys the canvas.
+]=]
+function Liquid.Destroy(self: Liquid)
+	Liquid.Stop(self)
+	self.Canvas:Destroy()
+end
+
+return Liquid
+]])
+local _6 = folder("_Core", _1)
+mod("Config", _6, [[
 -- IMGN
 -- _Core/Config.luau
 -- Plinko Labs
@@ -1568,7 +1927,7 @@ return {
 	configure = configure,
 }
 ]])
-mod("PixelBuffer", _5, [[
+mod("PixelBuffer", _6, [[
 -- IMGN
 -- _Core/PixelBuffer.luau
 -- Plinko Labs
@@ -1676,7 +2035,7 @@ end
 
 return PixelBuffer
 ]])
-local _6 = mod("_Drivers", _1, [[
+local _7 = mod("_Drivers", _1, [[
 -- IMGN
 -- _Drivers/init.luau
 -- Plinko Labs
@@ -1735,7 +2094,7 @@ end
 
 return Drivers
 ]])
-mod("GreedyMesh", _6, [[
+mod("GreedyMesh", _7, [[
 -- IMGN
 -- _Drivers/GreedyMesh.luau
 -- Plinko Labs
@@ -1920,7 +2279,7 @@ end
 
 return GreedyMesh
 ]])
-mod("PixelGrid", _6, [[
+mod("PixelGrid", _7, [[
 -- IMGN
 -- _Drivers/PixelGrid.luau
 -- Plinko Labs
@@ -2115,7 +2474,7 @@ end
 
 return PixelGrid
 ]])
-mod("RichText", _6, [[
+mod("RichText", _7, [[
 -- IMGN
 -- _Drivers/RichText.luau
 -- Plinko Labs
@@ -2282,7 +2641,7 @@ end
 
 return RichText
 ]])
-mod("RowMerge", _6, [[
+mod("RowMerge", _7, [[
 -- IMGN
 -- _Drivers/RowMerge.luau
 -- Plinko Labs
@@ -2466,8 +2825,8 @@ end
 
 return RowMerge
 ]])
-local _7 = folder("_Packages", _1)
-local _8 = mod("Image", _7, [[
+local _8 = folder("_Packages", _1)
+local _9 = mod("Image", _8, [[
 local Reader = script.ImageReader.Reader
 
 local ImageReader = require(script.ImageReader)
@@ -2487,7 +2846,7 @@ return {
     ImageFormat = require(script.ImageFormat),
     ImageError = require(script.ImageError)
 }]])
-mod("Cursor", _8, [[
+mod("Cursor", _9, [[
 local ImageError = require(script.Parent.ImageError)
 
 type ImageError = ImageError.ImageError
@@ -2690,7 +3049,7 @@ return {
 	new = new
 }
 ]])
-mod("DataReader", _8, [[
+mod("DataReader", _9, [[
 local ImageReader = script.Parent.ImageReader
 local ImageReaderTypes = require(ImageReader.types)
 
@@ -2705,7 +3064,7 @@ function DataReader.convertToBuffer(dataStream: ImageReaderTypes.ReadableData): 
 end
 
 return DataReader]])
-local _9 = mod("DynamicImage", _8, [[
+local _10 = mod("DynamicImage", _9, [[
 local Reader = require(script.Parent.ImageReader.Reader)
 local ImageFormat = require(script.Parent.ImageFormat)
 local ImageError = require(script.Parent.ImageError)
@@ -2758,7 +3117,7 @@ return {
 	end,
 }
 ]])
-mod("types", _9, [[
+mod("types", _10, [[
 local ImageFormat = require(script.Parent.Parent.ImageFormat)
 
 export type DynamicImage<T> = {
@@ -2774,7 +3133,7 @@ export type DynamicImage<T> = {
 }
 
 return nil]])
-mod("ImageError", _8, [[
+mod("ImageError", _9, [[
 local Result = require(script.Parent.Result)
 local SafeEnum = require(script.Parent.SafeEnum)
 
@@ -2789,7 +3148,7 @@ local ImageError = {
 }
 
 return ImageError]])
-mod("ImageFormat", _8, [[
+mod("ImageFormat", _9, [[
 local SafeEnum = require(script.Parent.SafeEnum)
 
 type Extensions = "BMP"
@@ -2825,7 +3184,7 @@ end
 
 return ImageFormat :: typeof(ImageFormat)
 ]])
-local _10 = mod("ImageReader", _8, [[
+local _11 = mod("ImageReader", _9, [[
 local types = require(script.types)
 local structs = require(script.structs)
 
@@ -2911,7 +3270,7 @@ return {
 	end,
 }
 ]])
-local _11 = mod("Reader", _10, [[
+local _12 = mod("Reader", _11, [[
 --!strict
 
 local ImageReader = script.Parent
@@ -2956,7 +3315,7 @@ return {
         return CODECS
     end
 }]])
-mod("Bmp", _11, [[
+mod("Bmp", _12, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -3388,7 +3747,7 @@ end
 
 return Bmp
 ]])
-local _12 = mod("Jpeg", _11, [[
+local _13 = mod("Jpeg", _12, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -3558,7 +3917,7 @@ end
 
 return Jpg
 ]])
-local _13 = mod("Decoder", _12, [[
+local _14 = mod("Decoder", _13, [[
 local JPEG = {}
 
 local HUFFMAN_MODULE = require(script.HuffmanTable)
@@ -4704,7 +5063,7 @@ end
 
 return JPEG
 ]])
-mod("BitStream", _13, [[
+mod("BitStream", _14, [[
 local module = {}
 
 function module.CreateBitStream(data)
@@ -4766,7 +5125,7 @@ function module.CreateBitStream(data)
 end
 
 return module]])
-mod("HuffmanTable", _13, [[
+mod("HuffmanTable", _14, [[
 local module = {}
 
 local function BitsFromLength(root, element, pos)
@@ -4845,7 +5204,7 @@ function module.GetCode(huffmanTable, bitStream)
 end
 
 return module]])
-mod("types", _12, [[
+mod("types", _13, [[
 local Jpg = script.Parent
 local Reader = Jpg.Parent
 local ImageReader = Reader.Parent
@@ -4866,7 +5225,7 @@ export type JpgHeader = {
 }
 
 return nil]])
-local _14 = mod("Png", _11, [[
+local _15 = mod("Png", _12, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5132,7 +5491,7 @@ end
 
 return Png
 ]])
-mod("BppConvert", _14, [[
+mod("BppConvert", _15, [[
 local Preprocess = require(script.Parent.Preprocess)
 local fourBit = Preprocess[0.5]
 local twoBit = Preprocess[0.25]
@@ -5240,8 +5599,8 @@ end
 
 return Convert
 ]])
-local _15 = folder("Chunks", _14)
-mod("IDAT", _15, [[
+local _16 = folder("Chunks", _15)
+mod("IDAT", _16, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5259,7 +5618,7 @@ return function(cursor: Cursor, file, chunk)
     return
 end
 ]])
-mod("IEND", _15, [[
+mod("IEND", _16, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5271,7 +5630,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("PLTE", _15, [[
+mod("PLTE", _16, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5283,7 +5642,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("gAMA", _15, [[
+mod("gAMA", _16, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Chunks = script.Parent
@@ -5297,7 +5656,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("sRGB", _15, [[
+mod("sRGB", _16, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5309,7 +5668,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("tEXt", _15, [[
+mod("tEXt", _16, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5328,7 +5687,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("tRNS", _15, [[
+mod("tRNS", _16, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5363,7 +5722,7 @@ return function(cursor: Cursor, file, data)
 	}
 end
 ]])
-mod("Deflate", _14, [=[
+mod("Deflate", _15, [=[
 --[[
 
 LUA MODULE
@@ -5840,7 +6199,7 @@ function Deflate:InflateZlib(io)
 end
 
 return Deflate]=])
-mod("IDHR", _14, [[
+mod("IDHR", _15, [[
 local Reader = script.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5874,7 +6233,7 @@ return function(PNG, cursor: Cursor)
     }
 end
 ]])
-mod("Interlacing", _14, [[
+mod("Interlacing", _15, [[
 local Interlacing = {}
 
 local X_STEP = { 8, 8, 4, 4, 2, 2, 1 }
@@ -6042,7 +6401,7 @@ end
 
 return Interlacing
 ]])
-mod("Preprocess", _14, [[
+mod("Preprocess", _15, [[
 local util = require(script.Parent.Parent.util)
 
 local createRGBAColor = util.createRGBAColor
@@ -6103,7 +6462,7 @@ return {
 	end,
 }
 ]])
-mod("Unfilter", _14, [[
+mod("Unfilter", _15, [[
 local Unfilter = {}
 
 -- 0
@@ -6297,9 +6656,9 @@ end
 
 return Unfilter
 ]])
-mod("util", _14, [[
+mod("util", _15, [[
 return require(script.Parent.Parent.util)]])
-mod("Tga", _11, [[
+mod("Tga", _12, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -6516,7 +6875,7 @@ end
 
 return Tga
 ]])
-mod("util", _11, [[
+mod("util", _12, [[
 local util = {}
 
 function util.createRGBAColor(r: number, g: number, b: number, a: number?): number
@@ -6545,7 +6904,7 @@ function util.beToLe16(beValue: number)
 end
 
 return util]])
-mod("structs", _10, [[
+mod("structs", _11, [[
 export type Dimensions = { width: number, height: number }
 
 export type function getAppropriateDecoder(ty: type, tys: type)
@@ -6553,7 +6912,7 @@ export type function getAppropriateDecoder(ty: type, tys: type)
 end
 
 return nil]])
-mod("types", _10, [[
+mod("types", _11, [[
 local ImageFormat = require(script.Parent.Parent.ImageFormat)
 local ImageError = require(script.Parent.Parent.ImageError)
 local Cursor = require(script.Parent.Parent.Cursor)
@@ -6591,7 +6950,7 @@ export type ImageReader<T> = {
 }
 
 return nil]])
-mod("Result", _8, [[
+mod("Result", _9, [[
 export type Result<T, E> = {
     isOk: boolean,
     value: {T | E},
@@ -6670,7 +7029,7 @@ function Result.castSmallToDefault<T, E>(result: SmallResult<T, E>): Result<T, E
 end
 
 return Result]])
-mod("SafeEnum", _8, [[
+mod("SafeEnum", _9, [[
 local counter = -1
 
 return function<T>(): T
@@ -6678,8 +7037,8 @@ return function<T>(): T
 	return counter
 end
 ]])
-local _16 = folder("_Patterns", _1)
-mod("Draw", _16, [[
+local _17 = folder("_Patterns", _1)
+mod("Draw", _17, [[
 -- IMGN
 -- _Patterns/Draw.luau
 -- Plinko Labs
@@ -6813,7 +7172,7 @@ end
 
 return Draw
 ]])
-mod("Font", _16, [[
+mod("Font", _17, [[
 -- IMGN
 -- _Patterns/Font.luau
 -- Plinko Labs
@@ -6936,7 +7295,7 @@ end
 
 return Font
 ]])
-mod("Image", _16, [[
+mod("Image", _17, [[
 -- IMGN
 -- _Patterns/Image.luau
 -- Plinko Labs
@@ -7166,5 +7525,5 @@ end
 return Image
 ]])
 
-print("[IMGN] installed 52 modules under ReplicatedStorage.IMGN")
+print("[IMGN] installed 53 modules under ReplicatedStorage.IMGN")
 return true

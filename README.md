@@ -163,6 +163,25 @@ A `section` is a 1-D view: `section.Index` (the row's y / column's x), `section.
 
 > **App backgrounds are solid.** Objects erase to `Background` each frame, so a static *image* backdrop behind moving objects isn't supported in 0.1.0 (a moving body would erase holes in it). Use a solid `Background`, or draw non-moving scenery as anchored Objects.
 
+## Liquid simulation (blood, water, …)
+
+`IMGN.Liquid` is a cellular fluid sim on a canvas — splats that **flow, drip in rivulets, pool, and dry**. The headline use is realistic **dripping blood** on a surface; the same engine does Water/Paint/Lava/Slime/Honey by preset.
+
+```lua
+local blood = IMGN.Liquid({
+    Canvas = IMGN.Surface(wall, Enum.NormalId.Front, { Resolution = Vector2.new(96, 120) }),
+    Preset = "Blood",   -- Water / Paint / Lava / Slime / Honey
+})
+blood:Start()
+
+-- splatter on impact (e.g. from a raycast hit mapped to a pixel)
+blood:Splat(px, py, 4, { Spread = 8, Velocity = Vector2.new(2, 1) })
+```
+
+How it looks right: each step fluid transfers downward but leaves a thin **`Cling`** film behind (the streak), spreads sideways only when **backed up** (high surface tension → narrow drips, not a watery sheet), slowly **evaporates**, and **dries** from its fresh colour to a dark stain. Gravity is a canvas-space vector — `(0, 1)` for a wall (drips down), `(0, 0)` for a floor (just pools). Every field (`Cling`, `Spread`, `Evaporation`, `DryRate`, `Capacity`, `Gravity`, `Color`) is tunable live. Only changed cells repaint, so once it dries it costs almost nothing.
+
+See `examples/BloodDrip.server.luau`.
+
 ## Loading real images
 
 IMGN can draw actual image files — PNG/BMP/TGA/JPG — onto a canvas. The decoder ([osgl-rbx/image](https://github.com/osgl-rbx/image)) is **bundled inside IMGN**, so there's nothing extra to install — just hand it the file bytes. No `EditableImage`, no verification.
@@ -290,6 +309,7 @@ See [`examples/`](examples):
 - **Raycaster** — a Wolfenstein-style first-person 3D view (W/S walk, A/D turn).
 - **LoadImage** — decode a real PNG onto a part (decoder bundled).
 - **WebImage** — load an image by URL through the bundled web service (`server/`).
+- **BloodDrip** — realistic dripping blood via the `Liquid` sim (`IMGN.Liquid`).
 
 - **GradientSurface** — procedural gradient on a part via `:Shader`.
 - **PaintCanvas** — click-drag finger paint on a `ScreenGui` with `AutoRender`.

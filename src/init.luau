@@ -16,6 +16,7 @@
 
 local Canvas = require(script._Classes.Canvas)
 local AppClass = require(script._Classes.App)
+local LiquidClass = require(script._Classes.Liquid)
 local ImageHelper = require(script._Patterns.Image)
 local ConfigModule = require(script._Core.Config)
 
@@ -27,6 +28,8 @@ export type App = AppClass.App
 export type AppConfig = AppClass.AppConfig
 export type Object = AppClass.Object
 export type ObjectConfig = AppClass.ObjectConfig
+export type Liquid = LiquidClass.Liquid
+export type LiquidConfig = LiquidClass.LiquidConfig
 export type Config = ConfigModule.Config
 
 --[=[
@@ -55,6 +58,16 @@ end
 ]=]
 function IMGN.App(config: AppConfig): App
 	return AppClass.new(config)
+end
+
+--[=[
+	@within IMGN
+	Creates a [Liquid] simulation (see [LiquidConfig]) - splatting, dripping, pooling, drying fluid
+	on a canvas. `Preset` picks the fluid ("Blood" default, plus Water/Paint/Lava/Slime/Honey).
+	Pass an existing `Canvas` or `Resolution`/`Parent`. `:Splat` to add fluid, `:Start` to run it.
+]=]
+function IMGN.Liquid(config: LiquidConfig): Liquid
+	return LiquidClass.new(config)
 end
 
 --[=[
