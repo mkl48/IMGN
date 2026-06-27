@@ -134,6 +134,51 @@ end
 
 --[=[
 	@within IMGN
+	Progressive [IMGN.ImageCanvas]: builds the canvas' Frames and draws the image a few rows per
+	frame so a big image loads smoothly instead of freezing. `config.Parent` is required (it mounts
+	as it builds), `config.RowsPerFrame` (default 8) tunes the budget, and `config.OnProgress(0..1)`
+	reports progress (mount counts as the first half, drawing the second). Must run on a yielding
+	thread - wrap the call in `task.spawn`. Note the decode step itself isn't split.
+]=]
+function IMGN.ImageCanvasAsync(bytes: string | buffer, config: {
+	Parent: Instance,
+	Driver: any?,
+	AutoRender: boolean?,
+	Scale: number?,
+	Format: string?,
+	SkipTransparent: boolean?,
+	RowsPerFrame: number?,
+	OnProgress: ((number) -> ())?,
+}): Canvas
+	assert(config and config.Parent, "IMGN.ImageCanvasAsync: config.Parent is required")
+	local decoded = ImageHelper.decode(bytes, config.Format)
+	local scale = config.Scale or 1
+	local width = math.max(1, math.floor(decoded.width * scale + 0.5))
+	local height = math.max(1, math.floor(decoded.height * scale + 0.5))
+	local rows = config.RowsPerFrame or 8
+	local report = config.OnProgress
+
+	local canvas = Canvas.new({
+		Resolution = Vector2.new(width, height),
+		Driver = config.Driver,
+		AutoRender = config.AutoRender,
+	})
+
+	-- Mount progressively (first half of progress), then draw progressively (second half).
+	canvas:MountAsync(config.Parent, rows, if report then function(f)
+		report(f * 0.5)
+	end else nil)
+	ImageHelper.blitAsync(canvas, decoded, { Scale = scale, SkipTransparent = config.SkipTransparent }, rows, function()
+		task.wait()
+	end, if report then function(f)
+		report(0.5 + f * 0.5)
+	end else nil)
+
+	return canvas
+end
+
+--[=[
+	@within IMGN
 	Creates (or reuses) a `SurfaceGui` on `part`'s `face` and mounts a [Canvas] onto it - the
 	in-world path (signs, screens, billboards on a brick). `face` defaults to `Enum.NormalId.Front`.
 	Any [CanvasConfig] field except `Parent` is honoured.
@@ -1109,6 +1154,36 @@ end
 
 --[=[
 	@within Canvas
+	Mounts progressively: builds the Driver's Instances `rowsPerFrame` rows at a time, yielding
+	between batches so a large canvas doesn't hitch the frame. `onProgress(fraction)` is reported
+	per batch. Falls back to a one-shot [Canvas:Mount] for drivers that build lazily (RowMerge).
+	Must run on a thread that can yield (e.g. inside `task.spawn`).
+]=]
+function Canvas.MountAsync(self: Canvas, parent: Instance, rowsPerFrame: number?, onProgress: ((number) -> ())?)
+	assert(not self._mounted, "IMGN Canvas: already mounted")
+
+	local driver = self._driver :: any
+	if driver.MountAsync then
+		driver:MountAsync(parent, rowsPerFrame or 8, function()
+			task.wait()
+		end, onProgress)
+	else
+		driver:Mount(parent)
+		if onProgress then
+			onProgress(1)
+		end
+	end
+	self._mounted = true
+
+	if self._autoRender then
+		self._heartbeat = RunService.Heartbeat:Connect(function()
+			self._driver:Flush()
+		end)
+	end
+end
+
+--[=[
+	@within Canvas
 	Writes `color` (and optional `alpha`, default `1`) at `(x, y)` and marks it dirty. Clipped
 	silently if out of bounds. Cheap - the visible update happens on the next flush.
 ]=]
@@ -1248,6 +1323,27 @@ end
 function Canvas.LoadImage(self: Canvas, bytes: string | buffer, options: Image.LoadOptions?): (number, number)
 	local decoded = Image.decode(bytes, options and options.Format)
 	return Image.blit(self, decoded, options)
+end
+
+--[=[
+	@within Canvas
+	Like [Canvas:LoadImage], but draws the image `rowsPerFrame` rows at a time, yielding (and
+	flushing) between bands so a large image spreads across frames instead of freezing one.
+	`onProgress(fraction)` is reported per band. The decode itself isn't split (it's one decoder
+	call); this spreads the per-pixel draw + render. Must run on a yielding thread. Returns the
+	drawn width/height.
+]=]
+function Canvas.LoadImageAsync(
+	self: Canvas,
+	bytes: string | buffer,
+	options: Image.LoadOptions?,
+	rowsPerFrame: number?,
+	onProgress: ((number) -> ())?
+): (number, number)
+	local decoded = Image.decode(bytes, options and options.Format)
+	return Image.blitAsync(self, decoded, options, rowsPerFrame or 8, function()
+		task.wait()
+	end, onProgress)
 end
 
 --[=[
@@ -1595,6 +1691,65 @@ function PixelGrid.Mount(self: PixelGrid, parent: Instance): Frame
 
 	container.Parent = parent
 	self._container = container
+	return container
+end
+
+-- Build one row of pixel Frames into the container.
+local function buildRow(self: PixelGrid, container: Frame, sx: number, sy: number, y: number)
+	local width = self._width
+	for x = 0, width - 1 do
+		local pixel = Instance.new("Frame")
+		pixel.BorderSizePixel = 0
+		pixel.BackgroundTransparency = 1
+		pixel.Size = UDim2.new(sx, 1, sy, 1)
+		pixel.Position = UDim2.fromScale(x * sx, y * sy)
+		pixel.ZIndex = 1
+		pixel.Parent = container
+		self._frames[y * width + x + 1] = pixel
+	end
+end
+
+--[=[
+	@within PixelGrid
+	Like [PixelGrid.Mount], but creates the grid `rowsPerYield` rows at a time, calling `yield`
+	between batches so building thousands of Frames spreads across frames instead of hitching one.
+	`onProgress(fraction)` is reported per batch. Must run on a yielding thread.
+]=]
+function PixelGrid.MountAsync(
+	self: PixelGrid,
+	parent: Instance,
+	rowsPerYield: number,
+	yield: () -> (),
+	onProgress: ((number) -> ())?
+): Frame
+	local height = self._height
+	local sx, sy = 1 / self._width, 1 / height
+
+	local container = Instance.new("Frame")
+	container.Name = "IMGNCanvas"
+	container.Size = UDim2.fromScale(1, 1)
+	container.BackgroundTransparency = 1
+	container.BorderSizePixel = 0
+	container.ClipsDescendants = true
+	container.Parent = parent
+	self._container = container
+
+	local step = math.max(1, rowsPerYield)
+	local y = 0
+	while y < height do
+		local toY = math.min(y + step - 1, height - 1)
+		for row = y, toY do
+			buildRow(self, container, sx, sy, row)
+		end
+		if onProgress then
+			onProgress((toY + 1) / height)
+		end
+		y = toY + 1
+		if y < height then
+			yield()
+		end
+	end
+
 	return container
 end
 
@@ -6326,11 +6481,14 @@ mod("Image", _16, [[
 -- is osgl-rbx/image (https://github.com/osgl-rbx/image), vendored under _Packages/Image and used
 -- internally - so callers just pass bytes, no separate install. This module drives osgl's API and
 -- copies the decoded RGBA8 buffer onto a Canvas (osgl's DynamicImage buffer is the same
--- 4-bytes-per-pixel layout IMGN uses, so it's a straight per-pixel copy with optional
--- nearest-neighbour scaling).
+-- 4-bytes-per-pixel layout IMGN uses, so it's a straight per-pixel copy).
+--
+-- Placement: pass `Scale` + `X`/`Y`, or a `Fit` mode ("Contain"/"Cover"/"Stretch") to size the
+-- image against the canvas. `blitAsync` does the same copy but yields every N rows so a big image
+-- doesn't freeze the frame - see Canvas:LoadImageAsync.
 --
 -- Bytes come from you: HttpService:GetAsync(url) returns the file as a string, or bake the file
--- into a ModuleScript - either a `string` or a `buffer` works.
+-- into a ModuleScript (scripts/embed-image.luau) - either a `string` or a `buffer` works.
 
 local Decoder = require(script.Parent.Parent._Packages.Image)
 
@@ -6342,12 +6500,15 @@ local Decoder = require(script.Parent.Parent._Packages.Image)
 local Image = {}
 
 export type LoadOptions = {
-	X: number?, -- destination top-left x (default 0)
-	Y: number?, -- destination top-left y (default 0)
+	X: number?, -- destination top-left x (default 0; ignored when Fit is set)
+	Y: number?, -- destination top-left y (default 0; ignored when Fit is set)
 	Scale: number?, -- nearest-neighbour scale (default 1; <1 shrinks, >1 enlarges)
+	Fit: (boolean | "Contain" | "Cover" | "Stretch")?, -- size to the canvas instead of Scale (true = "Contain")
 	Format: ("PNG" | "BMP" | "TGA" | "JPG")?, -- skip format auto-detection
 	SkipTransparent: boolean?, -- don't write fully-transparent source pixels (composite instead of replace)
 }
+
+type Placement = { scaleX: number, scaleY: number, ox: number, oy: number, destW: number, destH: number }
 
 -- Decode `bytes` (string|buffer) with the bundled decoder into a DynamicImage.
 function Image.decode(bytes: string | buffer, format: string?): any
@@ -6369,30 +6530,99 @@ function Image.decode(bytes: string | buffer, format: string?): any
 	return result:Unwrap()
 end
 
--- Copy a decoded DynamicImage onto `canvas` at the given offset/scale. Returns drawn width/height.
-function Image.blit(canvas: any, img: any, options: LoadOptions?): (number, number)
-	local opts = options or {}
-	local ox = opts.X or 0
-	local oy = opts.Y or 0
-	local scale = opts.Scale or 1
-	local skip = opts.SkipTransparent
-	assert(scale > 0, "IMGN: image Scale must be > 0")
+-- Work out destination scale + offset from the options and the target canvas size.
+local function resolvePlacement(canvas: any, img: any, opts: LoadOptions): Placement
+	local iw, ih = img.width, img.height
+	local scaleX, scaleY, ox, oy
 
-	local destW = math.max(1, math.floor(img.width * scale + 0.5))
-	local destH = math.max(1, math.floor(img.height * scale + 0.5))
+	if opts.Fit then
+		local mode = if opts.Fit == true then "Contain" else opts.Fit
+		local cw, ch = canvas.Width, canvas.Height
+		if mode == "Stretch" then
+			scaleX, scaleY = cw / iw, ch / ih
+		else
+			-- Contain fits inside (letterbox); Cover fills and crops.
+			local s = if mode == "Cover" then math.max(cw / iw, ch / ih) else math.min(cw / iw, ch / ih)
+			scaleX, scaleY = s, s
+		end
+		ox = math.floor((cw - iw * scaleX) / 2 + 0.5)
+		oy = math.floor((ch - ih * scaleY) / 2 + 0.5)
+	else
+		local s = opts.Scale or 1
+		assert(s > 0, "IMGN: image Scale must be > 0")
+		scaleX, scaleY = s, s
+		ox, oy = opts.X or 0, opts.Y or 0
+	end
 
-	for dy = 0, destH - 1 do
-		local sy = math.min(img.height - 1, math.floor(dy / scale))
-		for dx = 0, destW - 1 do
-			local sx = math.min(img.width - 1, math.floor(dx / scale))
+	return {
+		scaleX = scaleX,
+		scaleY = scaleY,
+		ox = ox,
+		oy = oy,
+		destW = math.max(1, math.floor(iw * scaleX + 0.5)),
+		destH = math.max(1, math.floor(ih * scaleY + 0.5)),
+	}
+end
+
+-- Copy one band of destination rows [fromY, toY] (inclusive) onto the canvas.
+local function blitRows(canvas: any, img: any, p: Placement, skip: boolean?, fromY: number, toY: number)
+	local iw, ih = img.width, img.height
+	for dy = fromY, toY do
+		local sy = math.min(ih - 1, math.floor(dy / p.scaleY))
+		for dx = 0, p.destW - 1 do
+			local sx = math.min(iw - 1, math.floor(dx / p.scaleX))
 			local r, g, b, a = img:ReadPixelRGBA(sx, sy)
 			if not (skip and a == 0) then
-				canvas:SetPixel(ox + dx, oy + dy, Color3.fromRGB(r, g, b), a / 255)
+				canvas:SetPixel(p.ox + dx, p.oy + dy, Color3.fromRGB(r, g, b), a / 255)
 			end
 		end
 	end
+end
 
-	return destW, destH
+--[=[
+	@within Image
+	Copies a decoded DynamicImage onto `canvas` per the options. Returns drawn width/height.
+]=]
+function Image.blit(canvas: any, img: any, options: LoadOptions?): (number, number)
+	local opts = options or {}
+	local p = resolvePlacement(canvas, img, opts)
+	blitRows(canvas, img, p, opts.SkipTransparent, 0, p.destH - 1)
+	return p.destW, p.destH
+end
+
+--[=[
+	@within Image
+	Same as `blit`, but copies `rowsPerYield` destination rows at a time, calling `yield()` (and
+	flushing the canvas) between bands so a large image spreads across frames. Reports
+	`onProgress(fraction)` per band. Must run on a thread that can yield.
+]=]
+function Image.blitAsync(
+	canvas: any,
+	img: any,
+	options: LoadOptions?,
+	rowsPerYield: number,
+	yield: () -> (),
+	onProgress: ((number) -> ())?
+): (number, number)
+	local opts = options or {}
+	local p = resolvePlacement(canvas, img, opts)
+	local step = math.max(1, rowsPerYield)
+
+	local y = 0
+	while y < p.destH do
+		local toY = math.min(y + step - 1, p.destH - 1)
+		blitRows(canvas, img, p, opts.SkipTransparent, y, toY)
+		canvas:Render()
+		if onProgress then
+			onProgress((toY + 1) / p.destH)
+		end
+		y = toY + 1
+		if y < p.destH then
+			yield()
+		end
+	end
+
+	return p.destW, p.destH
 end
 
 return Image

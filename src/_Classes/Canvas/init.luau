@@ -129,6 +129,36 @@ end
 
 --[=[
 	@within Canvas
+	Mounts progressively: builds the Driver's Instances `rowsPerFrame` rows at a time, yielding
+	between batches so a large canvas doesn't hitch the frame. `onProgress(fraction)` is reported
+	per batch. Falls back to a one-shot [Canvas:Mount] for drivers that build lazily (RowMerge).
+	Must run on a thread that can yield (e.g. inside `task.spawn`).
+]=]
+function Canvas.MountAsync(self: Canvas, parent: Instance, rowsPerFrame: number?, onProgress: ((number) -> ())?)
+	assert(not self._mounted, "IMGN Canvas: already mounted")
+
+	local driver = self._driver :: any
+	if driver.MountAsync then
+		driver:MountAsync(parent, rowsPerFrame or 8, function()
+			task.wait()
+		end, onProgress)
+	else
+		driver:Mount(parent)
+		if onProgress then
+			onProgress(1)
+		end
+	end
+	self._mounted = true
+
+	if self._autoRender then
+		self._heartbeat = RunService.Heartbeat:Connect(function()
+			self._driver:Flush()
+		end)
+	end
+end
+
+--[=[
+	@within Canvas
 	Writes `color` (and optional `alpha`, default `1`) at `(x, y)` and marks it dirty. Clipped
 	silently if out of bounds. Cheap - the visible update happens on the next flush.
 ]=]
@@ -268,6 +298,27 @@ end
 function Canvas.LoadImage(self: Canvas, bytes: string | buffer, options: Image.LoadOptions?): (number, number)
 	local decoded = Image.decode(bytes, options and options.Format)
 	return Image.blit(self, decoded, options)
+end
+
+--[=[
+	@within Canvas
+	Like [Canvas:LoadImage], but draws the image `rowsPerFrame` rows at a time, yielding (and
+	flushing) between bands so a large image spreads across frames instead of freezing one.
+	`onProgress(fraction)` is reported per band. The decode itself isn't split (it's one decoder
+	call); this spreads the per-pixel draw + render. Must run on a yielding thread. Returns the
+	drawn width/height.
+]=]
+function Canvas.LoadImageAsync(
+	self: Canvas,
+	bytes: string | buffer,
+	options: Image.LoadOptions?,
+	rowsPerFrame: number?,
+	onProgress: ((number) -> ())?
+): (number, number)
+	local decoded = Image.decode(bytes, options and options.Format)
+	return Image.blitAsync(self, decoded, options, rowsPerFrame or 8, function()
+		task.wait()
+	end, onProgress)
 end
 
 --[=[

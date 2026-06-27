@@ -92,6 +92,51 @@ end
 
 --[=[
 	@within IMGN
+	Progressive [IMGN.ImageCanvas]: builds the canvas' Frames and draws the image a few rows per
+	frame so a big image loads smoothly instead of freezing. `config.Parent` is required (it mounts
+	as it builds), `config.RowsPerFrame` (default 8) tunes the budget, and `config.OnProgress(0..1)`
+	reports progress (mount counts as the first half, drawing the second). Must run on a yielding
+	thread - wrap the call in `task.spawn`. Note the decode step itself isn't split.
+]=]
+function IMGN.ImageCanvasAsync(bytes: string | buffer, config: {
+	Parent: Instance,
+	Driver: any?,
+	AutoRender: boolean?,
+	Scale: number?,
+	Format: string?,
+	SkipTransparent: boolean?,
+	RowsPerFrame: number?,
+	OnProgress: ((number) -> ())?,
+}): Canvas
+	assert(config and config.Parent, "IMGN.ImageCanvasAsync: config.Parent is required")
+	local decoded = ImageHelper.decode(bytes, config.Format)
+	local scale = config.Scale or 1
+	local width = math.max(1, math.floor(decoded.width * scale + 0.5))
+	local height = math.max(1, math.floor(decoded.height * scale + 0.5))
+	local rows = config.RowsPerFrame or 8
+	local report = config.OnProgress
+
+	local canvas = Canvas.new({
+		Resolution = Vector2.new(width, height),
+		Driver = config.Driver,
+		AutoRender = config.AutoRender,
+	})
+
+	-- Mount progressively (first half of progress), then draw progressively (second half).
+	canvas:MountAsync(config.Parent, rows, if report then function(f)
+		report(f * 0.5)
+	end else nil)
+	ImageHelper.blitAsync(canvas, decoded, { Scale = scale, SkipTransparent = config.SkipTransparent }, rows, function()
+		task.wait()
+	end, if report then function(f)
+		report(0.5 + f * 0.5)
+	end else nil)
+
+	return canvas
+end
+
+--[=[
+	@within IMGN
 	Creates (or reuses) a `SurfaceGui` on `part`'s `face` and mounts a [Canvas] onto it - the
 	in-world path (signs, screens, billboards on a brick). `face` defaults to `Enum.NormalId.Front`.
 	Any [CanvasConfig] field except `Parent` is honoured.

@@ -172,7 +172,36 @@ canvas:LoadImage(bytes, { X = 4, Y = 4, Scale = 0.5, SkipTransparent = true })
 canvas:Render()
 ```
 
-**Getting the bytes is on you** — Roblox can't read an uploaded decal's pixels without `EditableImage`, so the file has to come from somewhere else: `HttpService:GetAsync(url)` (needs *Allow HTTP Requests*), or baked into a ModuleScript as a string/buffer. `LoadImage` options: `X`, `Y`, nearest-neighbour `Scale` (use `< 1` to shrink big images — remember the instance-count ceiling), explicit `Format`, and `SkipTransparent` (composite instead of replace).
+**Getting the bytes is on you** — Roblox can't read an uploaded decal's pixels without `EditableImage`, so the file has to come from somewhere else: `HttpService:GetAsync(url)` (needs *Allow HTTP Requests*), or baked into a ModuleScript (see "No link" below). `LoadImage` options: `X`, `Y`, nearest-neighbour `Scale` (use `< 1` to shrink big images), `Fit` (`"Contain"`/`"Cover"`/`"Stretch"` — size to the canvas instead of `Scale`), explicit `Format`, and `SkipTransparent` (composite instead of replace).
+
+### No link (bake the bytes in)
+
+No URL, no HTTP at runtime — embed the file into a ModuleScript at build time:
+
+```sh
+lune run scripts/embed-image cat.png   # -> cat.luau (returns the bytes)
+```
+
+```lua
+local bytes = require(ReplicatedStorage.Cat)
+local canvas = IMGN.ImageCanvas(bytes, { Parent = surfaceGui, Format = "PNG" })
+```
+
+### Loading without freezing
+
+A big image is a lot of work in one frame (decode + thousands of Frames). `IMGN.ImageCanvasAsync` spreads the Frame-building and drawing across frames, with progress:
+
+```lua
+task.spawn(function()
+    local canvas = IMGN.ImageCanvasAsync(bytes, {
+        Parent = surfaceGui,
+        RowsPerFrame = 8,
+        OnProgress = function(f) print(("%d%%"):format(f * 100)) end,
+    })
+end)
+```
+
+(The decode step itself is a single call and isn't split; if it's your bottleneck, shrink the image or offload decoding to a web service — see [Web image service](#web-image-service).) For lower instance counts entirely, pick a [driver](#drivers) like `RowMerge` or `RichText`.
 
 ## Global config
 

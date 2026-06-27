@@ -85,6 +85,65 @@ function PixelGrid.Mount(self: PixelGrid, parent: Instance): Frame
 	return container
 end
 
+-- Build one row of pixel Frames into the container.
+local function buildRow(self: PixelGrid, container: Frame, sx: number, sy: number, y: number)
+	local width = self._width
+	for x = 0, width - 1 do
+		local pixel = Instance.new("Frame")
+		pixel.BorderSizePixel = 0
+		pixel.BackgroundTransparency = 1
+		pixel.Size = UDim2.new(sx, 1, sy, 1)
+		pixel.Position = UDim2.fromScale(x * sx, y * sy)
+		pixel.ZIndex = 1
+		pixel.Parent = container
+		self._frames[y * width + x + 1] = pixel
+	end
+end
+
+--[=[
+	@within PixelGrid
+	Like [PixelGrid.Mount], but creates the grid `rowsPerYield` rows at a time, calling `yield`
+	between batches so building thousands of Frames spreads across frames instead of hitching one.
+	`onProgress(fraction)` is reported per batch. Must run on a yielding thread.
+]=]
+function PixelGrid.MountAsync(
+	self: PixelGrid,
+	parent: Instance,
+	rowsPerYield: number,
+	yield: () -> (),
+	onProgress: ((number) -> ())?
+): Frame
+	local height = self._height
+	local sx, sy = 1 / self._width, 1 / height
+
+	local container = Instance.new("Frame")
+	container.Name = "IMGNCanvas"
+	container.Size = UDim2.fromScale(1, 1)
+	container.BackgroundTransparency = 1
+	container.BorderSizePixel = 0
+	container.ClipsDescendants = true
+	container.Parent = parent
+	self._container = container
+
+	local step = math.max(1, rowsPerYield)
+	local y = 0
+	while y < height do
+		local toY = math.min(y + step - 1, height - 1)
+		for row = y, toY do
+			buildRow(self, container, sx, sy, row)
+		end
+		if onProgress then
+			onProgress((toY + 1) / height)
+		end
+		y = toY + 1
+		if y < height then
+			yield()
+		end
+	end
+
+	return container
+end
+
 --[=[
 	@within PixelGrid
 	Marks the pixel at linear index `index` (0-based `y*width + x`) as needing a flush.
