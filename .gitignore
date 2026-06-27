@@ -21,3 +21,7 @@ sourcemap.json
 # Moonwave docs build output
 /build/
 node_modules/
+
+# Python
+__pycache__/
+*.pyc
