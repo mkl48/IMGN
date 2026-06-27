@@ -1133,12 +1133,14 @@ local Surface = require(script.Surface)
 local Blood = {}
 
 local SETTINGS = {
-	ProxySize = 3, -- footprint of a blood proxy, in studs (fixed -> consistent resolution)
+	ProxySize = 8, -- footprint of a blood proxy, in studs. Bigger = blood streaks within ONE
+	-- continuous canvas instead of tiling into visible squares (fewer proxies, fewer seams).
 	ProxyThickness = 0.08,
 	ProxyOffset = 0.02, -- how far off the surface to float the proxy (avoid z-fighting)
-	PixelsPerStud = 12, -- resolution per proxy stud (ProxySize * this = canvas size)
+	PixelsPerStud = 6, -- resolution per proxy stud (ProxySize * this = canvas size, capped below)
 	MaxResolution = 64,
-	ReuseRadius = 2, -- splats within this many studs of an existing proxy reuse it
+	EdgeFade = 3, -- pixels of alpha falloff at a proxy's border, so its square edge blends out
+	ReuseRadius = 5, -- splats within this many studs reuse a proxy (fewer, bigger blood patches)
 	Preset = "Blood",
 	DropletSize = 0.4,
 	DropletColor = Color3.fromRGB(120, 6, 8),
@@ -1250,7 +1252,12 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 	gui.Parent = part
 
 	local canvas = Canvas.new({ Resolution = Vector2.new(res, res), Parent = gui })
-	local liquid = Liquid.new({ Canvas = canvas, Preset = SETTINGS.Preset, Gravity = gravity })
+	local liquid = Liquid.new({
+		Canvas = canvas,
+		Preset = SETTINGS.Preset,
+		Gravity = gravity,
+		EdgeFade = SETTINGS.EdgeFade,
+	})
 	liquid:Start()
 
 	local self = setmetatable({
@@ -2068,6 +2075,7 @@ export type LiquidConfig = {
 	Driver: any?,
 	Preset: string?, -- "Blood" (default), "Water", "Paint", "Lava", "Slime", "Honey"
 	Gravity: Vector2?, -- canvas-space down (default (0,1)); use (0,0) for a floor (pool, no drip)
+	EdgeFade: number?, -- pixels of alpha falloff at the border, so the canvas edge isn't a hard line
 	Color: (Color3 | RGB)?, -- override the fresh colour (handy for Paint)
 	-- any Preset field can be overridden directly:
 	Capacity: number?,
@@ -2125,6 +2133,7 @@ function Liquid.new(config: LiquidConfig): Liquid
 		Fresh = asRGB(config.Color) or preset.Fresh,
 		Dry = preset.Dry,
 		Gravity = config.Gravity or Vector2.new(0, 1),
+		EdgeFade = config.EdgeFade or 0, -- pixels of alpha falloff at the canvas border (softens seams)
 		_amount = table.create(count, 0),
 		_dry = table.create(count, 0),
 		_shown = table.create(count, -1),
@@ -2347,6 +2356,8 @@ function Liquid.Step(self: Liquid, dt: number)
 	local alphaAt = self.AlphaAt
 	local fr, dr = self.Fresh, self.Dry
 	local canvas = self.Canvas
+	local edgeFade = self.EdgeFade
+	local maxX, maxY = W - 1, H - 1
 	local active = false
 
 	for y = 0, H - 1 do
@@ -2379,12 +2390,15 @@ function Liquid.Step(self: Liquid, dt: number)
 					local g = dr[2] + (fr[2] - dr[2]) * fresh
 					local b = dr[3] + (fr[3] - dr[3]) * fresh
 					local thick = math.clamp(a / CAP, 0, 1) * 0.25
-					canvas:SetPixel(
-						x,
-						y,
-						Color3.fromRGB(r * (1 - thick), g * (1 - thick), b * (1 - thick)),
-						math.clamp(a / alphaAt, 0, 1)
-					)
+					local alpha = math.clamp(a / alphaAt, 0, 1)
+					if edgeFade > 0 then
+						-- fade the outer few pixels so the square canvas edge isn't a hard line
+						local d = math.min(x, y, maxX - x, maxY - y)
+						if d < edgeFade then
+							alpha *= d / edgeFade
+						end
+					end
+					canvas:SetPixel(x, y, Color3.fromRGB(r * (1 - thick), g * (1 - thick), b * (1 - thick)), alpha)
 				end
 			end
 		end

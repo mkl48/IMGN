@@ -28,12 +28,14 @@ local Surface = require(script.Surface)
 local Blood = {}
 
 local SETTINGS = {
-	ProxySize = 3, -- footprint of a blood proxy, in studs (fixed -> consistent resolution)
+	ProxySize = 8, -- footprint of a blood proxy, in studs. Bigger = blood streaks within ONE
+	-- continuous canvas instead of tiling into visible squares (fewer proxies, fewer seams).
 	ProxyThickness = 0.08,
 	ProxyOffset = 0.02, -- how far off the surface to float the proxy (avoid z-fighting)
-	PixelsPerStud = 12, -- resolution per proxy stud (ProxySize * this = canvas size)
+	PixelsPerStud = 6, -- resolution per proxy stud (ProxySize * this = canvas size, capped below)
 	MaxResolution = 64,
-	ReuseRadius = 2, -- splats within this many studs of an existing proxy reuse it
+	EdgeFade = 3, -- pixels of alpha falloff at a proxy's border, so its square edge blends out
+	ReuseRadius = 5, -- splats within this many studs reuse a proxy (fewer, bigger blood patches)
 	Preset = "Blood",
 	DropletSize = 0.4,
 	DropletColor = Color3.fromRGB(120, 6, 8),
@@ -145,7 +147,12 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 	gui.Parent = part
 
 	local canvas = Canvas.new({ Resolution = Vector2.new(res, res), Parent = gui })
-	local liquid = Liquid.new({ Canvas = canvas, Preset = SETTINGS.Preset, Gravity = gravity })
+	local liquid = Liquid.new({
+		Canvas = canvas,
+		Preset = SETTINGS.Preset,
+		Gravity = gravity,
+		EdgeFade = SETTINGS.EdgeFade,
+	})
 	liquid:Start()
 
 	local self = setmetatable({

@@ -62,6 +62,7 @@ export type LiquidConfig = {
 	Driver: any?,
 	Preset: string?, -- "Blood" (default), "Water", "Paint", "Lava", "Slime", "Honey"
 	Gravity: Vector2?, -- canvas-space down (default (0,1)); use (0,0) for a floor (pool, no drip)
+	EdgeFade: number?, -- pixels of alpha falloff at the border, so the canvas edge isn't a hard line
 	Color: (Color3 | RGB)?, -- override the fresh colour (handy for Paint)
 	-- any Preset field can be overridden directly:
 	Capacity: number?,
@@ -119,6 +120,7 @@ function Liquid.new(config: LiquidConfig): Liquid
 		Fresh = asRGB(config.Color) or preset.Fresh,
 		Dry = preset.Dry,
 		Gravity = config.Gravity or Vector2.new(0, 1),
+		EdgeFade = config.EdgeFade or 0, -- pixels of alpha falloff at the canvas border (softens seams)
 		_amount = table.create(count, 0),
 		_dry = table.create(count, 0),
 		_shown = table.create(count, -1),
@@ -341,6 +343,8 @@ function Liquid.Step(self: Liquid, dt: number)
 	local alphaAt = self.AlphaAt
 	local fr, dr = self.Fresh, self.Dry
 	local canvas = self.Canvas
+	local edgeFade = self.EdgeFade
+	local maxX, maxY = W - 1, H - 1
 	local active = false
 
 	for y = 0, H - 1 do
@@ -373,12 +377,15 @@ function Liquid.Step(self: Liquid, dt: number)
 					local g = dr[2] + (fr[2] - dr[2]) * fresh
 					local b = dr[3] + (fr[3] - dr[3]) * fresh
 					local thick = math.clamp(a / CAP, 0, 1) * 0.25
-					canvas:SetPixel(
-						x,
-						y,
-						Color3.fromRGB(r * (1 - thick), g * (1 - thick), b * (1 - thick)),
-						math.clamp(a / alphaAt, 0, 1)
-					)
+					local alpha = math.clamp(a / alphaAt, 0, 1)
+					if edgeFade > 0 then
+						-- fade the outer few pixels so the square canvas edge isn't a hard line
+						local d = math.min(x, y, maxX - x, maxY - y)
+						if d < edgeFade then
+							alpha *= d / edgeFade
+						end
+					end
+					canvas:SetPixel(x, y, Color3.fromRGB(r * (1 - thick), g * (1 - thick), b * (1 - thick)), alpha)
 				end
 			end
 		end

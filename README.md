@@ -212,7 +212,7 @@ Proxies are welded to the hit part (blood follows it if it moves), reused when s
 IMGN.Blood.Ignore(player.Character)   -- blood won't paint you
 ```
 
-**Performance:** small fixed-size proxies keep Frame counts low and uniform; each sim's hot loop is allocation-free, **skips its flow passes once the blood stops moving**, and **sleeps** entirely once it has dried (a stain costs ~nothing). Keep droplet counts modest — each one can spawn a proxy.
+**Performance + looks:** proxies are a middle ground between one tiny canvas per splat (visible square tiles) and one huge canvas per part (laggy on big walls). Defaults use **bigger, fewer proxies** (`ProxySize = 8`, `ReuseRadius = 5`) so blood streaks within *one* continuous canvas instead of tiling, plus an **`EdgeFade`** so a proxy's square border blends out instead of ending in a hard line. Each sim's hot loop is allocation-free, **skips its flow passes once the blood stops moving**, and **sleeps** once dried (a stain costs ~nothing). Crank `ProxySize`/`PixelsPerStud` up for crisper, more seamless blood, or down for less work; keep droplet counts modest (each can spawn a proxy).
 
 **If drips run upward** in your place, flip them with one global knob (no source edits):
 
