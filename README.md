@@ -209,6 +209,20 @@ end)
 
 (The decode step itself is a single call and isn't split; if it's your bottleneck, shrink the image or offload decoding to a web service — see [Web image service](#web-image-service).) For lower instance counts entirely, pick a [driver](#drivers) like `RowMerge` or `RichText`.
 
+## Web image service
+
+If you'd rather not decode images on the client (or want a server to resize them first), IMGN can draw pixel JSON straight from a web service. The repo ships a tiny FastAPI app under [`server/`](server) that fetches an image URL, resizes it, and returns the pixels — host it free on Render / Hugging Face / Vercel (see [`server/README.md`](server/README.md)).
+
+```lua
+local json = HttpService:GetAsync(API .. "?url=" .. HttpService:UrlEncode(imageUrl) .. "&max_width=64&format=rle")
+local data = HttpService:JSONDecode(json)
+
+local canvas = IMGN.PixelCanvas(data, { Parent = surfaceGui, Driver = "GreedyMesh" })
+-- or onto an existing canvas: canvas:LoadPixels(data, { Fit = "Contain" })
+```
+
+The service returns either run-length rows (`format=rle`, compact) or a raw grid (`format=raw`); `LoadPixels`/`PixelCanvas` accept both. Pairing it with the `GreedyMesh` driver keeps the instance count low for a static image.
+
 ## Global config
 
 ```lua
@@ -265,6 +279,7 @@ See [`examples/`](examples):
 - **Snake** — the classic, with a bitmap-font scoreboard (WASD / arrows).
 - **Raycaster** — a Wolfenstein-style first-person 3D view (W/S walk, A/D turn).
 - **LoadImage** — decode a real PNG onto a part (decoder bundled).
+- **WebImage** — load an image by URL through the bundled web service (`server/`).
 
 - **GradientSurface** — procedural gradient on a part via `:Shader`.
 - **PaintCanvas** — click-drag finger paint on a `ScreenGui` with `AutoRender`.

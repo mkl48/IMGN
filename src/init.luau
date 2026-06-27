@@ -137,6 +137,36 @@ end
 
 --[=[
 	@within IMGN
+	Builds a [Canvas] sized to a decoded pixel table (from a web image service, after
+	`HttpService:JSONDecode`) - times `Scale` - already drawn and rendered. `data` is the
+	`{ width, height, pixels|rows }` shape [Canvas:LoadPixels] accepts. `config` accepts `Parent`,
+	`Driver` (try `"GreedyMesh"` for flat art), `AutoRender`, `Scale` and `SkipTransparent`.
+]=]
+function IMGN.PixelCanvas(data: any, config: {
+	Parent: Instance?,
+	Driver: any?,
+	AutoRender: boolean?,
+	Scale: number?,
+	SkipTransparent: boolean?,
+}?): Canvas
+	config = config or {}
+	local scale = config.Scale or 1
+	local width = math.max(1, math.floor(data.width * scale + 0.5))
+	local height = math.max(1, math.floor(data.height * scale + 0.5))
+
+	local canvas = Canvas.new({
+		Resolution = Vector2.new(width, height),
+		Parent = config.Parent,
+		Driver = config.Driver,
+		AutoRender = config.AutoRender,
+	})
+	canvas:LoadPixels(data, { Scale = scale, SkipTransparent = config.SkipTransparent })
+	canvas:Render()
+	return canvas
+end
+
+--[=[
+	@within IMGN
 	Creates (or reuses) a `SurfaceGui` on `part`'s `face` and mounts a [Canvas] onto it - the
 	in-world path (signs, screens, billboards on a brick). `face` defaults to `Enum.NormalId.Front`.
 	Any [CanvasConfig] field except `Parent` is honoured.

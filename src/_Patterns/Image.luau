@@ -55,6 +55,51 @@ function Image.decode(bytes: string | buffer, format: string?): any
 	return result:Unwrap()
 end
 
+--[=[
+	@within Image
+	Wraps a decoded pixel table (from a web service / JSONDecode) as something [Image.blit] can
+	draw. Accepts `{ width, height, pixels = { { {r,g,b[,a]}, ... } } }` (a 2D grid) or the compact
+	`{ width, height, rows = { { {count,r,g,b,a}, ... } } }` (per-row run-length runs). Returns an
+	object with `width`, `height` and `ReadPixelRGBA`, matching the decoder's image shape.
+]=]
+function Image.fromPixels(data: any): any
+	local w, h = data.width, data.height
+	assert(w and h, "IMGN: pixel data needs width and height")
+
+	local grid -- grid[y][x] = {r,g,b,a?}
+	if data.pixels then
+		grid = data.pixels
+	elseif data.rows then
+		grid = {}
+		for y, runs in ipairs(data.rows) do
+			local row = {}
+			local x = 0
+			for _, run in ipairs(runs) do
+				local count = run[1]
+				for _ = 1, count do
+					x += 1
+					row[x] = { run[2], run[3], run[4], run[5] }
+				end
+			end
+			grid[y] = row
+		end
+	else
+		error("IMGN: pixel data needs a `pixels` grid or `rows` (RLE)")
+	end
+
+	return {
+		width = w,
+		height = h,
+		ReadPixelRGBA = function(_self: any, x: number, y: number): (number, number, number, number)
+			local px = grid[y + 1] and grid[y + 1][x + 1]
+			if not px then
+				return 0, 0, 0, 0
+			end
+			return px[1], px[2], px[3], px[4] or 255
+		end,
+	}
+end
+
 -- Work out destination scale + offset from the options and the target canvas size.
 local function resolvePlacement(canvas: any, img: any, opts: LoadOptions): Placement
 	local iw, ih = img.width, img.height

@@ -179,6 +179,36 @@ end
 
 --[=[
 	@within IMGN
+	Builds a [Canvas] sized to a decoded pixel table (from a web image service, after
+	`HttpService:JSONDecode`) - times `Scale` - already drawn and rendered. `data` is the
+	`{ width, height, pixels|rows }` shape [Canvas:LoadPixels] accepts. `config` accepts `Parent`,
+	`Driver` (try `"GreedyMesh"` for flat art), `AutoRender`, `Scale` and `SkipTransparent`.
+]=]
+function IMGN.PixelCanvas(data: any, config: {
+	Parent: Instance?,
+	Driver: any?,
+	AutoRender: boolean?,
+	Scale: number?,
+	SkipTransparent: boolean?,
+}?): Canvas
+	config = config or {}
+	local scale = config.Scale or 1
+	local width = math.max(1, math.floor(data.width * scale + 0.5))
+	local height = math.max(1, math.floor(data.height * scale + 0.5))
+
+	local canvas = Canvas.new({
+		Resolution = Vector2.new(width, height),
+		Parent = config.Parent,
+		Driver = config.Driver,
+		AutoRender = config.AutoRender,
+	})
+	canvas:LoadPixels(data, { Scale = scale, SkipTransparent = config.SkipTransparent })
+	canvas:Render()
+	return canvas
+end
+
+--[=[
+	@within IMGN
 	Creates (or reuses) a `SurfaceGui` on `part`'s `face` and mounts a [Canvas] onto it - the
 	in-world path (signs, screens, billboards on a brick). `face` defaults to `Enum.NormalId.Front`.
 	Any [CanvasConfig] field except `Parent` is honoured.
@@ -1344,6 +1374,18 @@ function Canvas.LoadImageAsync(
 	return Image.blitAsync(self, decoded, options, rowsPerFrame or 8, function()
 		task.wait()
 	end, onProgress)
+end
+
+--[=[
+	@within Canvas
+	Draws a decoded pixel table onto this canvas - the output of a web image service after
+	`HttpService:JSONDecode`. `data` is `{ width, height, pixels = {{ {r,g,b[,a]}, ... }} }` or the
+	compact `{ width, height, rows = {{ {count,r,g,b,a}, ... }} }` (RLE). `options` are the same as
+	[Canvas:LoadImage] (`X`/`Y`/`Scale`/`Fit`/`SkipTransparent`). Returns the drawn width/height.
+	Call `:Render()` afterwards. Lets a server do the PNG decoding so Roblox just plots pixels.
+]=]
+function Canvas.LoadPixels(self: Canvas, data: any, options: Image.LoadOptions?): (number, number)
+	return Image.blit(self, Image.fromPixels(data), options)
 end
 
 --[=[
@@ -6886,6 +6928,51 @@ function Image.decode(bytes: string | buffer, format: string?): any
 	local result = reader:Decode()
 	assert(result.isOk, "IMGN: image decode failed (is the data a valid image of that format?)")
 	return result:Unwrap()
+end
+
+--[=[
+	@within Image
+	Wraps a decoded pixel table (from a web service / JSONDecode) as something [Image.blit] can
+	draw. Accepts `{ width, height, pixels = { { {r,g,b[,a]}, ... } } }` (a 2D grid) or the compact
+	`{ width, height, rows = { { {count,r,g,b,a}, ... } } }` (per-row run-length runs). Returns an
+	object with `width`, `height` and `ReadPixelRGBA`, matching the decoder's image shape.
+]=]
+function Image.fromPixels(data: any): any
+	local w, h = data.width, data.height
+	assert(w and h, "IMGN: pixel data needs width and height")
+
+	local grid -- grid[y][x] = {r,g,b,a?}
+	if data.pixels then
+		grid = data.pixels
+	elseif data.rows then
+		grid = {}
+		for y, runs in ipairs(data.rows) do
+			local row = {}
+			local x = 0
+			for _, run in ipairs(runs) do
+				local count = run[1]
+				for _ = 1, count do
+					x += 1
+					row[x] = { run[2], run[3], run[4], run[5] }
+				end
+			end
+			grid[y] = row
+		end
+	else
+		error("IMGN: pixel data needs a `pixels` grid or `rows` (RLE)")
+	end
+
+	return {
+		width = w,
+		height = h,
+		ReadPixelRGBA = function(_self: any, x: number, y: number): (number, number, number, number)
+			local px = grid[y + 1] and grid[y + 1][x + 1]
+			if not px then
+				return 0, 0, 0, 0
+			end
+			return px[1], px[2], px[3], px[4] or 255
+		end,
+	}
 end
 
 -- Work out destination scale + offset from the options and the target canvas size.

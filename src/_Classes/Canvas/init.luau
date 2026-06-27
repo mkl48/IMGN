@@ -323,6 +323,18 @@ end
 
 --[=[
 	@within Canvas
+	Draws a decoded pixel table onto this canvas - the output of a web image service after
+	`HttpService:JSONDecode`. `data` is `{ width, height, pixels = {{ {r,g,b[,a]}, ... }} }` or the
+	compact `{ width, height, rows = {{ {count,r,g,b,a}, ... }} }` (RLE). `options` are the same as
+	[Canvas:LoadImage] (`X`/`Y`/`Scale`/`Fit`/`SkipTransparent`). Returns the drawn width/height.
+	Call `:Render()` afterwards. Lets a server do the PNG decoding so Roblox just plots pixels.
+]=]
+function Canvas.LoadPixels(self: Canvas, data: any, options: Image.LoadOptions?): (number, number)
+	return Image.blit(self, Image.fromPixels(data), options)
+end
+
+--[=[
+	@within Canvas
 	Flushes every dirty pixel onto its Instances. Call after a batch of edits; a no-op when
 	nothing changed. Unnecessary when `AutoRender` is on.
 ]=]
