@@ -197,21 +197,22 @@ IMGN.Blood.Emit(origin, Vector3.new(10, 20, 0))
 IMGN.Blood.Splat(part, Enum.NormalId.Front, worldPos, 4)
 ```
 
-How it works: `Emit` spawns a real droplet `Part` that flies under gravity; a per-frame raycast catches the surface it lands on; that face is turned (once, then cached) into an IMGN canvas with a `Liquid("Blood")` sim whose **gravity is the face's downhill direction** (`Surface.gravityVector` projects world-down onto the face — a wall gives `(0,1)`, a slope tilts it, a floor gives `(0,0)` so it pools). With `Dynamic` on (default) each surface re-reads its orientation every frame, so drips react live to rotation. The droplet then shrinks and is destroyed. Tune via `IMGN.Blood.Configure { PixelsPerStud = …, Preset = "Blood", DropletSize = …, … }`.
+**How it works — blood proxies.** `Emit` spawns a real droplet `Part` that flies under gravity; a per-frame raycast catches where it lands; instead of painting onto the part it hit (which scales the canvas to the *whole* part — a splat on a huge wall comes out low-res and stretched), it spawns a small **fixed-size proxy part** at the impact, oriented to the surface, and paints on *that*. Two wins:
 
-**Performance:** each surface's sim **sleeps** once its blood has settled and dried (a static stain costs ~nothing), and the hot loop is allocation-free. Resolution defaults are modest (`PixelsPerStud = 4`, capped at `64`) to keep Frame counts down — raise them for crisper blood, lower them if you have many surfaces. `Dynamic` is off by default (gravity is refreshed on each splat); turn it on only for parts that *move* while bloodied.
+- **Consistent resolution** everywhere — `ProxySize` studs at `PixelsPerStud`, regardless of what it landed on. A splat is the same crisp blood on a pebble or a skyscraper.
+- **No face-convention guessing** — the proxy is oriented so its canvas **+Y points downhill** (`Surface.dripBasis` projects world-down onto the surface), so the sim's gravity is just `(0,1)` and drips run correctly down walls *and* slopes. Floors/ceilings get `(0,0)` → blood pools.
 
-**If drips run the wrong way** on a floor/ramp, it's the Top/Bottom face-axis convention (the one thing I can't confirm outside Studio). Correct it without touching the source:
+Proxies are welded to the hit part (blood follows it if it moves), reused when splats land within `ReuseRadius`, and the droplet shrinks + is destroyed. Tune via `IMGN.Blood.Configure { ProxySize = …, PixelsPerStud = …, Preset = "Blood", … }`.
+
+**Performance:** small fixed-size proxies keep Frame counts low and uniform; each sim's hot loop is allocation-free, **skips its flow passes once the blood stops moving**, and **sleeps** entirely once it has dried (a stain costs ~nothing). Keep droplet counts modest — each one can spawn a proxy.
+
+**If drips run upward** in your place, flip them with one global knob (no source edits):
 
 ```lua
-IMGN.Blood.Configure({
-    GravityTransform = function(g, part, face)
-        return Vector2.new(-g.X, g.Y)   -- e.g. flip X, or Vector2.new(g.Y, g.X) to swap axes
-    end,
-})
+IMGN.Blood.Configure({ FlipDrip = true })
 ```
 
-> **Verified vs. needs-Studio:** the 2D sim and the gravity projection are unit-tested. The 3D pieces — droplet physics, the raycast landing, and the face/UV mapping in `Surface` (`Vector3.fromNormalId`, `CFrame`, `SurfaceGui` orientation) — can only be confirmed in a running place. Vertical walls are reliable; sanity-check Top/Bottom and use `GravityTransform` if needed.
+> **Verified vs. needs-Studio:** the 2D sim and the proxy orientation math (`dripBasis` — gravity + a right-handed basis for every surface) are unit-tested. The 3D pieces — droplet physics, the raycast, and the `CFrame.fromMatrix` proxy placement / `SurfaceGui` Back-face orientation — can only be confirmed in a running place. The drip *direction* no longer depends on face conventions (it's baked into the proxy), but if the whole image reads upside-down, `FlipDrip` corrects it.
 
 See `examples/KillBrick.server.luau`.
 

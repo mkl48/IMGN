@@ -1107,14 +1107,15 @@ local _4 = mod("Blood", _2, [[
 -- _Classes/Blood/init.luau
 -- Plinko Labs
 --
--- A small blood engine built on the Liquid sim. The flow: emit a real 3D droplet Part that flies
--- and falls under Roblox gravity; a per-frame raycast catches the surface it lands on; that
--- surface is turned (once) into an IMGN canvas with a Liquid("Blood") sim whose Gravity is the
--- face's downhill direction (so it drips correctly on walls, slopes, rotated parts); the droplet
--- shrinks and is destroyed. KillBrick wires all this to a Touched kill.
+-- A blood engine built on the Liquid sim, using BLOOD PROXIES. Instead of painting onto whatever
+-- part a droplet hits (which scales the canvas to the whole part - a splat on a huge wall comes
+-- out low-res and stretched, and forces a per-face axis convention), a hit spawns a small,
+-- fixed-size proxy Part at the impact, oriented to the surface, and the blood is painted on THAT.
 --
--- The 2D simulation + the gravity projection are verified; the 3D parts (droplet physics, the
--- raycast landing, face/UV mapping in Surface) follow Roblox conventions that need a Studio pass.
+-- The win is twofold: every splat has the same crisp resolution no matter what it landed on, and
+-- the proxy is oriented so its canvas +Y points DOWNHILL - so the sim's gravity is just (0,1) and
+-- drips run correctly down walls and slopes without guessing SurfaceGui face conventions. Proxies
+-- are welded to the hit part (blood follows it) and reused when splats land near each other.
 
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
@@ -1126,29 +1127,31 @@ local Surface = require(script.Surface)
 
 --[=[
 	@class Blood
-	A droplet-and-drip blood engine over [Liquid]. `Blood.Emit` throws a droplet, `Blood.KillBrick`
-	makes a brick that spurts blood when stepped on, `Blood.Splat` paints directly onto a surface.
+	A droplet-and-drip blood engine over [Liquid] using [BloodProxy] surfaces. `Blood.Emit` throws
+	a droplet, `Blood.KillBrick` makes a brick that spurts blood, `Blood.Splat` paints a hit point.
 ]=]
 local Blood = {}
 
 local SETTINGS = {
-	PixelsPerStud = 3, -- canvas resolution per stud of surface (lower = far fewer Frames)
-	MaxResolution = 48, -- clamp so a big wall doesn't melt the renderer (48x48 = 2304 Frames)
+	ProxySize = 3, -- footprint of a blood proxy, in studs (fixed -> consistent resolution)
+	ProxyThickness = 0.08,
+	ProxyOffset = 0.02, -- how far off the surface to float the proxy (avoid z-fighting)
+	PixelsPerStud = 12, -- resolution per proxy stud (ProxySize * this = canvas size)
+	MaxResolution = 64,
+	ReuseRadius = 2, -- splats within this many studs of an existing proxy reuse it
 	Preset = "Blood",
 	DropletSize = 0.4,
 	DropletColor = Color3.fromRGB(120, 6, 8),
-	DropletLifetime = 6, -- seconds before a droplet that never lands is cleaned up
+	DropletLifetime = 6,
 	SplatAmount = 4,
-	Dynamic = false, -- recompute a surface's gravity every frame (only needed for MOVING parts)
-	GravityTransform = nil :: (((Vector2, BasePart, Enum.NormalId) -> Vector2)?), -- correct face orientation
+	FlipDrip = false, -- flip if drips run UP instead of down in your place (single global knob)
 }
 
 --[=[
 	@within Blood
-	Overrides engine defaults: `PixelsPerStud`, `MaxResolution`, `Preset`, `DropletSize`,
-	`DropletColor`, `DropletLifetime`, `SplatAmount`, `Dynamic`, and `GravityTransform` - a
-	`function(gravity, part, face) -> Vector2` to correct drip direction per face if the Top/Bottom
-	convention is off in your place (e.g. `return Vector2.new(g.Y, g.X)` to swap axes).
+	Overrides engine defaults: `ProxySize`, `ProxyThickness`, `ProxyOffset`, `PixelsPerStud`,
+	`MaxResolution`, `ReuseRadius`, `Preset`, `DropletSize`, `DropletColor`, `DropletLifetime`,
+	`SplatAmount`, and `FlipDrip` (set true if drips run upward in your place).
 ]=]
 function Blood.Configure(overrides: { [string]: any })
 	for key, value in overrides do
@@ -1157,143 +1160,125 @@ function Blood.Configure(overrides: { [string]: any })
 	end
 end
 
--- a folder to hold droplets, so raycasts can ignore them all at once
 local dropletFolder: Folder
+local proxyFolder: Folder
 
-local function getDropletFolder(): Folder
-	if not dropletFolder or not dropletFolder.Parent then
-		dropletFolder = Instance.new("Folder")
-		dropletFolder.Name = "IMGNBloodDroplets"
-		dropletFolder.Parent = Workspace
+local function folder(name: string, ref: Folder?): Folder
+	if not ref or not ref.Parent then
+		ref = Instance.new("Folder")
+		ref.Name = name
+		ref.Parent = Workspace
 	end
-	return dropletFolder
+	return ref
 end
 
--- ============================ BloodSurface ============================
--- One canvas + Liquid sim bound to a part's face. Created lazily on first splat, then reused.
+-- ============================ BloodProxy ============================
 
-local BloodSurface = {}
-BloodSurface.__index = BloodSurface
+local BloodProxy = {}
+BloodProxy.__index = BloodProxy
 
--- key a part/face pair to its BloodSurface
-local surfaces: { [BasePart]: { [Enum.NormalId]: any } } = setmetatable({}, { __mode = "k" })
+-- proxies grouped by the part they landed on, for reuse + cleanup (weak so GC can collect)
+local proxiesByPart: { [BasePart]: { any } } = setmetatable({}, { __mode = "k" }) :: any
 
--- Canvas-space gravity for a face, with the optional user correction applied.
-local function computeGravity(part: BasePart, normalId: Enum.NormalId): Vector2
-	local _normal, right, down = Surface.faceVectors(part, normalId)
-	local g = Surface.gravityVector(right, down)
-	if SETTINGS.GravityTransform then
-		g = SETTINGS.GravityTransform(g, part, normalId)
+function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
+	local right, up, gravity = Surface.dripBasis(normal)
+	if SETTINGS.FlipDrip then
+		up = -up
+		right = -right
 	end
-	return g
-end
 
-local function faceExtent(part: BasePart, right: Vector3, down: Vector3): (number, number)
-	local s = part.Size
-	local w = math.abs(right.X * s.X) + math.abs(right.Y * s.Y) + math.abs(right.Z * s.Z)
-	local h = math.abs(down.X * s.X) + math.abs(down.Y * s.Y) + math.abs(down.Z * s.Z)
-	return w, h
-end
+	local size = SETTINGS.ProxySize
+	local res = math.clamp(math.floor(size * SETTINGS.PixelsPerStud), 8, SETTINGS.MaxResolution)
 
-function BloodSurface.new(part: BasePart, normalId: Enum.NormalId)
-	local _normal, right, down = Surface.faceVectors(part, normalId)
-	local wStuds, hStuds = faceExtent(part, right, down)
-	local resW = math.clamp(math.floor(wStuds * SETTINGS.PixelsPerStud), 8, SETTINGS.MaxResolution)
-	local resH = math.clamp(math.floor(hStuds * SETTINGS.PixelsPerStud), 8, SETTINGS.MaxResolution)
+	local part = Instance.new("Part")
+	part.Name = "BloodProxy"
+	part.Size = Vector3.new(size, size, SETTINGS.ProxyThickness)
+	part.Transparency = 1 -- only the SurfaceGui is visible
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.Massless = true
+	-- (right, up, normal) is right-handed, so the part's +Z face (Back) points outward along normal
+	part.CFrame = CFrame.fromMatrix(worldPos + normal * SETTINGS.ProxyOffset, right, up, normal)
+
+	if hitPart and not hitPart.Anchored then
+		part.Anchored = false
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = part
+		weld.Part1 = hitPart
+		weld.Parent = part
+	else
+		part.Anchored = true
+	end
+	part.Parent = folder("IMGNBloodProxies", proxyFolder)
+	proxyFolder = part.Parent :: Folder
 
 	local gui = Instance.new("SurfaceGui")
 	gui.Name = "IMGNBlood"
-	gui.Face = normalId
+	gui.Face = Enum.NormalId.Back -- the +Z face, which faces outward
 	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
 	gui.PixelsPerStud = 50
 	gui.Adornee = part
 	gui.Parent = part
 
-	local canvas = Canvas.new({ Resolution = Vector2.new(resW, resH), Parent = gui })
-	local liquid = Liquid.new({
-		Canvas = canvas,
-		Preset = SETTINGS.Preset,
-		Gravity = computeGravity(part, normalId),
-	})
+	local canvas = Canvas.new({ Resolution = Vector2.new(res, res), Parent = gui })
+	local liquid = Liquid.new({ Canvas = canvas, Preset = SETTINGS.Preset, Gravity = gravity })
 	liquid:Start()
 
-	local self = setmetatable({
+	return setmetatable({
 		Part = part,
-		Face = normalId,
+		HitPart = hitPart,
+		Center = worldPos,
+		Normal = normal,
 		Liquid = liquid,
-		Width = resW,
-		Height = resH,
-		_gui = gui,
-	}, BloodSurface)
-
-	-- drips react to the part's current orientation
-	if SETTINGS.Dynamic then
-		self._conn = RunService.Heartbeat:Connect(function()
-			if not part.Parent then
-				self:Destroy()
-				return
-			end
-			liquid.Gravity = computeGravity(part, normalId)
-		end)
-	end
-
-	return self
+		Size = size,
+		Res = res,
+	}, BloodProxy)
 end
 
-function BloodSurface.Splat(self: any, worldPos: Vector3, amount: number, velocity: Vector3?)
-	-- refresh gravity in case the part moved since last splat (cheap; only on splat)
-	if not SETTINGS.Dynamic then
-		self.Liquid.Gravity = computeGravity(self.Part, self.Face)
-	end
-	local px, py = Surface.worldToPixel(self.Part, self.Face, worldPos, self.Width, self.Height)
-	local canvasVel = Vector2.zero
-	if velocity then
-		local _n, right, down = Surface.faceVectors(self.Part, self.Face)
-		canvasVel = Vector2.new(velocity:Dot(right), velocity:Dot(down)) * 0.5
-	end
-	self.Liquid:Splat(px, py, amount, { Spread = 4 + amount, Velocity = canvasVel })
+-- world point -> this proxy's canvas pixel (proxy is a known fixed-size part, so this is exact)
+function BloodProxy.Pixel(self: any, worldPos: Vector3): (number, number)
+	local lp = self.Part.CFrame:PointToObjectSpace(worldPos)
+	local u = 0.5 + lp.X / self.Size
+	local v = 0.5 - lp.Y / self.Size -- +Y local is up-slope, so canvas v grows downward
+	return math.clamp(math.floor(u * self.Res), 0, self.Res - 1), math.clamp(math.floor(v * self.Res), 0, self.Res - 1)
 end
 
-function BloodSurface.Destroy(self: any)
-	if self._conn then
-		self._conn:Disconnect()
+function BloodProxy.Splat(self: any, worldPos: Vector3, amount: number)
+	local px, py = BloodProxy.Pixel(self, worldPos)
+	self.Liquid:Splat(px, py, amount, { Spread = 3 + amount })
+end
+
+-- find a nearby proxy on the same part facing the same way, or make a new one
+local function proxyFor(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
+	local key = hitPart or Workspace
+	local list = proxiesByPart[key]
+	if not list then
+		list = {}
+		proxiesByPart[key] = list
 	end
-	if surfaces[self.Part] then
-		surfaces[self.Part][self.Face] = nil
+	for i = #list, 1, -1 do
+		local p = list[i]
+		if not p.Part.Parent then
+			table.remove(list, i) -- cleaned up elsewhere
+		elseif (p.Center - worldPos).Magnitude <= SETTINGS.ReuseRadius and p.Normal:Dot(normal) > 0.8 then
+			return p
+		end
 	end
-	self.Liquid:Destroy()
-	if self._gui then
-		self._gui:Destroy()
-	end
+	local proxy = BloodProxy.new(hitPart, worldPos, normal)
+	table.insert(list, proxy)
+	return proxy
 end
 
 --[=[
 	@within Blood
-	The [BloodSurface] for a part's face, creating and caching it on first use. Use this (or
-	`Blood.Splat`) to paint onto a surface without going through a droplet.
+	Splats `amount` of blood at `worldPos` on a surface with outward `normal` (e.g. a raycast hit).
+	`hitPart` is what it landed on (so the proxy can follow it); pass `nil` for a static splat.
 ]=]
-function Blood.SurfaceFor(part: BasePart, normalId: Enum.NormalId): any
-	local byFace = surfaces[part]
-	if not byFace then
-		byFace = {}
-		surfaces[part] = byFace
-	end
-	if not byFace[normalId] then
-		byFace[normalId] = BloodSurface.new(part, normalId)
-	end
-	return byFace[normalId]
+function Blood.Splat(hitPart: BasePart?, worldPos: Vector3, normal: Vector3, amount: number?)
+	proxyFor(hitPart, worldPos, normal):Splat(worldPos, amount or SETTINGS.SplatAmount)
 end
 
---[=[
-	@within Blood
-	Splats `amount` of blood at `worldPos` on `part`'s `normalId` face (optionally biased by a 3D
-	`velocity`), turning that face into a dripping canvas if it isn't one already.
-]=]
-function Blood.Splat(part: BasePart, normalId: Enum.NormalId, worldPos: Vector3, amount: number?, velocity: Vector3?)
-	Blood.SurfaceFor(part, normalId):Splat(worldPos, amount or SETTINGS.SplatAmount, velocity)
-end
-
--- shrink a landed droplet, then destroy it
 local function popDroplet(drop: BasePart)
 	local tween = TweenService:Create(drop, TweenInfo.new(0.12, Enum.EasingStyle.Quad), { Size = Vector3.new(0.01, 0.01, 0.01) })
 	tween.Completed:Connect(function()
@@ -1305,26 +1290,27 @@ end
 --[=[
 	@within Blood
 	Emits a real 3D blood droplet from `origin` with initial `velocity`. It falls under gravity;
-	when it lands on a surface it splats there (drips down that surface) and is destroyed.
-	`options.Amount` sets the splat size.
+	when it lands it spawns a [BloodProxy] there (drips down the surface) and is destroyed.
 ]=]
 function Blood.Emit(origin: Vector3, velocity: Vector3, options: { Amount: number? }?)
 	local opts = options or {}
+	dropletFolder = folder("IMGNBloodDroplets", dropletFolder)
+
 	local drop = Instance.new("Part")
 	drop.Name = "BloodDroplet"
 	drop.Shape = Enum.PartType.Ball
 	drop.Size = Vector3.new(SETTINGS.DropletSize, SETTINGS.DropletSize, SETTINGS.DropletSize)
 	drop.Color = SETTINGS.DropletColor
-	drop.Material = Enum.Material.SmoothPlastic -- Glass is expensive to render on many small parts
+	drop.Material = Enum.Material.SmoothPlastic
 	drop.CanCollide = false
 	drop.CanQuery = false
 	drop.CFrame = CFrame.new(origin)
-	drop.Parent = getDropletFolder()
+	drop.Parent = dropletFolder
 	drop.AssemblyLinearVelocity = velocity
 
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { getDropletFolder() }
+	params.FilterDescendantsInstances = { dropletFolder, proxyFolder }
 
 	local last = origin
 	local born = os.clock()
@@ -1339,15 +1325,13 @@ function Blood.Emit(origin: Vector3, velocity: Vector3, options: { Amount: numbe
 			drop:Destroy()
 			return
 		end
-
 		local cur = drop.Position
 		local step = cur - last
 		if step.Magnitude > 1e-3 then
 			local hit = Workspace:Raycast(last, step, params)
-			if hit and hit.Instance then
+			if hit then
 				conn:Disconnect()
-				local face = Surface.faceFromNormal(hit.Instance, hit.Normal)
-				Blood.Splat(hit.Instance, face, hit.Position, opts.Amount or SETTINGS.SplatAmount, velocity)
+				Blood.Splat(hit.Instance, hit.Position, hit.Normal, opts.Amount or SETTINGS.SplatAmount)
 				drop.Anchored = true
 				popDroplet(drop)
 				return
@@ -1359,22 +1343,19 @@ end
 
 --[=[
 	@within Blood
-	Turns `part` into a kill brick: when a character with a Humanoid touches it, the Humanoid is
-	killed and a spray of droplets bursts from the contact point, landing and dripping on whatever
-	they hit. `options`: `Droplets` (count), `Spread` (sideways speed), `Up` (upward speed),
-	`Amount` (per-splat).
+	Turns `part` into a kill brick: a character with a Humanoid that touches it is killed and a
+	spray of droplets bursts from the contact point, each landing and dripping. `options`:
+	`Droplets`, `Spread`, `Up`, `Amount`.
 ]=]
 function Blood.KillBrick(part: BasePart, options: { Droplets: number?, Spread: number?, Up: number?, Amount: number? }?)
 	local opts = options or {}
-	local droplets = opts.Droplets or 6 -- fewer drops = fewer surfaces/canvases = far less lag
-	local spread = opts.Spread or 16
-	local up = opts.Up or 24
+	local droplets = opts.Droplets or 6
+	local spread = opts.Spread or 14
+	local up = opts.Up or 20
 	local debounce: { [Instance]: boolean } = setmetatable({}, { __mode = "k" }) :: any
 
 	part.Touched:Connect(function(hit)
 		local character = hit.Parent
-		-- Touched fires constantly, so bail fast: a direct hashed FindFirstChild beats
-		-- FindFirstChildOfType (which walks children) on the hot path.
 		if not character then
 			return
 		end
@@ -1384,7 +1365,7 @@ function Blood.KillBrick(part: BasePart, options: { Droplets: number?, Spread: n
 		end
 		debounce[character] = true
 
-		local origin = (hit.Position + Vector3.new(0, 2, 0))
+		local origin = hit.Position + Vector3.new(0, 2, 0)
 		humanoid.Health = 0
 		for _ = 1, droplets do
 			local v = Vector3.new(
@@ -1519,6 +1500,35 @@ function Surface.worldToPixel(
 	local u = if widthStuds > 0 then along / widthStuds + 0.5 else 0.5
 	local v = if heightStuds > 0 then downAmt / heightStuds + 0.5 else 0.5
 	return math.clamp(math.floor(u * resW), 0, resW - 1), math.clamp(math.floor(v * resH), 0, resH - 1)
+end
+
+--[=[
+	@within Surface
+	The orientation for a BloodProxy facing along a hit `normal`: returns the canvas `right` and
+	`up` axes (world unit vectors) and the canvas-space `gravity`. The proxy is built so canvas +Y
+	points DOWNHILL, so gravity is always `(0,1)` on a wall/slope (drips down it) and `(0,0)` on a
+	floor/ceiling (pools) - no per-face convention needed. Pure + verified.
+]=]
+function Surface.dripBasis(normal: Vector3): (Vector3, Vector3, Vector2)
+	normal = normal.Unit
+	local worldDown = Vector3.new(0, -1, 0)
+	local downhill = worldDown - normal * worldDown:Dot(normal) -- world-down projected onto the face
+
+	if downhill.Magnitude < 1e-3 then
+		-- floor/ceiling: no in-plane gravity, so the fluid just pools; any in-plane basis works
+		local right = normal:Cross(Vector3.new(0, 0, 1))
+		if right.Magnitude < 1e-3 then
+			right = normal:Cross(Vector3.new(1, 0, 0))
+		end
+		right = right.Unit
+		local up = normal:Cross(right).Unit -- right x up = normal (right-handed, for the proxy CFrame)
+		return right, up, Vector2.new(0, 0)
+	end
+
+	downhill = downhill.Unit
+	local up = -downhill -- canvas up = up-slope, so canvas +Y (down) runs downhill
+	local right = up:Cross(normal).Unit
+	return right, up, Vector2.new(0, 1)
 end
 
 return Surface

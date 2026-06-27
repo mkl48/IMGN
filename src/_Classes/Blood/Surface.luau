@@ -119,4 +119,33 @@ function Surface.worldToPixel(
 	return math.clamp(math.floor(u * resW), 0, resW - 1), math.clamp(math.floor(v * resH), 0, resH - 1)
 end
 
+--[=[
+	@within Surface
+	The orientation for a BloodProxy facing along a hit `normal`: returns the canvas `right` and
+	`up` axes (world unit vectors) and the canvas-space `gravity`. The proxy is built so canvas +Y
+	points DOWNHILL, so gravity is always `(0,1)` on a wall/slope (drips down it) and `(0,0)` on a
+	floor/ceiling (pools) - no per-face convention needed. Pure + verified.
+]=]
+function Surface.dripBasis(normal: Vector3): (Vector3, Vector3, Vector2)
+	normal = normal.Unit
+	local worldDown = Vector3.new(0, -1, 0)
+	local downhill = worldDown - normal * worldDown:Dot(normal) -- world-down projected onto the face
+
+	if downhill.Magnitude < 1e-3 then
+		-- floor/ceiling: no in-plane gravity, so the fluid just pools; any in-plane basis works
+		local right = normal:Cross(Vector3.new(0, 0, 1))
+		if right.Magnitude < 1e-3 then
+			right = normal:Cross(Vector3.new(1, 0, 0))
+		end
+		right = right.Unit
+		local up = normal:Cross(right).Unit -- right x up = normal (right-handed, for the proxy CFrame)
+		return right, up, Vector2.new(0, 0)
+	end
+
+	downhill = downhill.Unit
+	local up = -downhill -- canvas up = up-slope, so canvas +Y (down) runs downhill
+	local right = up:Cross(normal).Unit
+	return right, up, Vector2.new(0, 1)
+end
+
 return Surface
