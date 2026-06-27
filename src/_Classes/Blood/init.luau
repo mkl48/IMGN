@@ -40,6 +40,12 @@ local SETTINGS = {
 	DropletLifetime = 6,
 	SplatAmount = 4,
 	FlipDrip = false, -- flip if drips run UP instead of down in your place (single global knob)
+	-- cross-surface dripping: fluid reaching a proxy's bottom edge falls off as a droplet
+	EdgeDrip = true,
+	DripInterval = 0.25, -- min seconds between drips off one proxy edge (throttle = perf)
+	DripMin = 1.2, -- bottom-edge fluid must exceed this to shed a drip
+	DripTake = 2.5, -- how much fluid each drip carries away
+	Ignore = {} :: { Instance }, -- droplets never land on these (your character, the button, …)
 }
 
 --[=[
@@ -52,6 +58,28 @@ function Blood.Configure(overrides: { [string]: any })
 	for key, value in overrides do
 		assert(SETTINGS[key] ~= nil, `IMGN Blood.Configure: unknown key "{tostring(key)}"`)
 		SETTINGS[key] = value
+	end
+end
+
+--[=[
+	@within Blood
+	Adds an instance (and its descendants) to the ignore list - droplets never land on it. Use it
+	for the player's own character, the kill button, etc.
+]=]
+function Blood.Ignore(instance: Instance)
+	if not table.find(SETTINGS.Ignore, instance) then
+		table.insert(SETTINGS.Ignore, instance)
+	end
+end
+
+--[=[
+	@within Blood
+	Removes an instance from the ignore list.
+]=]
+function Blood.Unignore(instance: Instance)
+	local i = table.find(SETTINGS.Ignore, instance)
+	if i then
+		table.remove(SETTINGS.Ignore, i)
 	end
 end
 
@@ -120,15 +148,54 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 	local liquid = Liquid.new({ Canvas = canvas, Preset = SETTINGS.Preset, Gravity = gravity })
 	liquid:Start()
 
-	return setmetatable({
+	local self = setmetatable({
 		Part = part,
 		HitPart = hitPart,
 		Center = worldPos,
 		Normal = normal,
+		Up = up,
 		Liquid = liquid,
 		Size = size,
 		Res = res,
+		IsDrip = gravity.Y > 0.5, -- a wall/slope sheds off its bottom edge; a floor just pools
+		_dripCD = 0,
 	}, BloodProxy)
+
+	-- cross-surface dripping: when fluid reaches the bottom edge, shed it as a falling droplet that
+	-- lands on (and drips down) whatever is below - cascading down a ramp and onto the ground.
+	if SETTINGS.EdgeDrip and self.IsDrip then
+		liquid.OnStep = function(dt)
+			BloodProxy.checkEdge(self, dt)
+		end
+	end
+
+	return self
+end
+
+-- world position of a canvas pixel, just off the front of the surface
+function BloodProxy.worldOfPixel(self: any, px: number, py: number): Vector3
+	local lx = ((px + 0.5) / self.Res - 0.5) * self.Size
+	local ly = (0.5 - (py + 0.5) / self.Res) * self.Size
+	return self.Part.CFrame:PointToWorldSpace(Vector3.new(lx, ly, SETTINGS.ProxyThickness))
+end
+
+-- shed a drip off the bottom edge if enough fluid has pooled there (throttled)
+function BloodProxy.checkEdge(self: any, dt: number)
+	self._dripCD -= dt
+	if self._dripCD > 0 then
+		return
+	end
+	local x, taken = self.Liquid:TakeFromBottom(SETTINGS.DripMin, SETTINGS.DripTake)
+	if not x then
+		return
+	end
+	self._dripCD = SETTINGS.DripInterval
+
+	local pos = BloodProxy.worldOfPixel(self, x, self.Res - 1)
+	-- carry it down the surface so it lands a few studs lower (new proxy) or off the end (ground)
+	local downhill = -self.Up
+	local velocity = downhill * 6 + Vector3.new(0, -2, 0)
+	Blood.Emit(pos + self.Normal * 0.2, velocity, { Amount = math.max(2, taken :: number) })
 end
 
 -- world point -> this proxy's canvas pixel (proxy is a known fixed-size part, so this is exact)
@@ -205,7 +272,13 @@ function Blood.Emit(origin: Vector3, velocity: Vector3, options: { Amount: numbe
 
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { dropletFolder, proxyFolder }
+	-- never land on our own droplets/proxies, or anything the user told us to ignore (their
+	-- character, the kill button, …)
+	local exclude = { dropletFolder, proxyFolder }
+	for _, inst in SETTINGS.Ignore do
+		table.insert(exclude, inst)
+	end
+	params.FilterDescendantsInstances = exclude
 
 	local last = origin
 	local born = os.clock()

@@ -386,6 +386,41 @@ function Liquid.Step(self: Liquid, dt: number)
 
 	self._active = active
 	canvas:Render()
+
+	-- per-step hook (the blood engine uses it to shed fluid off the bottom edge -> drip onto the
+	-- surface below). Only fires while the sim is awake.
+	if self.OnStep then
+		self.OnStep(dt)
+	end
+end
+
+--[=[
+	@within Liquid
+	Removes up to `take` fluid from the wettest cell of the bottom row if it holds at least `min`,
+	and returns that cell's `x` plus the amount taken (or `nil`). The blood engine uses this to let
+	fluid that reaches the bottom edge "fall off" as a 3D droplet onto whatever's below.
+]=]
+function Liquid.TakeFromBottom(self: Liquid, min: number, take: number): (number?, number?)
+	local W, H = self.Width, self.Height
+	local amount = self._amount
+	local row = (H - 1) * W
+	local bestX, bestA = -1, min
+	for x = 0, W - 1 do
+		local a = amount[row + x + 1]
+		if a > bestA then
+			bestA = a
+			bestX = x
+		end
+	end
+	if bestX < 0 then
+		return nil
+	end
+	local i = row + bestX + 1
+	local taken = math.min(take, amount[i])
+	amount[i] -= taken
+	self._active = true
+	self._settledFlow = false
+	return bestX, taken
 end
 
 --[=[

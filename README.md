@@ -204,6 +204,14 @@ IMGN.Blood.Splat(part, Enum.NormalId.Front, worldPos, 4)
 
 Proxies are welded to the hit part (blood follows it if it moves), reused when splats land within `ReuseRadius`, and the droplet shrinks + is destroyed. Tune via `IMGN.Blood.Configure { ProxySize = …, PixelsPerStud = …, Preset = "Blood", … }`.
 
+**Cross-surface dripping.** Fluid that reaches a proxy's bottom edge **sheds off as a new falling droplet** (throttled by `DripInterval`/`DripMin`), which lands lower down — so blood runs down a ramp, cascades proxy-to-proxy, drips off the end, and pools on the ground below. Floors/ceilings pool instead of shedding.
+
+**Filters.** `IMGN.Blood.Ignore(instance)` (and `Unignore`) keep droplets from landing on things — your own character, a UI/button, etc. Anything with `CanQuery = false` is skipped automatically.
+
+```lua
+IMGN.Blood.Ignore(player.Character)   -- blood won't paint you
+```
+
 **Performance:** small fixed-size proxies keep Frame counts low and uniform; each sim's hot loop is allocation-free, **skips its flow passes once the blood stops moving**, and **sleeps** entirely once it has dried (a stain costs ~nothing). Keep droplet counts modest — each one can spawn a proxy.
 
 **If drips run upward** in your place, flip them with one global knob (no source edits):
@@ -345,6 +353,7 @@ See [`examples/`](examples):
 - **WebImage** — load an image by URL through the bundled web service (`server/`).
 - **BloodDrip** — realistic dripping blood via the `Liquid` sim (`IMGN.Liquid`).
 - **KillBrick** — step on it, die, and spray blood that drips downhill (`IMGN.Blood`).
+- **BloodArena** — a test play area + a click-to-bleed button that follows your character.
 
 - **GradientSurface** — procedural gradient on a part via `:Shader`.
 - **PaintCanvas** — click-drag finger paint on a `ScreenGui` with `AutoRender`.
