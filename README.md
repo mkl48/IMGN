@@ -195,19 +195,29 @@ local canvas = IMGN.ImageCanvas(bytes, { Parent = surfaceGui, Format = "PNG" })
 
 ### Loading without freezing
 
-A big image is a lot of work in one frame (decode + thousands of Frames). `IMGN.ImageCanvasAsync` spreads the Frame-building and drawing across frames, with progress:
+A big image is a lot of work in one frame (decode + thousands of Frames). `IMGN.ImageCanvasAsync` builds and draws it while yielding on a **per-frame time budget**, so the game keeps running smoothly — it spends ~4 ms per frame and picks up where it left off, instead of hitching once:
 
 ```lua
 task.spawn(function()
     local canvas = IMGN.ImageCanvasAsync(bytes, {
         Parent = surfaceGui,
-        RowsPerFrame = 8,
+        FrameBudget = 0.004,   -- seconds of work per frame (lower = smoother, slower to finish)
         OnProgress = function(f) print(("%d%%"):format(f * 100)) end,
+        OnComplete = function() print("done") end,
     })
 end)
 ```
 
-(The decode step itself is a single call and isn't split; if it's your bottleneck, shrink the image or offload decoding to a web service — see [Web image service](#web-image-service).) For lower instance counts entirely, pick a [driver](#drivers) like `RowMerge` or `RichText`.
+Tuning knobs (per call, or globally via `IMGN.Configure { LoadFrameBudget = …, LoadRowsPerFrame = … }`):
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `FrameBudget` | `0.004` (4 ms) | time spent per frame before yielding. `false` → use `RowsPerFrame` instead |
+| `RowsPerFrame` | `8` | fixed rows per yield when there's no budget |
+| `OnProgress(f)` | — | `0..1`, fired at each yield (mount is the first half, drawing the second) |
+| `OnComplete()` | — | fired once finished |
+
+> **The one thing budgeting can't hide:** the *decode* is a single osgl call and can't be split, so a very large source image still hitches once while it decodes. To keep that seamless too, shrink the source (or use the [web service](#web-image-service), which decodes server-side so the client never does). Placement options (`Fit`, `Align`, `Scale`) and a low-instance [driver](#drivers) like `GreedyMesh` round it out.
 
 ## Web image service
 

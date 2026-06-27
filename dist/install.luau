@@ -134,11 +134,12 @@ end
 
 --[=[
 	@within IMGN
-	Progressive [IMGN.ImageCanvas]: builds the canvas' Frames and draws the image a few rows per
-	frame so a big image loads smoothly instead of freezing. `config.Parent` is required (it mounts
-	as it builds), `config.RowsPerFrame` (default 8) tunes the budget, and `config.OnProgress(0..1)`
-	reports progress (mount counts as the first half, drawing the second). Must run on a yielding
-	thread - wrap the call in `task.spawn`. Note the decode step itself isn't split.
+	Progressive [IMGN.ImageCanvas]: builds the canvas' Frames and draws the image while yielding on
+	a per-frame time budget, so a big image loads without dropping frames. `config.Parent` is
+	required (it mounts as it builds). Tuning: `FrameBudget` (seconds/frame, default
+	[Config.LoadFrameBudget]), `RowsPerFrame` (fallback), `OnProgress(0..1)` (mount is the first
+	half, drawing the second) and `OnComplete`. Must run on a yielding thread - wrap in `task.spawn`.
+	The decode step itself isn't split.
 ]=]
 function IMGN.ImageCanvasAsync(bytes: string | buffer, config: {
 	Parent: Instance,
@@ -147,15 +148,16 @@ function IMGN.ImageCanvasAsync(bytes: string | buffer, config: {
 	Scale: number?,
 	Format: string?,
 	SkipTransparent: boolean?,
+	FrameBudget: (number | false)?,
 	RowsPerFrame: number?,
 	OnProgress: ((number) -> ())?,
+	OnComplete: (() -> ())?,
 }): Canvas
 	assert(config and config.Parent, "IMGN.ImageCanvasAsync: config.Parent is required")
 	local decoded = ImageHelper.decode(bytes, config.Format)
 	local scale = config.Scale or 1
 	local width = math.max(1, math.floor(decoded.width * scale + 0.5))
 	local height = math.max(1, math.floor(decoded.height * scale + 0.5))
-	local rows = config.RowsPerFrame or 8
 	local report = config.OnProgress
 
 	local canvas = Canvas.new({
@@ -164,15 +166,40 @@ function IMGN.ImageCanvasAsync(bytes: string | buffer, config: {
 		AutoRender = config.AutoRender,
 	})
 
-	-- Mount progressively (first half of progress), then draw progressively (second half).
-	canvas:MountAsync(config.Parent, rows, if report then function(f)
-		report(f * 0.5)
-	end else nil)
-	ImageHelper.blitAsync(canvas, decoded, { Scale = scale, SkipTransparent = config.SkipTransparent }, rows, function()
-		task.wait()
-	end, if report then function(f)
-		report(0.5 + f * 0.5)
-	end else nil)
+	-- Mount progressively (first half of progress), then draw progressively (second half) - both
+	-- pace off the same time budget so the whole load stays under it.
+	canvas:MountAsync(config.Parent, {
+		FrameBudget = config.FrameBudget,
+		RowsPerFrame = config.RowsPerFrame,
+		OnProgress = if report then function(f)
+			report(f * 0.5)
+		end else nil,
+	})
+
+	local budget: number?
+	if config.FrameBudget == false then
+		budget = nil
+	elseif config.FrameBudget ~= nil then
+		budget = config.FrameBudget :: number
+	else
+		budget = ConfigModule.Config.LoadFrameBudget
+	end
+	local pace = ImageHelper.newPacer({
+		Budget = budget,
+		RowsPerYield = config.RowsPerFrame or ConfigModule.Config.LoadRowsPerFrame,
+		Yield = task.wait,
+		OnProgress = if report then function(f)
+			report(0.5 + f * 0.5)
+		end else nil,
+		BeforeYield = function()
+			canvas:Render()
+		end,
+	})
+	ImageHelper.blitAsync(canvas, decoded, { Scale = scale, SkipTransparent = config.SkipTransparent }, pace)
+
+	if config.OnComplete then
+		config.OnComplete()
+	end
 
 	return canvas
 end
@@ -1078,6 +1105,41 @@ type PixelBuffer = PixelBuffer.PixelBuffer
 type Driver = Drivers.Driver
 
 --[=[
+	@interface AsyncOptions
+	@within Canvas
+	.FrameBudget (number | false)? -- seconds of work per frame before yielding (default [Config.LoadFrameBudget] = 4ms); `false` uses RowsPerFrame instead
+	.RowsPerFrame number? -- fixed rows per yield when there's no FrameBudget (default [Config.LoadRowsPerFrame])
+	.OnProgress (fraction: number) -> ()? -- 0..1, called at each yield
+	.OnComplete () -> ()? -- called once the whole load finishes
+]=]
+export type AsyncOptions = {
+	FrameBudget: (number | false)?,
+	RowsPerFrame: number?,
+	OnProgress: ((number) -> ())?,
+	OnComplete: (() -> ())?,
+}
+
+-- Build a time-budget pacer from per-call AsyncOptions, falling back to the global Config.
+local function pacerFor(async: AsyncOptions?, beforeYield: (() -> ())?)
+	local opts = async or {}
+	local budget: number?
+	if opts.FrameBudget == false then
+		budget = nil
+	elseif opts.FrameBudget ~= nil then
+		budget = opts.FrameBudget :: number
+	else
+		budget = Config.LoadFrameBudget
+	end
+	return Image.newPacer({
+		Budget = budget,
+		RowsPerYield = opts.RowsPerFrame or Config.LoadRowsPerFrame,
+		Yield = task.wait,
+		OnProgress = opts.OnProgress,
+		BeforeYield = beforeYield,
+	})
+end
+
+--[=[
 	@class Canvas
 	A writable pixel image rendered from GUI Frames - no `EditableImage`, no verification. Create
 	one with [IMGN.new], [IMGN.Surface] or [IMGN.Billboard], draw into it, then [Canvas:Render].
@@ -1184,23 +1246,21 @@ end
 
 --[=[
 	@within Canvas
-	Mounts progressively: builds the Driver's Instances `rowsPerFrame` rows at a time, yielding
-	between batches so a large canvas doesn't hitch the frame. `onProgress(fraction)` is reported
-	per batch. Falls back to a one-shot [Canvas:Mount] for drivers that build lazily (RowMerge).
-	Must run on a thread that can yield (e.g. inside `task.spawn`).
+	Mounts progressively: builds the Driver's Instances a row at a time, yielding on a per-frame
+	time budget (see [AsyncOptions]) so a large canvas doesn't hitch the frame. Falls back to a
+	one-shot [Canvas:Mount] for drivers that build lazily (RowMerge/GreedyMesh/RichText). Must run
+	on a thread that can yield (e.g. inside `task.spawn`).
 ]=]
-function Canvas.MountAsync(self: Canvas, parent: Instance, rowsPerFrame: number?, onProgress: ((number) -> ())?)
+function Canvas.MountAsync(self: Canvas, parent: Instance, async: AsyncOptions?)
 	assert(not self._mounted, "IMGN Canvas: already mounted")
 
 	local driver = self._driver :: any
 	if driver.MountAsync then
-		driver:MountAsync(parent, rowsPerFrame or 8, function()
-			task.wait()
-		end, onProgress)
+		driver:MountAsync(parent, pacerFor(async))
 	else
 		driver:Mount(parent)
-		if onProgress then
-			onProgress(1)
+		if async and async.OnProgress then
+			async.OnProgress(1)
 		end
 	end
 	self._mounted = true
@@ -1357,23 +1417,26 @@ end
 
 --[=[
 	@within Canvas
-	Like [Canvas:LoadImage], but draws the image `rowsPerFrame` rows at a time, yielding (and
-	flushing) between bands so a large image spreads across frames instead of freezing one.
-	`onProgress(fraction)` is reported per band. The decode itself isn't split (it's one decoder
-	call); this spreads the per-pixel draw + render. Must run on a yielding thread. Returns the
-	drawn width/height.
+	Like [Canvas:LoadImage], but draws the image a row at a time and yields on a per-frame time
+	budget (see [AsyncOptions]) so a large image fills in without dropping frames. The decode itself
+	isn't split (it's one decoder call); this spreads the per-pixel draw + render. Must run on a
+	yielding thread. Returns the drawn width/height.
 ]=]
 function Canvas.LoadImageAsync(
 	self: Canvas,
 	bytes: string | buffer,
 	options: Image.LoadOptions?,
-	rowsPerFrame: number?,
-	onProgress: ((number) -> ())?
+	async: AsyncOptions?
 ): (number, number)
 	local decoded = Image.decode(bytes, options and options.Format)
-	return Image.blitAsync(self, decoded, options, rowsPerFrame or 8, function()
-		task.wait()
-	end, onProgress)
+	local pace = pacerFor(async, function()
+		Canvas.Render(self)
+	end)
+	local w, h = Image.blitAsync(self, decoded, options, pace)
+	if async and async.OnComplete then
+		async.OnComplete()
+	end
+	return w, h
 end
 
 --[=[
@@ -1434,6 +1497,8 @@ export type Config = {
 	MaxPixels: number,
 	WarnOnLargeCanvas: boolean,
 	AutoRender: boolean,
+	LoadFrameBudget: number,
+	LoadRowsPerFrame: number,
 }
 
 local Config: Config = {
@@ -1468,6 +1533,22 @@ local Config: Config = {
 		`:Render()` by hand. Leave `false` to batch many edits and flush once explicitly.
 	]=]
 	AutoRender = false,
+	--[=[
+		@within Config
+		@prop LoadFrameBudget number
+		Default `0.004` (4ms). The per-frame time budget the async loaders (`ImageCanvasAsync`,
+		`LoadImageAsync`, `MountAsync`) spend building/drawing before yielding the frame. Lower =
+		smoother but slower to finish; higher = faster but choppier. Pass `FrameBudget` per-call to
+		override, or `FrameBudget = false` to fall back to `LoadRowsPerFrame`.
+	]=]
+	LoadFrameBudget = 0.004,
+	--[=[
+		@within Config
+		@prop LoadRowsPerFrame number
+		Default `8`. Rows built/drawn per yield when no time budget is in effect (`FrameBudget`
+		nil/false). The time budget is usually the better knob; this is the fixed-count fallback.
+	]=]
+	LoadRowsPerFrame = 8,
 }
 
 --[=[
@@ -1944,17 +2025,11 @@ end
 
 --[=[
 	@within PixelGrid
-	Like [PixelGrid.Mount], but creates the grid `rowsPerYield` rows at a time, calling `yield`
-	between batches so building thousands of Frames spreads across frames instead of hitching one.
-	`onProgress(fraction)` is reported per batch. Must run on a yielding thread.
+	Like [PixelGrid.Mount], but builds one row of Frames at a time and calls `pace((rowsDone)/total)`
+	after each, so the pacer can yield on its time budget - thousands of Frames spread across frames
+	instead of hitching one. Must run on a yielding thread.
 ]=]
-function PixelGrid.MountAsync(
-	self: PixelGrid,
-	parent: Instance,
-	rowsPerYield: number,
-	yield: () -> (),
-	onProgress: ((number) -> ())?
-): Frame
+function PixelGrid.MountAsync(self: PixelGrid, parent: Instance, pace: (number) -> ()): Frame
 	local height = self._height
 	local sx, sy = 1 / self._width, 1 / height
 
@@ -1967,20 +2042,9 @@ function PixelGrid.MountAsync(
 	container.Parent = parent
 	self._container = container
 
-	local step = math.max(1, rowsPerYield)
-	local y = 0
-	while y < height do
-		local toY = math.min(y + step - 1, height - 1)
-		for row = y, toY do
-			buildRow(self, container, sx, sy, row)
-		end
-		if onProgress then
-			onProgress((toY + 1) / height)
-		end
-		y = toY + 1
-		if y < height then
-			yield()
-		end
+	for y = 0, height - 1 do
+		buildRow(self, container, sx, sy, y)
+		pace((y + 1) / height)
 	end
 
 	return container
@@ -6883,12 +6947,9 @@ mod("Image", _16, [[
 -- copies the decoded RGBA8 buffer onto a Canvas (osgl's DynamicImage buffer is the same
 -- 4-bytes-per-pixel layout IMGN uses, so it's a straight per-pixel copy).
 --
--- Placement: pass `Scale` + `X`/`Y`, or a `Fit` mode ("Contain"/"Cover"/"Stretch") to size the
--- image against the canvas. `blitAsync` does the same copy but yields every N rows so a big image
--- doesn't freeze the frame - see Canvas:LoadImageAsync.
---
--- Bytes come from you: HttpService:GetAsync(url) returns the file as a string, or bake the file
--- into a ModuleScript (scripts/embed-image.luau) - either a `string` or a `buffer` works.
+-- Placement: `Scale` + `X`/`Y`, or a `Fit` mode ("Contain"/"Cover"/"Stretch") with optional
+-- `Align`. `blitAsync` does the copy through a Pacer that yields on a time budget so a big image
+-- loads without dropping frames; `fromPixels` lets web-service JSON reuse the same path.
 
 local Decoder = require(script.Parent.Parent._Packages.Image)
 
@@ -6904,11 +6965,63 @@ export type LoadOptions = {
 	Y: number?, -- destination top-left y (default 0; ignored when Fit is set)
 	Scale: number?, -- nearest-neighbour scale (default 1; <1 shrinks, >1 enlarges)
 	Fit: (boolean | "Contain" | "Cover" | "Stretch")?, -- size to the canvas instead of Scale (true = "Contain")
+	Align: string?, -- placement for Contain/Cover: Center (default), Top, Bottom, Left, Right, TopLeft, ...
 	Format: ("PNG" | "BMP" | "TGA" | "JPG")?, -- skip format auto-detection
 	SkipTransparent: boolean?, -- don't write fully-transparent source pixels (composite instead of replace)
 }
 
+export type PacerOptions = {
+	Budget: number?, -- seconds of work per frame before yielding (time-based; preferred)
+	RowsPerYield: number?, -- fallback when Budget is nil: yield every N units
+	Yield: () -> (), -- how to give up the frame (e.g. task.wait)
+	OnProgress: ((number) -> ())?, -- 0..1, called at each yield
+	BeforeYield: (() -> ())?, -- run just before yielding (e.g. canvas:Render)
+}
+
+-- Pacer: call the returned function once per unit of work (a row); it yields when the per-frame
+-- time Budget is spent (or every RowsPerYield units if no Budget), keeping the frame responsive.
+type Pacer = (progress: number) -> ()
+
 type Placement = { scaleX: number, scaleY: number, ox: number, oy: number, destW: number, destH: number }
+
+local ALIGN: { [string]: { number } } = {
+	Center = { 0.5, 0.5 },
+	Top = { 0.5, 0 },
+	Bottom = { 0.5, 1 },
+	Left = { 0, 0.5 },
+	Right = { 1, 0.5 },
+	TopLeft = { 0, 0 },
+	TopRight = { 1, 0 },
+	BottomLeft = { 0, 1 },
+	BottomRight = { 1, 1 },
+}
+
+--[=[
+	@within Image
+	Builds a [PacerOptions]-driven pacer. Call it once per row; it yields on the time budget.
+]=]
+function Image.newPacer(opts: PacerOptions): Pacer
+	local budget = opts.Budget
+	local step = math.max(1, opts.RowsPerYield or 8)
+	local frameStart = os.clock()
+	local since = 0
+
+	return function(progress: number)
+		since += 1
+		local doYield = if budget then (os.clock() - frameStart) >= budget else since >= step
+		if doYield then
+			if opts.BeforeYield then
+				opts.BeforeYield()
+			end
+			if opts.OnProgress then
+				opts.OnProgress(progress)
+			end
+			opts.Yield()
+			frameStart = os.clock()
+			since = 0
+		end
+	end
+end
 
 -- Decode `bytes` (string|buffer) with the bundled decoder into a DynamicImage.
 function Image.decode(bytes: string | buffer, format: string?): any
@@ -6934,14 +7047,13 @@ end
 	@within Image
 	Wraps a decoded pixel table (from a web service / JSONDecode) as something [Image.blit] can
 	draw. Accepts `{ width, height, pixels = { { {r,g,b[,a]}, ... } } }` (a 2D grid) or the compact
-	`{ width, height, rows = { { {count,r,g,b,a}, ... } } }` (per-row run-length runs). Returns an
-	object with `width`, `height` and `ReadPixelRGBA`, matching the decoder's image shape.
+	`{ width, height, rows = { { {count,r,g,b,a}, ... } } }` (per-row run-length runs).
 ]=]
 function Image.fromPixels(data: any): any
 	local w, h = data.width, data.height
 	assert(w and h, "IMGN: pixel data needs width and height")
 
-	local grid -- grid[y][x] = {r,g,b,a?}
+	local grid
 	if data.pixels then
 		grid = data.pixels
 	elseif data.rows then
@@ -6950,8 +7062,7 @@ function Image.fromPixels(data: any): any
 			local row = {}
 			local x = 0
 			for _, run in ipairs(runs) do
-				local count = run[1]
-				for _ = 1, count do
+				for _ = 1, run[1] do
 					x += 1
 					row[x] = { run[2], run[3], run[4], run[5] }
 				end
@@ -6986,12 +7097,12 @@ local function resolvePlacement(canvas: any, img: any, opts: LoadOptions): Place
 		if mode == "Stretch" then
 			scaleX, scaleY = cw / iw, ch / ih
 		else
-			-- Contain fits inside (letterbox); Cover fills and crops.
 			local s = if mode == "Cover" then math.max(cw / iw, ch / ih) else math.min(cw / iw, ch / ih)
 			scaleX, scaleY = s, s
 		end
-		ox = math.floor((cw - iw * scaleX) / 2 + 0.5)
-		oy = math.floor((ch - ih * scaleY) / 2 + 0.5)
+		local a = ALIGN[opts.Align or "Center"] or ALIGN.Center
+		ox = math.floor((cw - iw * scaleX) * a[1] + 0.5)
+		oy = math.floor((ch - ih * scaleY) * a[2] + 0.5)
 	else
 		local s = opts.Scale or 1
 		assert(s > 0, "IMGN: image Scale must be > 0")
@@ -7026,7 +7137,7 @@ end
 
 --[=[
 	@within Image
-	Copies a decoded DynamicImage onto `canvas` per the options. Returns drawn width/height.
+	Copies a decoded image onto `canvas` per the options. Returns drawn width/height.
 ]=]
 function Image.blit(canvas: any, img: any, options: LoadOptions?): (number, number)
 	local opts = options or {}
@@ -7037,36 +7148,18 @@ end
 
 --[=[
 	@within Image
-	Same as `blit`, but copies `rowsPerYield` destination rows at a time, calling `yield()` (and
-	flushing the canvas) between bands so a large image spreads across frames. Reports
-	`onProgress(fraction)` per band. Must run on a thread that can yield.
+	Like `blit`, but draws one row at a time and calls `pace((rowsDone)/total)` after each, so the
+	pacer can yield on its time budget - the image fills in without dropping frames. Must run on a
+	yielding thread. Returns drawn width/height.
 ]=]
-function Image.blitAsync(
-	canvas: any,
-	img: any,
-	options: LoadOptions?,
-	rowsPerYield: number,
-	yield: () -> (),
-	onProgress: ((number) -> ())?
-): (number, number)
+function Image.blitAsync(canvas: any, img: any, options: LoadOptions?, pace: Pacer): (number, number)
 	local opts = options or {}
 	local p = resolvePlacement(canvas, img, opts)
-	local step = math.max(1, rowsPerYield)
-
-	local y = 0
-	while y < p.destH do
-		local toY = math.min(y + step - 1, p.destH - 1)
-		blitRows(canvas, img, p, opts.SkipTransparent, y, toY)
-		canvas:Render()
-		if onProgress then
-			onProgress((toY + 1) / p.destH)
-		end
-		y = toY + 1
-		if y < p.destH then
-			yield()
-		end
+	for dy = 0, p.destH - 1 do
+		blitRows(canvas, img, p, opts.SkipTransparent, dy, dy)
+		pace((dy + 1) / p.destH)
 	end
-
+	canvas:Render()
 	return p.destW, p.destH
 end
 

@@ -23,6 +23,41 @@ type PixelBuffer = PixelBuffer.PixelBuffer
 type Driver = Drivers.Driver
 
 --[=[
+	@interface AsyncOptions
+	@within Canvas
+	.FrameBudget (number | false)? -- seconds of work per frame before yielding (default [Config.LoadFrameBudget] = 4ms); `false` uses RowsPerFrame instead
+	.RowsPerFrame number? -- fixed rows per yield when there's no FrameBudget (default [Config.LoadRowsPerFrame])
+	.OnProgress (fraction: number) -> ()? -- 0..1, called at each yield
+	.OnComplete () -> ()? -- called once the whole load finishes
+]=]
+export type AsyncOptions = {
+	FrameBudget: (number | false)?,
+	RowsPerFrame: number?,
+	OnProgress: ((number) -> ())?,
+	OnComplete: (() -> ())?,
+}
+
+-- Build a time-budget pacer from per-call AsyncOptions, falling back to the global Config.
+local function pacerFor(async: AsyncOptions?, beforeYield: (() -> ())?)
+	local opts = async or {}
+	local budget: number?
+	if opts.FrameBudget == false then
+		budget = nil
+	elseif opts.FrameBudget ~= nil then
+		budget = opts.FrameBudget :: number
+	else
+		budget = Config.LoadFrameBudget
+	end
+	return Image.newPacer({
+		Budget = budget,
+		RowsPerYield = opts.RowsPerFrame or Config.LoadRowsPerFrame,
+		Yield = task.wait,
+		OnProgress = opts.OnProgress,
+		BeforeYield = beforeYield,
+	})
+end
+
+--[=[
 	@class Canvas
 	A writable pixel image rendered from GUI Frames - no `EditableImage`, no verification. Create
 	one with [IMGN.new], [IMGN.Surface] or [IMGN.Billboard], draw into it, then [Canvas:Render].
@@ -129,23 +164,21 @@ end
 
 --[=[
 	@within Canvas
-	Mounts progressively: builds the Driver's Instances `rowsPerFrame` rows at a time, yielding
-	between batches so a large canvas doesn't hitch the frame. `onProgress(fraction)` is reported
-	per batch. Falls back to a one-shot [Canvas:Mount] for drivers that build lazily (RowMerge).
-	Must run on a thread that can yield (e.g. inside `task.spawn`).
+	Mounts progressively: builds the Driver's Instances a row at a time, yielding on a per-frame
+	time budget (see [AsyncOptions]) so a large canvas doesn't hitch the frame. Falls back to a
+	one-shot [Canvas:Mount] for drivers that build lazily (RowMerge/GreedyMesh/RichText). Must run
+	on a thread that can yield (e.g. inside `task.spawn`).
 ]=]
-function Canvas.MountAsync(self: Canvas, parent: Instance, rowsPerFrame: number?, onProgress: ((number) -> ())?)
+function Canvas.MountAsync(self: Canvas, parent: Instance, async: AsyncOptions?)
 	assert(not self._mounted, "IMGN Canvas: already mounted")
 
 	local driver = self._driver :: any
 	if driver.MountAsync then
-		driver:MountAsync(parent, rowsPerFrame or 8, function()
-			task.wait()
-		end, onProgress)
+		driver:MountAsync(parent, pacerFor(async))
 	else
 		driver:Mount(parent)
-		if onProgress then
-			onProgress(1)
+		if async and async.OnProgress then
+			async.OnProgress(1)
 		end
 	end
 	self._mounted = true
@@ -302,23 +335,26 @@ end
 
 --[=[
 	@within Canvas
-	Like [Canvas:LoadImage], but draws the image `rowsPerFrame` rows at a time, yielding (and
-	flushing) between bands so a large image spreads across frames instead of freezing one.
-	`onProgress(fraction)` is reported per band. The decode itself isn't split (it's one decoder
-	call); this spreads the per-pixel draw + render. Must run on a yielding thread. Returns the
-	drawn width/height.
+	Like [Canvas:LoadImage], but draws the image a row at a time and yields on a per-frame time
+	budget (see [AsyncOptions]) so a large image fills in without dropping frames. The decode itself
+	isn't split (it's one decoder call); this spreads the per-pixel draw + render. Must run on a
+	yielding thread. Returns the drawn width/height.
 ]=]
 function Canvas.LoadImageAsync(
 	self: Canvas,
 	bytes: string | buffer,
 	options: Image.LoadOptions?,
-	rowsPerFrame: number?,
-	onProgress: ((number) -> ())?
+	async: AsyncOptions?
 ): (number, number)
 	local decoded = Image.decode(bytes, options and options.Format)
-	return Image.blitAsync(self, decoded, options, rowsPerFrame or 8, function()
-		task.wait()
-	end, onProgress)
+	local pace = pacerFor(async, function()
+		Canvas.Render(self)
+	end)
+	local w, h = Image.blitAsync(self, decoded, options, pace)
+	if async and async.OnComplete then
+		async.OnComplete()
+	end
+	return w, h
 end
 
 --[=[

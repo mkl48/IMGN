@@ -92,11 +92,12 @@ end
 
 --[=[
 	@within IMGN
-	Progressive [IMGN.ImageCanvas]: builds the canvas' Frames and draws the image a few rows per
-	frame so a big image loads smoothly instead of freezing. `config.Parent` is required (it mounts
-	as it builds), `config.RowsPerFrame` (default 8) tunes the budget, and `config.OnProgress(0..1)`
-	reports progress (mount counts as the first half, drawing the second). Must run on a yielding
-	thread - wrap the call in `task.spawn`. Note the decode step itself isn't split.
+	Progressive [IMGN.ImageCanvas]: builds the canvas' Frames and draws the image while yielding on
+	a per-frame time budget, so a big image loads without dropping frames. `config.Parent` is
+	required (it mounts as it builds). Tuning: `FrameBudget` (seconds/frame, default
+	[Config.LoadFrameBudget]), `RowsPerFrame` (fallback), `OnProgress(0..1)` (mount is the first
+	half, drawing the second) and `OnComplete`. Must run on a yielding thread - wrap in `task.spawn`.
+	The decode step itself isn't split.
 ]=]
 function IMGN.ImageCanvasAsync(bytes: string | buffer, config: {
 	Parent: Instance,
@@ -105,15 +106,16 @@ function IMGN.ImageCanvasAsync(bytes: string | buffer, config: {
 	Scale: number?,
 	Format: string?,
 	SkipTransparent: boolean?,
+	FrameBudget: (number | false)?,
 	RowsPerFrame: number?,
 	OnProgress: ((number) -> ())?,
+	OnComplete: (() -> ())?,
 }): Canvas
 	assert(config and config.Parent, "IMGN.ImageCanvasAsync: config.Parent is required")
 	local decoded = ImageHelper.decode(bytes, config.Format)
 	local scale = config.Scale or 1
 	local width = math.max(1, math.floor(decoded.width * scale + 0.5))
 	local height = math.max(1, math.floor(decoded.height * scale + 0.5))
-	local rows = config.RowsPerFrame or 8
 	local report = config.OnProgress
 
 	local canvas = Canvas.new({
@@ -122,15 +124,40 @@ function IMGN.ImageCanvasAsync(bytes: string | buffer, config: {
 		AutoRender = config.AutoRender,
 	})
 
-	-- Mount progressively (first half of progress), then draw progressively (second half).
-	canvas:MountAsync(config.Parent, rows, if report then function(f)
-		report(f * 0.5)
-	end else nil)
-	ImageHelper.blitAsync(canvas, decoded, { Scale = scale, SkipTransparent = config.SkipTransparent }, rows, function()
-		task.wait()
-	end, if report then function(f)
-		report(0.5 + f * 0.5)
-	end else nil)
+	-- Mount progressively (first half of progress), then draw progressively (second half) - both
+	-- pace off the same time budget so the whole load stays under it.
+	canvas:MountAsync(config.Parent, {
+		FrameBudget = config.FrameBudget,
+		RowsPerFrame = config.RowsPerFrame,
+		OnProgress = if report then function(f)
+			report(f * 0.5)
+		end else nil,
+	})
+
+	local budget: number?
+	if config.FrameBudget == false then
+		budget = nil
+	elseif config.FrameBudget ~= nil then
+		budget = config.FrameBudget :: number
+	else
+		budget = ConfigModule.Config.LoadFrameBudget
+	end
+	local pace = ImageHelper.newPacer({
+		Budget = budget,
+		RowsPerYield = config.RowsPerFrame or ConfigModule.Config.LoadRowsPerFrame,
+		Yield = task.wait,
+		OnProgress = if report then function(f)
+			report(0.5 + f * 0.5)
+		end else nil,
+		BeforeYield = function()
+			canvas:Render()
+		end,
+	})
+	ImageHelper.blitAsync(canvas, decoded, { Scale = scale, SkipTransparent = config.SkipTransparent }, pace)
+
+	if config.OnComplete then
+		config.OnComplete()
+	end
 
 	return canvas
 end

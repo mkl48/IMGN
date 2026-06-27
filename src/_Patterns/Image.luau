@@ -8,12 +8,9 @@
 -- copies the decoded RGBA8 buffer onto a Canvas (osgl's DynamicImage buffer is the same
 -- 4-bytes-per-pixel layout IMGN uses, so it's a straight per-pixel copy).
 --
--- Placement: pass `Scale` + `X`/`Y`, or a `Fit` mode ("Contain"/"Cover"/"Stretch") to size the
--- image against the canvas. `blitAsync` does the same copy but yields every N rows so a big image
--- doesn't freeze the frame - see Canvas:LoadImageAsync.
---
--- Bytes come from you: HttpService:GetAsync(url) returns the file as a string, or bake the file
--- into a ModuleScript (scripts/embed-image.luau) - either a `string` or a `buffer` works.
+-- Placement: `Scale` + `X`/`Y`, or a `Fit` mode ("Contain"/"Cover"/"Stretch") with optional
+-- `Align`. `blitAsync` does the copy through a Pacer that yields on a time budget so a big image
+-- loads without dropping frames; `fromPixels` lets web-service JSON reuse the same path.
 
 local Decoder = require(script.Parent.Parent._Packages.Image)
 
@@ -29,11 +26,63 @@ export type LoadOptions = {
 	Y: number?, -- destination top-left y (default 0; ignored when Fit is set)
 	Scale: number?, -- nearest-neighbour scale (default 1; <1 shrinks, >1 enlarges)
 	Fit: (boolean | "Contain" | "Cover" | "Stretch")?, -- size to the canvas instead of Scale (true = "Contain")
+	Align: string?, -- placement for Contain/Cover: Center (default), Top, Bottom, Left, Right, TopLeft, ...
 	Format: ("PNG" | "BMP" | "TGA" | "JPG")?, -- skip format auto-detection
 	SkipTransparent: boolean?, -- don't write fully-transparent source pixels (composite instead of replace)
 }
 
+export type PacerOptions = {
+	Budget: number?, -- seconds of work per frame before yielding (time-based; preferred)
+	RowsPerYield: number?, -- fallback when Budget is nil: yield every N units
+	Yield: () -> (), -- how to give up the frame (e.g. task.wait)
+	OnProgress: ((number) -> ())?, -- 0..1, called at each yield
+	BeforeYield: (() -> ())?, -- run just before yielding (e.g. canvas:Render)
+}
+
+-- Pacer: call the returned function once per unit of work (a row); it yields when the per-frame
+-- time Budget is spent (or every RowsPerYield units if no Budget), keeping the frame responsive.
+type Pacer = (progress: number) -> ()
+
 type Placement = { scaleX: number, scaleY: number, ox: number, oy: number, destW: number, destH: number }
+
+local ALIGN: { [string]: { number } } = {
+	Center = { 0.5, 0.5 },
+	Top = { 0.5, 0 },
+	Bottom = { 0.5, 1 },
+	Left = { 0, 0.5 },
+	Right = { 1, 0.5 },
+	TopLeft = { 0, 0 },
+	TopRight = { 1, 0 },
+	BottomLeft = { 0, 1 },
+	BottomRight = { 1, 1 },
+}
+
+--[=[
+	@within Image
+	Builds a [PacerOptions]-driven pacer. Call it once per row; it yields on the time budget.
+]=]
+function Image.newPacer(opts: PacerOptions): Pacer
+	local budget = opts.Budget
+	local step = math.max(1, opts.RowsPerYield or 8)
+	local frameStart = os.clock()
+	local since = 0
+
+	return function(progress: number)
+		since += 1
+		local doYield = if budget then (os.clock() - frameStart) >= budget else since >= step
+		if doYield then
+			if opts.BeforeYield then
+				opts.BeforeYield()
+			end
+			if opts.OnProgress then
+				opts.OnProgress(progress)
+			end
+			opts.Yield()
+			frameStart = os.clock()
+			since = 0
+		end
+	end
+end
 
 -- Decode `bytes` (string|buffer) with the bundled decoder into a DynamicImage.
 function Image.decode(bytes: string | buffer, format: string?): any
@@ -59,14 +108,13 @@ end
 	@within Image
 	Wraps a decoded pixel table (from a web service / JSONDecode) as something [Image.blit] can
 	draw. Accepts `{ width, height, pixels = { { {r,g,b[,a]}, ... } } }` (a 2D grid) or the compact
-	`{ width, height, rows = { { {count,r,g,b,a}, ... } } }` (per-row run-length runs). Returns an
-	object with `width`, `height` and `ReadPixelRGBA`, matching the decoder's image shape.
+	`{ width, height, rows = { { {count,r,g,b,a}, ... } } }` (per-row run-length runs).
 ]=]
 function Image.fromPixels(data: any): any
 	local w, h = data.width, data.height
 	assert(w and h, "IMGN: pixel data needs width and height")
 
-	local grid -- grid[y][x] = {r,g,b,a?}
+	local grid
 	if data.pixels then
 		grid = data.pixels
 	elseif data.rows then
@@ -75,8 +123,7 @@ function Image.fromPixels(data: any): any
 			local row = {}
 			local x = 0
 			for _, run in ipairs(runs) do
-				local count = run[1]
-				for _ = 1, count do
+				for _ = 1, run[1] do
 					x += 1
 					row[x] = { run[2], run[3], run[4], run[5] }
 				end
@@ -111,12 +158,12 @@ local function resolvePlacement(canvas: any, img: any, opts: LoadOptions): Place
 		if mode == "Stretch" then
 			scaleX, scaleY = cw / iw, ch / ih
 		else
-			-- Contain fits inside (letterbox); Cover fills and crops.
 			local s = if mode == "Cover" then math.max(cw / iw, ch / ih) else math.min(cw / iw, ch / ih)
 			scaleX, scaleY = s, s
 		end
-		ox = math.floor((cw - iw * scaleX) / 2 + 0.5)
-		oy = math.floor((ch - ih * scaleY) / 2 + 0.5)
+		local a = ALIGN[opts.Align or "Center"] or ALIGN.Center
+		ox = math.floor((cw - iw * scaleX) * a[1] + 0.5)
+		oy = math.floor((ch - ih * scaleY) * a[2] + 0.5)
 	else
 		local s = opts.Scale or 1
 		assert(s > 0, "IMGN: image Scale must be > 0")
@@ -151,7 +198,7 @@ end
 
 --[=[
 	@within Image
-	Copies a decoded DynamicImage onto `canvas` per the options. Returns drawn width/height.
+	Copies a decoded image onto `canvas` per the options. Returns drawn width/height.
 ]=]
 function Image.blit(canvas: any, img: any, options: LoadOptions?): (number, number)
 	local opts = options or {}
@@ -162,36 +209,18 @@ end
 
 --[=[
 	@within Image
-	Same as `blit`, but copies `rowsPerYield` destination rows at a time, calling `yield()` (and
-	flushing the canvas) between bands so a large image spreads across frames. Reports
-	`onProgress(fraction)` per band. Must run on a thread that can yield.
+	Like `blit`, but draws one row at a time and calls `pace((rowsDone)/total)` after each, so the
+	pacer can yield on its time budget - the image fills in without dropping frames. Must run on a
+	yielding thread. Returns drawn width/height.
 ]=]
-function Image.blitAsync(
-	canvas: any,
-	img: any,
-	options: LoadOptions?,
-	rowsPerYield: number,
-	yield: () -> (),
-	onProgress: ((number) -> ())?
-): (number, number)
+function Image.blitAsync(canvas: any, img: any, options: LoadOptions?, pace: Pacer): (number, number)
 	local opts = options or {}
 	local p = resolvePlacement(canvas, img, opts)
-	local step = math.max(1, rowsPerYield)
-
-	local y = 0
-	while y < p.destH do
-		local toY = math.min(y + step - 1, p.destH - 1)
-		blitRows(canvas, img, p, opts.SkipTransparent, y, toY)
-		canvas:Render()
-		if onProgress then
-			onProgress((toY + 1) / p.destH)
-		end
-		y = toY + 1
-		if y < p.destH then
-			yield()
-		end
+	for dy = 0, p.destH - 1 do
+		blitRows(canvas, img, p, opts.SkipTransparent, dy, dy)
+		pace((dy + 1) / p.destH)
 	end
-
+	canvas:Render()
 	return p.destW, p.destH
 end
 

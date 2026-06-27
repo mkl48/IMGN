@@ -102,17 +102,11 @@ end
 
 --[=[
 	@within PixelGrid
-	Like [PixelGrid.Mount], but creates the grid `rowsPerYield` rows at a time, calling `yield`
-	between batches so building thousands of Frames spreads across frames instead of hitching one.
-	`onProgress(fraction)` is reported per batch. Must run on a yielding thread.
+	Like [PixelGrid.Mount], but builds one row of Frames at a time and calls `pace((rowsDone)/total)`
+	after each, so the pacer can yield on its time budget - thousands of Frames spread across frames
+	instead of hitching one. Must run on a yielding thread.
 ]=]
-function PixelGrid.MountAsync(
-	self: PixelGrid,
-	parent: Instance,
-	rowsPerYield: number,
-	yield: () -> (),
-	onProgress: ((number) -> ())?
-): Frame
+function PixelGrid.MountAsync(self: PixelGrid, parent: Instance, pace: (number) -> ()): Frame
 	local height = self._height
 	local sx, sy = 1 / self._width, 1 / height
 
@@ -125,20 +119,9 @@ function PixelGrid.MountAsync(
 	container.Parent = parent
 	self._container = container
 
-	local step = math.max(1, rowsPerYield)
-	local y = 0
-	while y < height do
-		local toY = math.min(y + step - 1, height - 1)
-		for row = y, toY do
-			buildRow(self, container, sx, sy, row)
-		end
-		if onProgress then
-			onProgress((toY + 1) / height)
-		end
-		y = toY + 1
-		if y < height then
-			yield()
-		end
+	for y = 0, height - 1 do
+		buildRow(self, container, sx, sy, y)
+		pace((y + 1) / height)
 	end
 
 	return container

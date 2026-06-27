@@ -17,6 +17,8 @@ export type Config = {
 	MaxPixels: number,
 	WarnOnLargeCanvas: boolean,
 	AutoRender: boolean,
+	LoadFrameBudget: number,
+	LoadRowsPerFrame: number,
 }
 
 local Config: Config = {
@@ -51,6 +53,22 @@ local Config: Config = {
 		`:Render()` by hand. Leave `false` to batch many edits and flush once explicitly.
 	]=]
 	AutoRender = false,
+	--[=[
+		@within Config
+		@prop LoadFrameBudget number
+		Default `0.004` (4ms). The per-frame time budget the async loaders (`ImageCanvasAsync`,
+		`LoadImageAsync`, `MountAsync`) spend building/drawing before yielding the frame. Lower =
+		smoother but slower to finish; higher = faster but choppier. Pass `FrameBudget` per-call to
+		override, or `FrameBudget = false` to fall back to `LoadRowsPerFrame`.
+	]=]
+	LoadFrameBudget = 0.004,
+	--[=[
+		@within Config
+		@prop LoadRowsPerFrame number
+		Default `8`. Rows built/drawn per yield when no time budget is in effect (`FrameBudget`
+		nil/false). The time budget is usually the better knob; this is the fixed-count fallback.
+	]=]
+	LoadRowsPerFrame = 8,
 }
 
 --[=[
