@@ -15,12 +15,17 @@
 ]=]
 
 local Canvas = require(script._Classes.Canvas)
+local AppClass = require(script._Classes.App)
 local ConfigModule = require(script._Core.Config)
 
 local IMGN = {}
 
 export type Canvas = Canvas.Canvas
 export type CanvasConfig = Canvas.CanvasConfig
+export type App = AppClass.App
+export type AppConfig = AppClass.AppConfig
+export type Object = AppClass.Object
+export type ObjectConfig = AppClass.ObjectConfig
 export type Config = ConfigModule.Config
 
 --[=[
@@ -40,6 +45,15 @@ end
 ]=]
 function IMGN.new(config: CanvasConfig): Canvas
 	return Canvas.new(config)
+end
+
+--[=[
+	@within IMGN
+	Creates an [App] (see [AppConfig]) - the managed layer with Objects, collisions and a step/draw
+	loop. Pass an existing `Canvas` (e.g. from [IMGN.Surface]) or `Resolution`/`Parent` to build one.
+]=]
+function IMGN.App(config: AppConfig): App
+	return AppClass.new(config)
 end
 
 --[=[

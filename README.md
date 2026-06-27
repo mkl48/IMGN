@@ -108,6 +108,54 @@ A driver turns the pixel buffer into instances. Pick per canvas via `Driver`:
 - **`PixelGrid`** *(default)* — one `Frame` per pixel, dirty-tracked. A brush stroke updates only the Frames under it. Best for **live drawing** and frequently-changing content.
 - **`RowMerge`** — run-length-merges each row into wide Frames; fully-transparent runs cost nothing. Far fewer instances. Best for **flat-colour sprites and static art**. A flush rebuilds whole dirty rows, so it's less suited to noisy every-pixel churn.
 
+## The App layer
+
+`Canvas` is the raw image. **`App`** is the managed engine on top of it: it owns a canvas, a list of **`Object`s** (each a *union of shapes* with collision presets), and a per-frame loop that steps physics, resolves collisions, and redraws only what moved. The whole bouncing-ball script becomes "spawn an Object, `app:Start()`".
+
+```lua
+local app = IMGN.App({
+    Canvas = IMGN.Surface(part, Enum.NormalId.Front, { Resolution = Vector2.new(96, 96) }),
+    Background = Color3.fromRGB(12, 12, 20),  -- what Objects erase back to each frame
+})
+
+-- An immovable wall (preset "Wall" = anchored + collidable).
+app:Object({ Position = Vector2.new(48, 48), Preset = "Wall" })
+   :Rect(Vector2.new(-3, -22), Vector2.new(6, 44), Color3.fromRGB(90, 90, 120))
+
+-- A bouncing ball: shapes are offsets from the Object's Position, so it moves as one unit.
+app:Object({
+    Position = Vector2.new(20, 20),
+    Velocity = Vector2.new(40, 25),   -- pixels per second
+    Bounce = 1,
+}):Circle(Vector2.zero, 5, Color3.fromRGB(0, 170, 255))
+
+app:Start()   -- runs the step→collide→draw loop every frame
+```
+
+### Object
+
+An Object is a transform (`Position`, `Velocity`) carrying shapes that draw and collide as one AABB.
+
+- **Shapes** (chainable, offsets are relative to `Position`): `:Circle(offset, radius, color, filled?)`, `:Rect(offset, size, color, filled?)`, `:Pixel(offset, color)`.
+- **Presets** seed the flags: `"Dynamic"` (default, free body), `"Wall"`/`"Static"` (anchored solid), `"Ghost"` (moves, no collision). Override per-field with `CanCollide`, `Anchored`, `Bounce`, `Visible`.
+- **Collision** is automatic for `CanCollide` bodies — they bounce off the canvas edges *and* each other (anchored bodies are immovable). Or drive it yourself with `obj:Overlaps(other)` and `obj:TouchingEdge()` (these work even on Ghosts — handy for triggers/pickups).
+- **Hooks**: `OnUpdate(self, dt)` each frame before physics; `OnCollide(self, other)` where `other` is another Object or an edge name (`"Left"`/`"Right"`/`"Top"`/`"Bottom"`).
+
+### Comb
+
+`app:Comb(axis, direction, fn)` sweeps the canvas a line at a time — a **row** for `"Y"`, a **column** for `"X"`, both for `"XY"` — calling `fn(section)` per line. Great for wipes, scanlines and per-line effects:
+
+```lua
+app:Comb("Y", "Forward", function(section)
+    section:Fill(Color3.fromHSV(section.Index / 64, 1, 1))  -- vertical rainbow
+end)
+app.Canvas:Render()
+```
+
+A `section` is a 1-D view: `section.Index` (the row's y / column's x), `section.Length`, and `:Set(i, color)` / `:Get(i)` / `:Fill(color)`.
+
+> **App backgrounds are solid.** Objects erase to `Background` each frame, so a static *image* backdrop behind moving objects isn't supported in 0.1.0 (a moving body would erase holes in it). Use a solid `Background`, or draw non-moving scenery as anchored Objects.
+
 ## Global config
 
 ```lua
@@ -152,6 +200,8 @@ rojo serve  place.project.json                       # live-sync via the Rojo St
 See [`examples/`](examples):
 
 - **Showcase** — self-contained animated plasma surface; what the dev place runs.
+- **AppBounce** — the App engine: 5 balls bouncing off the walls and each other around a center wall.
+- **CombWipe** — `App:Comb` painting a scrolling rainbow one row at a time.
 
 - **GradientSurface** — procedural gradient on a part via `:Shader`.
 - **PaintCanvas** — click-drag finger paint on a `ScreenGui` with `AutoRender`.

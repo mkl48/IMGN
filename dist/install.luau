@@ -54,12 +54,17 @@ local _1 = mod("IMGN", RS, [[
 ]=]
 
 local Canvas = require(script._Classes.Canvas)
+local AppClass = require(script._Classes.App)
 local ConfigModule = require(script._Core.Config)
 
 local IMGN = {}
 
 export type Canvas = Canvas.Canvas
 export type CanvasConfig = Canvas.CanvasConfig
+export type App = AppClass.App
+export type AppConfig = AppClass.AppConfig
+export type Object = AppClass.Object
+export type ObjectConfig = AppClass.ObjectConfig
 export type Config = ConfigModule.Config
 
 --[=[
@@ -79,6 +84,15 @@ end
 ]=]
 function IMGN.new(config: CanvasConfig): Canvas
 	return Canvas.new(config)
+end
+
+--[=[
+	@within IMGN
+	Creates an [App] (see [AppConfig]) - the managed layer with Objects, collisions and a step/draw
+	loop. Pass an existing `Canvas` (e.g. from [IMGN.Surface]) or `Resolution`/`Parent` to build one.
+]=]
+function IMGN.App(config: AppConfig): App
+	return AppClass.new(config)
 end
 
 --[=[
@@ -126,7 +140,807 @@ end
 return IMGN
 ]])
 local _2 = folder("_Classes", _1)
-local _3 = mod("Canvas", _2, [[
+local _3 = mod("App", _2, [[
+-- IMGN
+-- _Classes/App/init.luau
+-- Plinko Labs
+--
+-- The managed layer over a Canvas: an App owns a canvas, a list of Objects, and a per-frame loop
+-- that steps physics, resolves collisions, and redraws - so building something like the bouncing
+-- ball is "spawn an Object, app:Start()" instead of writing the loop yourself. It draws
+-- efficiently: each frame it erases only last frame's object footprints (back to Background) and
+-- redraws the objects, so a flush touches the moving pixels, not the whole canvas.
+--
+-- The canvas is yours to draw on directly too (app.Canvas) - but anything you draw that ISN'T an
+-- Object won't be re-erased, so a static backdrop drawn once stays put behind the objects, as
+-- long as it matches Background where objects pass over it.
+
+local RunService = game:GetService("RunService")
+
+local Canvas = require(script.Parent.Canvas)
+local Object = require(script.Object)
+local Section = require(script.Section)
+local Collision = require(script.Collision)
+
+--[=[
+	@class App
+	A canvas application: an owned [Canvas] plus managed [Object]s and a step/draw loop. Create one
+	with [IMGN.App], spawn Objects with [App:Object], then [App:Start]. `Canvas` (the underlying
+	canvas) and `Objects` are readable fields; `OnUpdate` is an optional per-frame hook.
+]=]
+local App = {}
+App.__index = App
+
+export type Object = Object.Object
+export type ObjectConfig = Object.ObjectConfig
+export type Section = Section.Section
+
+--[=[
+	@interface AppConfig
+	@within App
+	.Canvas Canvas? -- an existing Canvas to drive (e.g. from IMGN.Surface); else one is built from the fields below
+	.Resolution Vector2? -- canvas size when building one (required if no Canvas given)
+	.Parent Instance? -- GUI container to mount the built canvas into
+	.Driver ("PixelGrid" | "RowMerge")? -- renderer for the built canvas
+	.Background (Color3 | false)? -- fill colour objects erase back to; `false` = erase to transparent, no initial fill (default black)
+	.Clock ("Heartbeat" | "RenderStepped" | "Stepped")? -- which RunService signal drives the loop (default "Heartbeat")
+	.OnUpdate (self, dt) -> ()? -- per-frame hook, after physics + collisions, before draw
+]=]
+export type AppConfig = {
+	Canvas: Canvas.Canvas?,
+	Resolution: Vector2?,
+	Parent: Instance?,
+	Driver: any?,
+	Background: (Color3 | false)?,
+	Clock: ("Heartbeat" | "RenderStepped" | "Stepped")?,
+	OnUpdate: ((self: any, dt: number) -> ())?,
+}
+
+export type App = typeof(setmetatable(
+	{} :: {
+		Canvas: Canvas.Canvas,
+		Width: number,
+		Height: number,
+		Objects: { Object.Object },
+		Background: Color3 | false,
+		OnUpdate: ((self: any, dt: number) -> ())?,
+		_clock: string,
+		_conn: RBXScriptConnection?,
+		_running: boolean,
+	},
+	App
+))
+
+--[=[
+	@within App
+	Builds an App. Pass `Canvas` to drive an existing canvas (e.g. from [IMGN.Surface]); otherwise
+	a canvas is built from `Resolution`/`Parent`/`Driver`.
+]=]
+function App.new(config: AppConfig): App
+	local canvas = config.Canvas
+	if not canvas then
+		assert(config.Resolution, "IMGN.App: pass either a Canvas or a Resolution to build one")
+		canvas = Canvas.new({
+			Resolution = config.Resolution,
+			Parent = config.Parent,
+			Driver = config.Driver,
+		})
+	end
+
+	local background: Color3 | false = if config.Background == nil then Color3.new(0, 0, 0) else config.Background
+
+	return setmetatable({
+		Canvas = canvas,
+		Width = canvas.Width,
+		Height = canvas.Height,
+		Objects = {},
+		Background = background,
+		OnUpdate = config.OnUpdate,
+		_clock = config.Clock or "Heartbeat",
+		_conn = nil,
+		_running = false,
+	}, App)
+end
+
+--[=[
+	@within App
+	Spawns an [Object] (see [ObjectConfig]) into the App and returns it. Add shapes to it with
+	`obj:Circle/:Rect/:Pixel`.
+]=]
+function App.Object(self: App, config: Object.ObjectConfig?): Object.Object
+	local object = Object.new(self, config or {})
+	table.insert(self.Objects, object)
+	return object
+end
+
+--[=[
+	@within App
+	Removes `object` from the App and clears its last footprint on the next frame.
+]=]
+function App.Remove(self: App, object: Object.Object)
+	local index = table.find(self.Objects, object)
+	if index then
+		table.remove(self.Objects, index)
+		-- Erase its footprint now so it doesn't linger when the loop is stopped.
+		if object._lastBounds then
+			App._erase(self, object._lastBounds)
+			object._lastBounds = nil
+		end
+	end
+end
+
+--[=[
+	@within App
+	Finds the first Object with `Name`, or `nil`.
+]=]
+function App.Find(self: App, name: string): Object.Object?
+	for _, object in self.Objects do
+		if object.Name == name then
+			return object
+		end
+	end
+	return nil
+end
+
+--[=[
+	@within App
+	Sweeps the canvas across `axis` (`"X"` columns, `"Y"` rows, `"XY"` = a Y pass then an X pass),
+	in `direction` (`"Forward"` 0..n-1 or `"Backward"` n-1..0), calling `fn(section)` once per
+	line - see [Section]. Marks pixels dirty but does not flush; the App's loop (or your
+	`app.Canvas:Render()`) shows the result. Great for wipes, scanlines and per-line effects.
+]=]
+function App.Comb(
+	self: App,
+	axis: "X" | "Y" | "XY",
+	direction: "Forward" | "Backward",
+	fn: (section: Section.Section) -> ()
+)
+	local function sweep(orientation: "Row" | "Column")
+		local count = if orientation == "Row" then self.Height else self.Width
+		if direction == "Forward" then
+			for index = 0, count - 1 do
+				fn(Section.new(self.Canvas, orientation, index))
+			end
+		else
+			for index = count - 1, 0, -1 do
+				fn(Section.new(self.Canvas, orientation, index))
+			end
+		end
+	end
+
+	if axis == "Y" or axis == "XY" then
+		sweep("Row")
+	end
+	if axis == "X" or axis == "XY" then
+		sweep("Column")
+	end
+end
+
+--[=[
+	@within App
+	Fills the whole canvas with the App's Background (or `color` if given) - a clean slate.
+]=]
+function App.Clear(self: App, color: Color3?)
+	local fill = color or (if self.Background then self.Background else Color3.new(0, 0, 0))
+	local alpha = if color or self.Background then 1 else 0
+	self.Canvas:Fill(fill, alpha)
+end
+
+-- Erase a footprint back to the App's Background (or transparent when Background is false).
+function App._erase(self: App, bounds: Object.AABB)
+	local color = if self.Background then self.Background else Color3.new(0, 0, 0)
+	local alpha = if self.Background then 1 else 0
+	local w = bounds.maxX - bounds.minX + 1
+	local h = bounds.maxY - bounds.minY + 1
+	self.Canvas:DrawRect(bounds.minX, bounds.minY, w, h, color, true, alpha)
+end
+
+function App._draw(self: App)
+	-- Erase last frame's footprints first, then draw everyone, so overlapping objects redraw
+	-- cleanly regardless of order.
+	for _, object in self.Objects do
+		if object._lastBounds then
+			App._erase(self, object._lastBounds)
+			object._lastBounds = nil
+		end
+	end
+	for _, object in self.Objects do
+		if object.Visible then
+			object._lastBounds = object:Draw(self.Canvas)
+		end
+	end
+	self.Canvas:Render()
+end
+
+function App._step(self: App, dt: number)
+	-- 1. per-object update hook + velocity integration (px/sec).
+	for _, object in self.Objects do
+		if object.OnUpdate then
+			object.OnUpdate(object, dt)
+		end
+		if not object.Anchored then
+			object.Position += object.Velocity * dt
+		end
+	end
+
+	-- 2. walls, then 3. object-object.
+	for _, object in self.Objects do
+		if object.CanCollide and not object.Anchored then
+			Collision.resolveWalls(object, self.Width, self.Height)
+		end
+	end
+	Collision.resolvePairs(self.Objects)
+
+	-- 4. app-level hook, then 5. draw.
+	if self.OnUpdate then
+		self.OnUpdate(self, dt)
+	end
+	App._draw(self)
+end
+
+--[=[
+	@within App
+	Fills the Background once, then starts the per-frame loop (step physics -> resolve collisions
+	-> redraw). Idempotent while running.
+]=]
+function App.Start(self: App)
+	if self._running then
+		return
+	end
+	self._running = true
+
+	if self.Background then
+		self.Canvas:Fill(self.Background, 1)
+		self.Canvas:Render()
+	end
+
+	local signal = (RunService :: any)[self._clock] :: RBXScriptSignal
+	self._conn = signal:Connect(function(dt: number)
+		App._step(self, dt)
+	end)
+end
+
+--[=[
+	@within App
+	Stops the loop. Objects and their drawn pixels are left as-is; call [App:Start] to resume.
+]=]
+function App.Stop(self: App)
+	if self._conn then
+		self._conn:Disconnect()
+		self._conn = nil
+	end
+	self._running = false
+end
+
+--[=[
+	@within App
+	Stops the loop and destroys the underlying Canvas. The App is unusable afterwards.
+]=]
+function App.Destroy(self: App)
+	App.Stop(self)
+	self.Canvas:Destroy()
+	self.Objects = {}
+end
+
+return App
+]])
+mod("Collision", _3, [[
+-- IMGN
+-- _Classes/App/Collision.luau
+-- Plinko Labs
+--
+-- AABB collision resolution for the App's CanCollide Objects. Two layers: walls (an Object that
+-- would leave the canvas is pushed back inside and its velocity flipped along that axis, scaled
+-- by Bounce) and pairs (two overlapping Objects are separated along their axis of least
+-- penetration, and - for two dynamic bodies - swap that axis' velocity, the equal-mass elastic
+-- result; against an Anchored body the mover just reflects). It's intentionally AABB-only: cheap,
+-- predictable, and enough for the games this layer is for. Each resolution fires OnCollide.
+
+local Collision = {}
+
+type AABB = { minX: number, minY: number, maxX: number, maxY: number }
+
+local function fire(object: any, other: any)
+	if object.OnCollide then
+		object.OnCollide(object, other)
+	end
+end
+
+--[=[
+	@class Collision
+	@within App
+	Internal AABB resolver the App's step loop drives; not part of the public surface.
+]=]
+
+--[=[
+	@within Collision
+	Pushes `object` back inside a `width` x `height` canvas if its AABB crossed an edge, flipping
+	the matching velocity component by `-Bounce` and firing OnCollide with the edge name.
+]=]
+function Collision.resolveWalls(object: any, width: number, height: number)
+	local b = object:Bounds()
+	if not b then
+		return
+	end
+
+	local vx, vy = object.Velocity.X, object.Velocity.Y
+	local px, py = object.Position.X, object.Position.Y
+	local bounce = object.Bounce
+
+	if b.minX < 0 then
+		px += -b.minX
+		vx = math.abs(vx) * bounce
+		fire(object, "Left")
+	elseif b.maxX > width - 1 then
+		px -= b.maxX - (width - 1)
+		vx = -math.abs(vx) * bounce
+		fire(object, "Right")
+	end
+
+	if b.minY < 0 then
+		py += -b.minY
+		vy = math.abs(vy) * bounce
+		fire(object, "Top")
+	elseif b.maxY > height - 1 then
+		py -= b.maxY - (height - 1)
+		vy = -math.abs(vy) * bounce
+		fire(object, "Bottom")
+	end
+
+	object.Position = Vector2.new(px, py)
+	object.Velocity = Vector2.new(vx, vy)
+end
+
+local function overlaps(a: AABB, b: AABB): boolean
+	return not (a.maxX < b.minX or a.minX > b.maxX or a.maxY < b.minY or a.minY > b.maxY)
+end
+
+-- Shift an Object's Position by (dx, dy) unless it's anchored.
+local function shift(object: any, dx: number, dy: number)
+	if object.Anchored then
+		return
+	end
+	object.Position += Vector2.new(dx, dy)
+end
+
+local function resolvePair(a: any, b: any)
+	local ab, bb = a:Bounds(), b:Bounds()
+	if not ab or not bb or not overlaps(ab, bb) then
+		return
+	end
+
+	local overlapX = math.min(ab.maxX, bb.maxX) - math.max(ab.minX, bb.minX) + 1
+	local overlapY = math.min(ab.maxY, bb.maxY) - math.max(ab.minY, bb.minY) + 1
+	local aCenterX, bCenterX = (ab.minX + ab.maxX) / 2, (bb.minX + bb.maxX) / 2
+	local aCenterY, bCenterY = (ab.minY + ab.maxY) / 2, (bb.minY + bb.maxY) / 2
+	local bounce = (a.Bounce + b.Bounce) / 2
+
+	-- Separate along the axis of least penetration: that's the one they actually hit on.
+	if overlapX <= overlapY then
+		local aDir = if aCenterX < bCenterX then -1 else 1
+		if a.Anchored then
+			shift(b, -aDir * overlapX, 0)
+		elseif b.Anchored then
+			shift(a, aDir * overlapX, 0)
+		else
+			shift(a, aDir * overlapX / 2, 0)
+			shift(b, -aDir * overlapX / 2, 0)
+		end
+
+		if a.Anchored ~= b.Anchored then
+			-- One wall, one mover: the mover reflects off the X axis.
+			local mover = if a.Anchored then b else a
+			mover.Velocity = Vector2.new(-mover.Velocity.X * mover.Bounce, mover.Velocity.Y)
+		elseif not a.Anchored then
+			-- Two dynamic bodies swap their X velocity (equal-mass elastic), scaled by bounce.
+			local ax, bx = a.Velocity.X, b.Velocity.X
+			a.Velocity = Vector2.new(bx * bounce, a.Velocity.Y)
+			b.Velocity = Vector2.new(ax * bounce, b.Velocity.Y)
+		end
+	else
+		local aDir = if aCenterY < bCenterY then -1 else 1
+		if a.Anchored then
+			shift(b, 0, -aDir * overlapY)
+		elseif b.Anchored then
+			shift(a, 0, aDir * overlapY)
+		else
+			shift(a, 0, aDir * overlapY / 2)
+			shift(b, 0, -aDir * overlapY / 2)
+		end
+
+		if a.Anchored ~= b.Anchored then
+			local mover = if a.Anchored then b else a
+			mover.Velocity = Vector2.new(mover.Velocity.X, -mover.Velocity.Y * mover.Bounce)
+		elseif not a.Anchored then
+			local ay, by = a.Velocity.Y, b.Velocity.Y
+			a.Velocity = Vector2.new(a.Velocity.X, by * bounce)
+			b.Velocity = Vector2.new(b.Velocity.X, ay * bounce)
+		end
+	end
+
+	fire(a, b)
+	fire(b, a)
+end
+
+--[=[
+	@within Collision
+	Resolves every CanCollide pair in `objects` (skips pairs where both are anchored - two walls
+	never need separating). O(n^2); fine for the modest object counts this layer targets.
+]=]
+function Collision.resolvePairs(objects: { any })
+	for i = 1, #objects do
+		local a = objects[i]
+		if not a.CanCollide then
+			continue
+		end
+		for j = i + 1, #objects do
+			local b = objects[j]
+			if b.CanCollide and not (a.Anchored and b.Anchored) then
+				resolvePair(a, b)
+			end
+		end
+	end
+end
+
+return Collision
+]])
+mod("Object", _3, [[
+-- IMGN
+-- _Classes/App/Object.luau
+-- Plinko Labs
+--
+-- An Object is the thing you spawn into an App: a transform (Position + Velocity) carrying one
+-- or more shapes - circles, rects, pixels - that draw and collide as a single union. You never
+-- place the shapes in canvas space; you give them offsets relative to the Object's Position, and
+-- moving the Object moves the whole union. Presets ("Dynamic", "Wall", "Ghost") seed the
+-- behaviour flags (CanCollide, Anchored, Bounce, Visible) so the common cases are one word.
+--
+-- Collision uses the union's axis-aligned bounding box (AABB) - the App resolves walls and
+-- object-object overlaps off these. :Overlaps / :TouchingEdge expose the same tests for when you
+-- want to drive the response yourself instead of letting the engine bounce things.
+
+local PRESETS: { [string]: { CanCollide: boolean, Anchored: boolean, Bounce: number, Visible: boolean } } = {
+	-- A free-moving body that bounces off everything. The default.
+	Dynamic = { CanCollide = true, Anchored = false, Bounce = 1, Visible = true },
+	-- An immovable solid - other bodies bounce off it, it never moves. (Static is an alias.)
+	Wall = { CanCollide = true, Anchored = true, Bounce = 1, Visible = true },
+	Static = { CanCollide = true, Anchored = true, Bounce = 1, Visible = true },
+	-- Moves and draws but passes through everything (still answers :Overlaps).
+	Ghost = { CanCollide = false, Anchored = false, Bounce = 1, Visible = true },
+}
+
+type Shape = {
+	Kind: "Circle" | "Rect" | "Pixel",
+	OX: number,
+	OY: number,
+	W: number, -- radius for Circle, width for Rect (0 for Pixel)
+	H: number, -- height for Rect (0 otherwise)
+	Color: Color3,
+	Filled: boolean,
+	Alpha: number?,
+}
+
+export type AABB = { minX: number, minY: number, maxX: number, maxY: number }
+
+--[=[
+	@class Object
+	@within App
+	A union of shapes with a transform and collision presets. Created with [App:Object]; never
+	constructed directly. Read/write `Position`, `Velocity`, `CanCollide`, `Anchored`, `Bounce`,
+	`Visible` and `Name` as plain fields.
+]=]
+local Object = {}
+Object.__index = Object
+
+export type Object = typeof(setmetatable(
+	{} :: {
+		Name: string?,
+		Position: Vector2,
+		Velocity: Vector2,
+		CanCollide: boolean,
+		Anchored: boolean,
+		Bounce: number,
+		Visible: boolean,
+		OnUpdate: ((self: Object, dt: number) -> ())?,
+		OnCollide: ((self: Object, other: Object | string) -> ())?,
+		_app: any,
+		_shapes: { Shape },
+		_lastBounds: AABB?,
+	},
+	Object
+))
+
+--[=[
+	@interface ObjectConfig
+	@within Object
+	.Position Vector2? -- union anchor in canvas pixels (default canvas centre)
+	.Velocity Vector2? -- pixels per second (default zero)
+	.Preset ("Dynamic" | "Wall" | "Static" | "Ghost")? -- seeds the flags below (default "Dynamic")
+	.CanCollide boolean? -- participates in wall + object collisions
+	.Anchored boolean? -- immovable: ignores Velocity, never pushed
+	.Bounce number? -- restitution 0..1 applied on collision
+	.Visible boolean? -- drawn each frame
+	.Name string? -- optional id for App:Find
+	.OnUpdate (self, dt) -> ()? -- per-frame callback before physics integrates
+	.OnCollide (self, other) -> ()? -- fired on collision; `other` is an Object or an edge name
+]=]
+export type ObjectConfig = {
+	Position: Vector2?,
+	Velocity: Vector2?,
+	Preset: string?,
+	CanCollide: boolean?,
+	Anchored: boolean?,
+	Bounce: number?,
+	Visible: boolean?,
+	Name: string?,
+	OnUpdate: ((self: Object, dt: number) -> ())?,
+	OnCollide: ((self: Object, other: Object | string) -> ())?,
+}
+
+local function pick<T>(value: T?, fallback: T): T
+	if value == nil then
+		return fallback
+	end
+	return value
+end
+
+function Object.new(app: any, config: ObjectConfig): Object
+	local preset = PRESETS[config.Preset or "Dynamic"]
+	assert(preset, `IMGN App:Object: unknown Preset "{tostring(config.Preset)}"`)
+
+	return setmetatable({
+		Name = config.Name,
+		Position = config.Position or Vector2.new(app.Width / 2, app.Height / 2),
+		Velocity = config.Velocity or Vector2.zero,
+		CanCollide = pick(config.CanCollide, preset.CanCollide),
+		Anchored = pick(config.Anchored, preset.Anchored),
+		Bounce = pick(config.Bounce, preset.Bounce),
+		Visible = pick(config.Visible, preset.Visible),
+		OnUpdate = config.OnUpdate,
+		OnCollide = config.OnCollide,
+		_app = app,
+		_shapes = {},
+		_lastBounds = nil,
+	}, Object)
+end
+
+--[=[
+	@within Object
+	Adds a circle of `radius` at `offset` (relative to Position) to the union. Chainable.
+]=]
+function Object.Circle(self: Object, offset: Vector2, radius: number, color: Color3, filled: boolean?, alpha: number?): Object
+	table.insert(self._shapes, {
+		Kind = "Circle",
+		OX = offset.X,
+		OY = offset.Y,
+		W = radius,
+		H = radius,
+		Color = color,
+		Filled = pick(filled, true),
+		Alpha = alpha,
+	})
+	return self
+end
+
+--[=[
+	@within Object
+	Adds a `size`-wide rectangle with its top-left at `offset` (relative to Position). Chainable.
+]=]
+function Object.Rect(self: Object, offset: Vector2, size: Vector2, color: Color3, filled: boolean?, alpha: number?): Object
+	table.insert(self._shapes, {
+		Kind = "Rect",
+		OX = offset.X,
+		OY = offset.Y,
+		W = size.X,
+		H = size.Y,
+		Color = color,
+		Filled = pick(filled, true),
+		Alpha = alpha,
+	})
+	return self
+end
+
+--[=[
+	@within Object
+	Adds a single pixel at `offset` (relative to Position) to the union. Chainable.
+]=]
+function Object.Pixel(self: Object, offset: Vector2, color: Color3, alpha: number?): Object
+	table.insert(self._shapes, {
+		Kind = "Pixel",
+		OX = offset.X,
+		OY = offset.Y,
+		W = 0,
+		H = 0,
+		Color = color,
+		Filled = true,
+		Alpha = alpha,
+	})
+	return self
+end
+
+-- Integer AABB of the union in canvas space, snapped to the Position the Object will actually
+-- draw at this frame (so erase rectangles cover exactly what was drawn).
+local function computeBounds(self: Object): AABB?
+	if #self._shapes == 0 then
+		return nil
+	end
+
+	local px = math.round(self.Position.X)
+	local py = math.round(self.Position.Y)
+	local minX, minY = math.huge, math.huge
+	local maxX, maxY = -math.huge, -math.huge
+
+	for _, shape in self._shapes do
+		local ox = math.round(shape.OX)
+		local oy = math.round(shape.OY)
+		local sMinX, sMinY, sMaxX, sMaxY
+		if shape.Kind == "Circle" then
+			local r = math.round(shape.W)
+			sMinX, sMinY, sMaxX, sMaxY = ox - r, oy - r, ox + r, oy + r
+		elseif shape.Kind == "Rect" then
+			sMinX, sMinY = ox, oy
+			sMaxX, sMaxY = ox + math.round(shape.W) - 1, oy + math.round(shape.H) - 1
+		else -- Pixel
+			sMinX, sMinY, sMaxX, sMaxY = ox, oy, ox, oy
+		end
+		minX = math.min(minX, sMinX)
+		minY = math.min(minY, sMinY)
+		maxX = math.max(maxX, sMaxX)
+		maxY = math.max(maxY, sMaxY)
+	end
+
+	return { minX = px + minX, minY = py + minY, maxX = px + maxX, maxY = py + maxY }
+end
+
+--[=[
+	@within Object
+	The union's axis-aligned bounding box in canvas pixels, or `nil` if it has no shapes yet.
+]=]
+function Object.Bounds(self: Object): AABB?
+	return computeBounds(self)
+end
+
+--[=[
+	@within Object
+	Draws every shape onto `canvas` at the current Position and returns the AABB it covered (used
+	by the App to erase last frame's footprint). Internal - the App calls this each frame.
+]=]
+function Object.Draw(self: Object, canvas: any): AABB?
+	local px = math.round(self.Position.X)
+	local py = math.round(self.Position.Y)
+	for _, shape in self._shapes do
+		local x = px + math.round(shape.OX)
+		local y = py + math.round(shape.OY)
+		if shape.Kind == "Circle" then
+			canvas:DrawCircle(x, y, math.round(shape.W), shape.Color, shape.Filled, shape.Alpha)
+		elseif shape.Kind == "Rect" then
+			canvas:DrawRect(x, y, math.round(shape.W), math.round(shape.H), shape.Color, shape.Filled, shape.Alpha)
+		else
+			canvas:SetPixel(x, y, shape.Color, shape.Alpha)
+		end
+	end
+	return computeBounds(self)
+end
+
+--[=[
+	@within Object
+	Whether this Object's AABB overlaps `other`'s. Works regardless of CanCollide, so you can use
+	it for triggers/pickups the engine shouldn't physically bounce.
+]=]
+function Object.Overlaps(self: Object, other: Object): boolean
+	local a, b = computeBounds(self), computeBounds(other)
+	if not a or not b then
+		return false
+	end
+	return not (a.maxX < b.minX or a.minX > b.maxX or a.maxY < b.minY or a.minY > b.maxY)
+end
+
+--[=[
+	@within Object
+	Which canvas edges the union is touching or past, as `{ Left, Right, Top, Bottom }` booleans.
+]=]
+function Object.TouchingEdge(self: Object): { Left: boolean, Right: boolean, Top: boolean, Bottom: boolean }
+	local b = computeBounds(self)
+	if not b then
+		return { Left = false, Right = false, Top = false, Bottom = false }
+	end
+	return {
+		Left = b.minX <= 0,
+		Right = b.maxX >= self._app.Width - 1,
+		Top = b.minY <= 0,
+		Bottom = b.maxY >= self._app.Height - 1,
+	}
+end
+
+--[=[
+	@within Object
+	Removes the Object from its App. It stops updating, and its last footprint is cleared on the
+	next frame.
+]=]
+function Object.Destroy(self: Object)
+	self._app:Remove(self)
+end
+
+return Object
+]])
+mod("Section", _3, [[
+-- IMGN
+-- _Classes/App/Section.luau
+-- Plinko Labs
+--
+-- One line of the canvas handed to an App:Comb callback: a row (when combing the Y axis) or a
+-- column (when combing X). You address it 1-dimensionally - `Set(i, color)` writes the i-th
+-- pixel along the line, `Fill` paints the whole line - and the Section maps that onto the right
+-- (x, y) without you tracking which axis you're on. Index is the line's fixed coordinate
+-- (the row's y, or the column's x); Length is how many pixels long it is.
+
+--[=[
+	@class Section
+	@within App
+	A row or column view passed to an [App:Comb] callback. `Orientation` is `"Row"` or `"Column"`;
+	`Index` is the fixed coordinate; `Length` is the pixel count along the line.
+]=]
+local Section = {}
+Section.__index = Section
+
+export type Section = typeof(setmetatable(
+	{} :: {
+		Orientation: "Row" | "Column",
+		Index: number,
+		Length: number,
+		_canvas: any,
+	},
+	Section
+))
+
+function Section.new(canvas: any, orientation: "Row" | "Column", index: number): Section
+	return setmetatable({
+		Orientation = orientation,
+		Index = index,
+		Length = if orientation == "Row" then canvas.Width else canvas.Height,
+		_canvas = canvas,
+	}, Section)
+end
+
+-- Map a 1-D position `i` along the line to its (x, y) on the canvas.
+local function coord(self: Section, i: number): (number, number)
+	if self.Orientation == "Row" then
+		return i, self.Index
+	end
+	return self.Index, i
+end
+
+--[=[
+	@within Section
+	Writes the `i`-th pixel along the line (0-based). Clipped if out of range.
+]=]
+function Section.Set(self: Section, i: number, color: Color3, alpha: number?)
+	local x, y = coord(self, i)
+	self._canvas:SetPixel(x, y, color, alpha)
+end
+
+--[=[
+	@within Section
+	Reads the `i`-th pixel along the line.
+]=]
+function Section.Get(self: Section, i: number): (Color3, number)
+	local x, y = coord(self, i)
+	return self._canvas:GetPixel(x, y)
+end
+
+--[=[
+	@within Section
+	Paints the whole line one colour.
+]=]
+function Section.Fill(self: Section, color: Color3, alpha: number?)
+	for i = 0, self.Length - 1 do
+		Section.Set(self, i, color, alpha)
+	end
+end
+
+return Section
+]])
+local _4 = mod("Canvas", _2, [[
 -- IMGN
 -- _Classes/Canvas/init.luau
 -- Plinko Labs
@@ -397,8 +1211,8 @@ end
 
 return Canvas
 ]])
-local _4 = folder("_Core", _1)
-mod("Config", _4, [[
+local _5 = folder("_Core", _1)
+mod("Config", _5, [[
 -- IMGN
 -- _Core/Config.luau
 -- Plinko Labs
@@ -471,7 +1285,7 @@ return {
 	configure = configure,
 }
 ]])
-mod("PixelBuffer", _4, [[
+mod("PixelBuffer", _5, [[
 -- IMGN
 -- _Core/PixelBuffer.luau
 -- Plinko Labs
@@ -579,7 +1393,7 @@ end
 
 return PixelBuffer
 ]])
-local _5 = mod("_Drivers", _1, [[
+local _6 = mod("_Drivers", _1, [[
 -- IMGN
 -- _Drivers/init.luau
 -- Plinko Labs
@@ -632,7 +1446,7 @@ end
 
 return Drivers
 ]])
-mod("PixelGrid", _5, [[
+mod("PixelGrid", _6, [[
 -- IMGN
 -- _Drivers/PixelGrid.luau
 -- Plinko Labs
@@ -785,7 +1599,7 @@ end
 
 return PixelGrid
 ]])
-mod("RowMerge", _5, [[
+mod("RowMerge", _6, [[
 -- IMGN
 -- _Drivers/RowMerge.luau
 -- Plinko Labs
@@ -969,8 +1783,8 @@ end
 
 return RowMerge
 ]])
-local _6 = folder("_Patterns", _1)
-mod("Draw", _6, [[
+local _7 = folder("_Patterns", _1)
+mod("Draw", _7, [[
 -- IMGN
 -- _Patterns/Draw.luau
 -- Plinko Labs
@@ -1105,5 +1919,5 @@ end
 return Draw
 ]])
 
-print("[IMGN] installed 8 modules under ReplicatedStorage.IMGN")
+print("[IMGN] installed 12 modules under ReplicatedStorage.IMGN")
 return true
