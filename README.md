@@ -211,7 +211,7 @@ IMGN.Blood.Splat(part, Enum.NormalId.Front, worldPos, 4)
 
 Proxies are welded to the hit part (blood follows it if it moves), reused when splats land within `ReuseRadius`, and the droplet shrinks + is destroyed. Tune via `IMGN.Blood.Configure { ProxySize = …, PixelsPerStud = …, Preset = "Blood", … }`.
 
-**Cross-surface dripping.** Fluid that reaches a proxy's bottom edge **sheds off as a new falling droplet** (throttled by `DripInterval`/`DripMin`), which lands lower down — so blood runs down a ramp, cascades proxy-to-proxy, drips off the end, and pools on the ground below. Floors/ceilings pool instead of shedding.
+**Cross-surface flow.** Blood reaching an edge **follows the geometry** like the real thing: it **wraps around a convex corner** onto the part's next face (top → front), or **flows onto a surface just below/past the edge** (a wall meeting the floor), and **only detaches into a falling droplet when there's genuinely nothing to travel down** (a true overhang). So it runs down a ramp, wraps over the end, continues down a wall, and finally drips into open space — cascading surface to surface. Tune the look-ahead with `WrapReach`. Floors/ceilings pool instead of shedding.
 
 **Filters.** `IMGN.Blood.Ignore(instance)` (and `Unignore`) keep droplets from landing on things — your own character, a UI/button, etc. Anything with `CanQuery = false` is skipped automatically.
 

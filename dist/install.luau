@@ -1158,8 +1158,10 @@ local SETTINGS = {
 	DropletLifetime = 6,
 	SplatAmount = 4,
 	FlipDrip = false, -- flip if drips run UP instead of down in your place (single global knob)
-	-- cross-surface dripping: fluid reaching a proxy's bottom edge falls off as a droplet
+	-- cross-surface dripping: fluid reaching an edge wraps onto / flows onto the next surface, and
+	-- only falls as a droplet when there's nothing to travel down
 	EdgeDrip = true,
+	WrapReach = 3, -- how far (studs) past an edge to look for a surface to continue on before dripping
 	DripInterval = 0.25, -- min seconds between drips off one proxy edge (throttle = perf)
 	DripMin = 1.2, -- bottom-edge fluid must exceed this to shed a drip
 	DripTake = 2.5, -- how much fluid each drip carries away
@@ -1211,6 +1213,24 @@ local function folder(name: string, ref: Folder?): Folder
 		ref.Parent = Workspace
 	end
 	return ref
+end
+
+-- raycast params that ignore our own blood (droplets, proxies) and the user's ignore list
+local function bloodRaycastParams(): RaycastParams
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local exclude = {}
+	if dropletFolder then
+		table.insert(exclude, dropletFolder)
+	end
+	if proxyFolder then
+		table.insert(exclude, proxyFolder)
+	end
+	for _, inst in SETTINGS.Ignore do
+		table.insert(exclude, inst)
+	end
+	params.FilterDescendantsInstances = exclude
+	return params
 end
 
 -- ============================ BloodProxy ============================
@@ -1393,12 +1413,37 @@ function BloodProxy.edgeDistanceScale(self: any, worldPos: Vector3): number
 	return tExit / self.SizeU -- studs -> scale (downhill is the up/U axis)
 end
 
--- shed a falling droplet off the edge at scale `(x, y)`, continuing the cascade below
+-- Blood reaching an edge: follow the geometry if it can (wrap around a corner / flow onto the
+-- next surface), and only fall as a droplet when there's genuinely nothing to travel down.
 function BloodProxy.shed(self: any, x: number, y: number, amount: number)
-	local pos = BloodProxy.worldOfScale(self, x, y)
+	local edge = BloodProxy.worldOfScale(self, x, y)
 	local downhill = -self.Up
-	local velocity = downhill * 6 + Vector3.new(0, -2, 0)
-	Blood.Emit(pos + self.Normal * 0.2, velocity, { Amount = math.max(2, amount) })
+
+	-- 1) wrap around a convex corner onto the SAME part's adjacent face (e.g. top -> front). The
+	-- face the blood exits toward is the one whose normal best matches downhill; only wrap if it's a
+	-- different, non-underside face (so we don't try to flow onto the bottom of something).
+	if self.HitPart then
+		local nid = Surface.faceFromNormal(self.HitPart, downhill)
+		local wrapN = self.HitPart.CFrame:VectorToWorldSpace(Vector3.fromNormalId(nid)).Unit
+		if wrapN:Dot(self.Normal) < 0.9 and wrapN:Dot(Vector3.new(0, -1, 0)) < 0.45 then
+			Blood.Splat(self.HitPart, edge + wrapN * 0.05, wrapN, amount)
+			return
+		end
+	end
+
+	-- 2) is there a surface just below/past the edge to continue on? (wall meets floor, ledge to a
+	-- step). Probe straight down, then along the downhill direction.
+	local params = bloodRaycastParams()
+	local start = edge + self.Normal * 0.05
+	local hit = Workspace:Raycast(start + downhill * 0.1, Vector3.new(0, -SETTINGS.WrapReach, 0), params)
+		or Workspace:Raycast(start, downhill * SETTINGS.WrapReach, params)
+	if hit and hit.Instance then
+		Blood.Splat(hit.Instance, hit.Position, hit.Normal, amount)
+		return
+	end
+
+	-- 3) nothing to travel down -> a real hanging drip that detaches and falls
+	Blood.Emit(edge + self.Normal * 0.2, downhill * 4 + Vector3.new(0, -3, 0), { Amount = math.max(2, amount) })
 end
 
 -- (Pixel renderer) shed off the bottom edge if enough fluid pooled there (throttled)
@@ -1503,15 +1548,8 @@ function Blood.Emit(origin: Vector3, velocity: Vector3, options: { Amount: numbe
 	drop.Parent = dropletFolder
 	drop.AssemblyLinearVelocity = velocity
 
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	-- never land on our own droplets/proxies, or anything the user told us to ignore (their
-	-- character, the kill button, …)
-	local exclude = { dropletFolder, proxyFolder }
-	for _, inst in SETTINGS.Ignore do
-		table.insert(exclude, inst)
-	end
-	params.FilterDescendantsInstances = exclude
+	-- never land on our own droplets/proxies, or anything the user told us to ignore
+	local params = bloodRaycastParams()
 
 	local last = origin
 	local born = os.clock()
