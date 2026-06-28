@@ -403,7 +403,9 @@ See [`examples/`](examples):
 - **KillBrick** — step on it, die, and spray blood that drips downhill (`IMGN.Blood`).
 - **BloodArena** — a test play area + a click-to-bleed button that follows your character.
 - **Particles** — a fire with bursting sparks (`IMGN.Particles`).
+- **Weather** — rain/snow particle presets falling across a surface.
 - **PaintApp** — a working paint program using `canvas:OnInput` (works on a SurfaceGui too).
+- **Dither** — an animated plasma crushed through GameBoy / 1-bit / CGA palettes.
 
 - **GradientSurface** — procedural gradient on a part via `:Shader`.
 - **PaintCanvas** — click-drag finger paint on a `ScreenGui` with `AutoRender`.
