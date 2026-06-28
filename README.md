@@ -319,6 +319,21 @@ end)
 
 See `examples/PaintApp.client.luau` (a working paint program).
 
+## Post-processing effects
+
+`canvas:Effect(name, …)` (or `IMGN.Effects.<name>(target, …)`) applies a screen filter in place — the movie/game-screen looks. Works on a whole canvas or a `:Query` region.
+
+```lua
+canvas:Effect("CRT")          -- scanlines + chromatic aberration + vignette
+canvas:Effect("Glitch")       -- RGB-split band displacement
+canvas:Effect("Hologram")     -- blue tint + scanlines + grain
+canvas:Effect("Edges")        -- Sobel wireframe / blueprint
+canvas:Effect("Chromatic", 2) -- extra args pass through
+canvas:Render()
+```
+
+The set: `CRT`, `Glitch`, `Hologram`, `Edges`, `Wave`, `Bloom`, `Scanlines`, `Chromatic`, `Vignette`, `Grain`, `ASCII`, `Grayscale`, `Invert`, `Posterize`, `Tint`. See `examples/Effects.server.luau` (every effect side by side).
+
 ## Dithering & palettes
 
 `canvas:Dither(palette)` (Floyd–Steinberg) and `canvas:Quantize(palette)` reduce a canvas to a set of colours — the retro / GameBoy look, *and* fewer colours mean longer runs, so the `RowMerge`/`GreedyMesh`/`RichText` drivers get much cheaper.
@@ -465,6 +480,7 @@ See [`examples/`](examples):
 - **Dither** — an animated plasma crushed through GameBoy / 1-bit / CGA palettes.
 - **Dashboard** — a live line + bar chart panel (`IMGN.Chart`) drawn into `:Query` regions.
 - **Identicons** — a grid of 16 unique seed-based avatars, no uploads.
+- **Effects** — the same scene through every post-processing effect (CRT/glitch/hologram/…).
 
 - **GradientSurface** — procedural gradient on a part via `:Shader`.
 - **PaintCanvas** — click-drag finger paint on a `ScreenGui` with `AutoRender`.

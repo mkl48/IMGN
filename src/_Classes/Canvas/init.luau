@@ -17,6 +17,7 @@ local Draw = require(script.Parent.Parent._Patterns.Draw)
 local Font = require(script.Parent.Parent._Patterns.Font)
 local Image = require(script.Parent.Parent._Patterns.Image)
 local Dither = require(script.Parent.Parent._Patterns.Dither)
+local Effects = require(script.Parent.Parent._Patterns.Effect)
 local Region = require(script.Region)
 
 local Config = ConfigModule.Config
@@ -375,6 +376,19 @@ end
 ]=]
 function Canvas.LoadPixels(self: Canvas, data: any, options: Image.LoadOptions?): (number, number)
 	return Image.blit(self, Image.fromPixels(data), options)
+end
+
+--[=[
+	@within Canvas
+	Applies a post-processing [Effects] filter in place - `"CRT"`, `"Glitch"`, `"Hologram"`,
+	`"Edges"`, `"Wave"`, `"Bloom"`, `"Scanlines"`, `"Chromatic"`, `"Vignette"`, `"Grain"`, `"ASCII"`,
+	`"Grayscale"`, `"Invert"`, `"Posterize"`, `"Tint"`. Extra args pass through (e.g.
+	`canvas:Effect("Chromatic", 2)`). Call `:Render()` after.
+]=]
+function Canvas.Effect(self: Canvas, name: string, ...: any)
+	local fn = (Effects :: any)[string.lower(name)]
+	assert(fn, `IMGN: unknown effect "{tostring(name)}"`)
+	fn(self, ...)
 end
 
 --[=[

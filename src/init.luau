@@ -25,6 +25,7 @@ local DitherHelper = require(script._Patterns.Dither)
 local TextureHelper = require(script._Patterns.Texture)
 local ChartHelper = require(script._Patterns.Chart)
 local IdenticonHelper = require(script._Patterns.Identicon)
+local EffectsHelper = require(script._Patterns.Effect)
 local ConfigModule = require(script._Core.Config)
 
 local IMGN = {}
@@ -142,6 +143,14 @@ IMGN.Chart = ChartHelper
 function IMGN.Identicon(target: any, seed: any, options: any?)
 	IdenticonHelper.draw(target, seed, options)
 end
+
+--[=[
+	@within IMGN
+	Post-processing effects you can apply to a canvas/region (also via `canvas:Effect("CRT")`):
+	`IMGN.Effects.crt/glitch/hologram/edges/wave/bloom/scanlines/chromatic/vignette/grain/ascii/
+	grayscale/invert/posterize/tint(target, ...)`.
+]=]
+IMGN.Effects = EffectsHelper
 
 --[=[
 	@within IMGN

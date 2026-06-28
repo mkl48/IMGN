@@ -11,6 +11,7 @@
 
 local Draw = require(script.Parent.Parent.Parent._Patterns.Draw)
 local Font = require(script.Parent.Parent.Parent._Patterns.Font)
+local Effects = require(script.Parent.Parent.Parent._Patterns.Effect)
 
 --[=[
 	@class Region
@@ -134,6 +135,16 @@ function Region.Shader(self: Region, shader: (x: number, y: number, color: Color
 			end
 		end
 	end
+end
+
+--[=[
+	@within Region
+	Applies a post-processing [Effects] filter to just this region (see [Canvas:Effect]).
+]=]
+function Region.Effect(self: Region, name: string, ...: any)
+	local fn = (Effects :: any)[string.lower(name)]
+	assert(fn, `IMGN: unknown effect "{tostring(name)}"`)
+	fn(self, ...)
 end
 
 --[=[
