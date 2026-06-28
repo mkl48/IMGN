@@ -29,17 +29,20 @@ local Surface = require(script.Surface)
 local Blood = {}
 
 local SETTINGS = {
-	-- "Vector" (default): smooth animated Path2D drips - no pixels, no edges, cheap on any surface.
-	-- "Pixel": the Liquid cellular sim (raster; tiles into proxies). Vector is recommended for blood.
-	Renderer = "Vector",
+	-- "Fluid" (default): the Liquid cellular SIM (real flowing/pooling dynamics) rendered with the
+	--   Blob driver - overlapping circles, so it's smooth/organic, not square pixels. Realistic.
+	-- "Vector": smooth animated Path2D drips (scripted, not simulated, but the cheapest).
+	-- "Pixel": the Liquid sim on square Frames (the original raster look).
+	Renderer = "Fluid",
 	VectorFresh = Color3.fromRGB(135, 8, 10),
 	VectorDry = Color3.fromRGB(62, 16, 12),
-	ProxySize = 10, -- footprint of a blood proxy, in studs (drip room; vector is cheap at any size)
+	ProxySize = 10, -- max footprint of a blood proxy, in studs (clamped to the part so it can't overhang)
 	ProxyThickness = 0.08,
 	ProxyOffset = 0.02, -- how far off the surface to float the proxy (avoid z-fighting)
-	PixelsPerStud = 6, -- (Pixel renderer only) resolution per proxy stud, capped below
-	MaxResolution = 64,
-	EdgeFade = 3, -- (Pixel renderer only) border alpha falloff so its square edge blends out
+	FluidPixelsPerStud = 3, -- (Fluid) low res - the circles melt the grid so it still looks smooth
+	PixelsPerStud = 6, -- (Pixel) resolution per proxy stud
+	MaxResolution = 56,
+	EdgeFade = 3, -- (Fluid/Pixel) border alpha falloff so the canvas edge blends out
 	ReuseRadius = 6, -- splats within this many studs reuse a proxy (fewer, bigger blood patches)
 	Preset = "Blood",
 	DropletSize = 0.4,
@@ -110,6 +113,25 @@ BloodProxy.__index = BloodProxy
 -- proxies grouped by the part they landed on, for reuse + cleanup (weak so GC can collect)
 local proxiesByPart: { [BasePart]: { any } } = setmetatable({}, { __mode = "k" }) :: any
 
+-- distance from `worldPos` along world `dir` until it exits `part`'s box (studs)
+local function exitDistance(part: BasePart, worldPos: Vector3, dir: Vector3): number
+	local localP = part.CFrame:PointToObjectSpace(worldPos)
+	local localD = part.CFrame:VectorToObjectSpace(dir)
+	local half = part.Size * 0.5
+	local t = math.huge
+	for _, axis in { "X", "Y", "Z" } do
+		local d = (localD :: any)[axis]
+		if math.abs(d) > 1e-4 then
+			local bound = if d > 0 then (half :: any)[axis] else -(half :: any)[axis]
+			local tt = (bound - (localP :: any)[axis]) / d
+			if tt > 0 then
+				t = math.min(t, tt)
+			end
+		end
+	end
+	return t
+end
+
 function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 	local right, up, gravity = Surface.dripBasis(normal)
 	if SETTINGS.FlipDrip then
@@ -117,8 +139,17 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 		right = -right
 	end
 
-	local vector = SETTINGS.Renderer == "Vector"
+	local renderer = SETTINGS.Renderer
+	local vector = renderer == "Vector"
+
+	-- clamp the proxy to fit inside the hit part around the splat, so blood never floats out past
+	-- the part's real edges (the proxy is otherwise oversized).
 	local size = SETTINGS.ProxySize
+	if hitPart then
+		local dRight = math.min(exitDistance(hitPart, worldPos, right), exitDistance(hitPart, worldPos, -right))
+		local dUp = math.min(exitDistance(hitPart, worldPos, up), exitDistance(hitPart, worldPos, -up))
+		size = math.clamp(math.min(size, 2 * dRight, 2 * dUp), 1, SETTINGS.ProxySize)
+	end
 
 	local part = Instance.new("Part")
 	part.Name = "BloodProxy"
@@ -173,14 +204,21 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 		})
 		self.Vector:Start()
 	else
-		-- pixel: the Liquid cellular sim on a Frame canvas
+		-- the Liquid cellular sim. "Fluid" renders it with the Blob driver (smooth circles) at low
+		-- res; "Pixel" uses square Frames at higher res.
+		local fluid = renderer == "Fluid"
 		gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
 		gui.PixelsPerStud = 50
 		gui.Parent = part
-		local res = math.clamp(math.floor(size * SETTINGS.PixelsPerStud), 8, SETTINGS.MaxResolution)
+		local ppstud = if fluid then SETTINGS.FluidPixelsPerStud else SETTINGS.PixelsPerStud
+		local res = math.clamp(math.floor(size * ppstud), 8, SETTINGS.MaxResolution)
 		self.Res = res
 		self.Liquid = Liquid.new({
-			Canvas = Canvas.new({ Resolution = Vector2.new(res, res), Parent = gui }),
+			Canvas = Canvas.new({
+				Resolution = Vector2.new(res, res),
+				Parent = gui,
+				Driver = if fluid then "Blob" else "PixelGrid",
+			}),
 			Preset = SETTINGS.Preset,
 			Gravity = gravity,
 			EdgeFade = SETTINGS.EdgeFade,
@@ -206,24 +244,10 @@ end
 -- distance (in 0..1 scale, downhill) from a splat point to the hit part's real edge, so drips
 -- stop at the actual surface edge instead of floating out onto the oversized proxy.
 function BloodProxy.edgeDistanceScale(self: any, worldPos: Vector3): number
-	local hp = self.HitPart
-	if not hp then
+	if not self.HitPart then
 		return 0.96
 	end
-	local localP = hp.CFrame:PointToObjectSpace(worldPos)
-	local localD = hp.CFrame:VectorToObjectSpace(-self.Up) -- downhill in the part's local space
-	local half = hp.Size * 0.5
-	local tExit = math.huge
-	for _, axis in { "X", "Y", "Z" } do
-		local d = localD[axis]
-		if math.abs(d) > 1e-4 then
-			local bound = if d > 0 then half[axis] else -half[axis]
-			local t = (bound - localP[axis]) / d
-			if t > 0 then
-				tExit = math.min(tExit, t)
-			end
-		end
-	end
+	local tExit = exitDistance(self.HitPart, worldPos, -self.Up) -- downhill to the part edge
 	if tExit == math.huge then
 		return 0.96
 	end

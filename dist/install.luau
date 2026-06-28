@@ -1134,17 +1134,20 @@ local Surface = require(script.Surface)
 local Blood = {}
 
 local SETTINGS = {
-	-- "Vector" (default): smooth animated Path2D drips - no pixels, no edges, cheap on any surface.
-	-- "Pixel": the Liquid cellular sim (raster; tiles into proxies). Vector is recommended for blood.
-	Renderer = "Vector",
+	-- "Fluid" (default): the Liquid cellular SIM (real flowing/pooling dynamics) rendered with the
+	--   Blob driver - overlapping circles, so it's smooth/organic, not square pixels. Realistic.
+	-- "Vector": smooth animated Path2D drips (scripted, not simulated, but the cheapest).
+	-- "Pixel": the Liquid sim on square Frames (the original raster look).
+	Renderer = "Fluid",
 	VectorFresh = Color3.fromRGB(135, 8, 10),
 	VectorDry = Color3.fromRGB(62, 16, 12),
-	ProxySize = 10, -- footprint of a blood proxy, in studs (drip room; vector is cheap at any size)
+	ProxySize = 10, -- max footprint of a blood proxy, in studs (clamped to the part so it can't overhang)
 	ProxyThickness = 0.08,
 	ProxyOffset = 0.02, -- how far off the surface to float the proxy (avoid z-fighting)
-	PixelsPerStud = 6, -- (Pixel renderer only) resolution per proxy stud, capped below
-	MaxResolution = 64,
-	EdgeFade = 3, -- (Pixel renderer only) border alpha falloff so its square edge blends out
+	FluidPixelsPerStud = 3, -- (Fluid) low res - the circles melt the grid so it still looks smooth
+	PixelsPerStud = 6, -- (Pixel) resolution per proxy stud
+	MaxResolution = 56,
+	EdgeFade = 3, -- (Fluid/Pixel) border alpha falloff so the canvas edge blends out
 	ReuseRadius = 6, -- splats within this many studs reuse a proxy (fewer, bigger blood patches)
 	Preset = "Blood",
 	DropletSize = 0.4,
@@ -1215,6 +1218,25 @@ BloodProxy.__index = BloodProxy
 -- proxies grouped by the part they landed on, for reuse + cleanup (weak so GC can collect)
 local proxiesByPart: { [BasePart]: { any } } = setmetatable({}, { __mode = "k" }) :: any
 
+-- distance from `worldPos` along world `dir` until it exits `part`'s box (studs)
+local function exitDistance(part: BasePart, worldPos: Vector3, dir: Vector3): number
+	local localP = part.CFrame:PointToObjectSpace(worldPos)
+	local localD = part.CFrame:VectorToObjectSpace(dir)
+	local half = part.Size * 0.5
+	local t = math.huge
+	for _, axis in { "X", "Y", "Z" } do
+		local d = (localD :: any)[axis]
+		if math.abs(d) > 1e-4 then
+			local bound = if d > 0 then (half :: any)[axis] else -(half :: any)[axis]
+			local tt = (bound - (localP :: any)[axis]) / d
+			if tt > 0 then
+				t = math.min(t, tt)
+			end
+		end
+	end
+	return t
+end
+
 function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 	local right, up, gravity = Surface.dripBasis(normal)
 	if SETTINGS.FlipDrip then
@@ -1222,8 +1244,17 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 		right = -right
 	end
 
-	local vector = SETTINGS.Renderer == "Vector"
+	local renderer = SETTINGS.Renderer
+	local vector = renderer == "Vector"
+
+	-- clamp the proxy to fit inside the hit part around the splat, so blood never floats out past
+	-- the part's real edges (the proxy is otherwise oversized).
 	local size = SETTINGS.ProxySize
+	if hitPart then
+		local dRight = math.min(exitDistance(hitPart, worldPos, right), exitDistance(hitPart, worldPos, -right))
+		local dUp = math.min(exitDistance(hitPart, worldPos, up), exitDistance(hitPart, worldPos, -up))
+		size = math.clamp(math.min(size, 2 * dRight, 2 * dUp), 1, SETTINGS.ProxySize)
+	end
 
 	local part = Instance.new("Part")
 	part.Name = "BloodProxy"
@@ -1278,14 +1309,21 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 		})
 		self.Vector:Start()
 	else
-		-- pixel: the Liquid cellular sim on a Frame canvas
+		-- the Liquid cellular sim. "Fluid" renders it with the Blob driver (smooth circles) at low
+		-- res; "Pixel" uses square Frames at higher res.
+		local fluid = renderer == "Fluid"
 		gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
 		gui.PixelsPerStud = 50
 		gui.Parent = part
-		local res = math.clamp(math.floor(size * SETTINGS.PixelsPerStud), 8, SETTINGS.MaxResolution)
+		local ppstud = if fluid then SETTINGS.FluidPixelsPerStud else SETTINGS.PixelsPerStud
+		local res = math.clamp(math.floor(size * ppstud), 8, SETTINGS.MaxResolution)
 		self.Res = res
 		self.Liquid = Liquid.new({
-			Canvas = Canvas.new({ Resolution = Vector2.new(res, res), Parent = gui }),
+			Canvas = Canvas.new({
+				Resolution = Vector2.new(res, res),
+				Parent = gui,
+				Driver = if fluid then "Blob" else "PixelGrid",
+			}),
 			Preset = SETTINGS.Preset,
 			Gravity = gravity,
 			EdgeFade = SETTINGS.EdgeFade,
@@ -1311,24 +1349,10 @@ end
 -- distance (in 0..1 scale, downhill) from a splat point to the hit part's real edge, so drips
 -- stop at the actual surface edge instead of floating out onto the oversized proxy.
 function BloodProxy.edgeDistanceScale(self: any, worldPos: Vector3): number
-	local hp = self.HitPart
-	if not hp then
+	if not self.HitPart then
 		return 0.96
 	end
-	local localP = hp.CFrame:PointToObjectSpace(worldPos)
-	local localD = hp.CFrame:VectorToObjectSpace(-self.Up) -- downhill in the part's local space
-	local half = hp.Size * 0.5
-	local tExit = math.huge
-	for _, axis in { "X", "Y", "Z" } do
-		local d = localD[axis]
-		if math.abs(d) > 1e-4 then
-			local bound = if d > 0 then half[axis] else -half[axis]
-			local t = (bound - localP[axis]) / d
-			if t > 0 then
-				tExit = math.min(tExit, t)
-			end
-		end
-	end
+	local tExit = exitDistance(self.HitPart, worldPos, -self.Up) -- downhill to the part edge
 	if tExit == math.huge then
 		return 0.96
 	end
@@ -3007,6 +3031,7 @@ local PixelGrid = require(script.PixelGrid)
 local RowMerge = require(script.RowMerge)
 local GreedyMesh = require(script.GreedyMesh)
 local RichText = require(script.RichText)
+local Blob = require(script.Blob)
 local PixelBuffer = require(script.Parent._Core.PixelBuffer)
 type PixelBuffer = PixelBuffer.PixelBuffer
 
@@ -3018,7 +3043,7 @@ type PixelBuffer = PixelBuffer.PixelBuffer
 	Frames, best for static/flat images); `"RichText"` is the whole image in one TextLabel (lowest
 	instance count, approximate, low-res only).
 ]=]
-export type DriverType = "PixelGrid" | "RowMerge" | "GreedyMesh" | "RichText"
+export type DriverType = "PixelGrid" | "RowMerge" | "GreedyMesh" | "RichText" | "Blob"
 
 -- The common shape every Driver implements. Both concrete drivers are structurally compatible
 -- with this; Canvas only ever calls through these methods.
@@ -3035,6 +3060,7 @@ local constructors: { [string]: (PixelBuffer) -> Driver } = {
 	RowMerge = RowMerge.new :: any,
 	GreedyMesh = GreedyMesh.new :: any,
 	RichText = RichText.new :: any,
+	Blob = Blob.new :: any,
 }
 
 local Drivers = {}
@@ -3051,6 +3077,158 @@ function Drivers.get(name: string, pixelBuffer: PixelBuffer): Driver
 end
 
 return Drivers
+]])
+mod("Blob", _8, [[
+-- IMGN
+-- _Drivers/Blob.luau
+-- Plinko Labs
+--
+-- Like PixelGrid, but every pixel is an oversized CIRCLE instead of a square. Neighbouring
+-- circles overlap, so a low-resolution buffer renders as smooth, organic, metaball-style blobs
+-- with rounded edges - no square pixels, no stair-stepped boundary. Perfect for fluids (blood,
+-- water): run the sim coarse + cheap, and the circles melt the grid into something that looks
+-- high-resolution. Dirty-tracked like PixelGrid, so only changed cells repaint.
+
+local Blob = {}
+Blob.__index = Blob
+
+local PixelBuffer = require(script.Parent.Parent._Core.PixelBuffer)
+type PixelBuffer = PixelBuffer.PixelBuffer
+
+local OVERSIZE = 1.9 -- each circle is this many cells wide, so neighbours overlap and merge
+
+export type Blob = typeof(setmetatable(
+	{} :: {
+		_buffer: PixelBuffer,
+		_width: number,
+		_height: number,
+		_frames: { Frame },
+		_dirty: { [number]: boolean },
+		_dirtyCount: number,
+		_container: Frame?,
+	},
+	Blob
+))
+
+--[=[
+	@class Blob
+	@within Canvas
+	One overlapping circle per pixel - smooth, blobby output from a low-res buffer. Selected with
+	`Driver = "Blob"`; ideal for the [Liquid] fluid sim.
+]=]
+function Blob.new(pixelBuffer: PixelBuffer): Blob
+	return setmetatable({
+		_buffer = pixelBuffer,
+		_width = pixelBuffer.Width,
+		_height = pixelBuffer.Height,
+		_frames = {},
+		_dirty = {},
+		_dirtyCount = 0,
+		_container = nil,
+	}, Blob)
+end
+
+--[=[
+	@within Blob
+	Builds the circle grid under a container and parents it into `parent`.
+]=]
+function Blob.Mount(self: Blob, parent: Instance): Frame
+	local width, height = self._width, self._height
+
+	local container = Instance.new("Frame")
+	container.Name = "IMGNCanvas"
+	container.Size = UDim2.fromScale(1, 1)
+	container.BackgroundTransparency = 1
+	container.BorderSizePixel = 0
+	container.ClipsDescendants = true
+
+	local sx, sy = 1 / width, 1 / height
+
+	for y = 0, height - 1 do
+		for x = 0, width - 1 do
+			local pixel = Instance.new("Frame")
+			pixel.AnchorPoint = Vector2.new(0.5, 0.5)
+			pixel.BorderSizePixel = 0
+			pixel.BackgroundTransparency = 1
+			pixel.Size = UDim2.fromScale(sx * OVERSIZE, sy * OVERSIZE)
+			pixel.Position = UDim2.fromScale((x + 0.5) * sx, (y + 0.5) * sy)
+			pixel.ZIndex = 1
+			local corner = Instance.new("UICorner")
+			corner.CornerRadius = UDim.new(1, 0) -- full circle
+			corner.Parent = pixel
+			pixel.Parent = container
+			self._frames[y * width + x + 1] = pixel
+		end
+	end
+
+	container.Parent = parent
+	self._container = container
+	return container
+end
+
+--[=[
+	@within Blob
+	Marks the pixel at linear `index` (0-based `y*width + x`) for repaint.
+]=]
+function Blob.SetDirty(self: Blob, index: number)
+	if not self._dirty[index] then
+		self._dirty[index] = true
+		self._dirtyCount += 1
+	end
+end
+
+--[=[
+	@within Blob
+	Marks every pixel dirty.
+]=]
+function Blob.SetAllDirty(self: Blob)
+	local total = self._width * self._height
+	for index = 0, total - 1 do
+		self._dirty[index] = true
+	end
+	self._dirtyCount = total
+end
+
+--[=[
+	@within Blob
+	Pushes every dirty cell's colour onto its circle, then clears the dirty set.
+]=]
+function Blob.Flush(self: Blob)
+	if self._dirtyCount == 0 then
+		return
+	end
+
+	local width = self._width
+	for index in self._dirty do
+		local frame = self._frames[index + 1]
+		if frame then
+			local x = index % width
+			local y = (index - x) / width
+			local color, alpha = PixelBuffer.Get(self._buffer, x, y)
+			frame.BackgroundColor3 = color
+			frame.BackgroundTransparency = 1 - alpha
+		end
+	end
+
+	self._dirty = {}
+	self._dirtyCount = 0
+end
+
+--[=[
+	@within Blob
+	Destroys every circle and the container.
+]=]
+function Blob.Destroy(self: Blob)
+	if self._container then
+		self._container:Destroy()
+		self._container = nil
+	end
+	self._frames = {}
+	self._dirty = {}
+	self._dirtyCount = 0
+end
+
+return Blob
 ]])
 mod("GreedyMesh", _8, [[
 -- IMGN
@@ -8483,5 +8661,5 @@ end
 return Image
 ]])
 
-print("[IMGN] installed 56 modules under ReplicatedStorage.IMGN")
+print("[IMGN] installed 57 modules under ReplicatedStorage.IMGN")
 return true

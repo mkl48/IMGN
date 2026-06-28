@@ -11,6 +11,7 @@ local PixelGrid = require(script.PixelGrid)
 local RowMerge = require(script.RowMerge)
 local GreedyMesh = require(script.GreedyMesh)
 local RichText = require(script.RichText)
+local Blob = require(script.Blob)
 local PixelBuffer = require(script.Parent._Core.PixelBuffer)
 type PixelBuffer = PixelBuffer.PixelBuffer
 
@@ -22,7 +23,7 @@ type PixelBuffer = PixelBuffer.PixelBuffer
 	Frames, best for static/flat images); `"RichText"` is the whole image in one TextLabel (lowest
 	instance count, approximate, low-res only).
 ]=]
-export type DriverType = "PixelGrid" | "RowMerge" | "GreedyMesh" | "RichText"
+export type DriverType = "PixelGrid" | "RowMerge" | "GreedyMesh" | "RichText" | "Blob"
 
 -- The common shape every Driver implements. Both concrete drivers are structurally compatible
 -- with this; Canvas only ever calls through these methods.
@@ -39,6 +40,7 @@ local constructors: { [string]: (PixelBuffer) -> Driver } = {
 	RowMerge = RowMerge.new :: any,
 	GreedyMesh = GreedyMesh.new :: any,
 	RichText = RichText.new :: any,
+	Blob = Blob.new :: any,
 }
 
 local Drivers = {}
