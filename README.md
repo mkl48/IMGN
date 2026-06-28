@@ -189,7 +189,7 @@ See `examples/BloodDrip.server.luau`.
 A full droplet-and-drip system: throw 3D blood that lands on surfaces and drips down them, correctly following each surface's **downhill** — walls, slopes, and rotated/moving parts.
 
 **Three renderers** (set with `IMGN.Blood.Configure { Renderer = … }`):
-- **`"Pixel"`** *(default)* — the `Liquid` cellular **simulation**, rendered with the **`Sparse` driver** (only *painted* pixels cost anything). On a normal-size part the canvas **covers the whole part** (the original full-surface look); on a part bigger than `MaxCanvasStuds` it uses a **good-size patch** near each splat instead, so the **pixel density stays constant** (no giant blocky tiles on huge plates) and a big surface just gets a few patches where blood actually landed.
+- **`"Pixel"`** *(default)* — the `Liquid` cellular **simulation** painted **directly on the hit part's face** (a `SurfaceGui` adorned to the part, so it lies flush and aligned — never floating or rotated), rendered with the **`Sparse` driver** (only *painted* pixels cost anything). One canvas per part-face; when blood reaches an edge it **wraps onto the adjacent face** (a new face canvas) and continues, cascading around corners.
 - **`"Fluid"`** — the sim on a small **`Blob`-circle** patch (smooth/organic, localized).
 - **`"Vector"`** — smooth animated **`Path2D` strokes** (scripted, the cheapest); drips stop at the surface's real edge and shed, floors puddle.
 

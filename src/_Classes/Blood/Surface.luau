@@ -119,6 +119,44 @@ function Surface.worldToPixel(
 	return math.clamp(math.floor(u * resW), 0, resW - 1), math.clamp(math.floor(v * resH), 0, resH - 1)
 end
 
+-- studs spanned by a face along its right/down axes
+local function faceExtents(part: BasePart, right: Vector3, down: Vector3): (number, number)
+	local s = part.Size
+	local w = math.abs(right.X * s.X) + math.abs(right.Y * s.Y) + math.abs(right.Z * s.Z)
+	local h = math.abs(down.X * s.X) + math.abs(down.Y * s.Y) + math.abs(down.Z * s.Z)
+	return w, h
+end
+
+--[=[
+	@within Surface
+	The world position of a `(x, y)` pixel on `part`'s `normalId` face (the inverse of worldToPixel),
+	placed on the face plane. NEEDS STUDIO CHECK (same face convention).
+]=]
+function Surface.pixelToWorld(part: BasePart, normalId: Enum.NormalId, x: number, y: number, resW: number, resH: number): Vector3
+	local normal, right, down = Surface.faceVectors(part, normalId)
+	local widthStuds, heightStuds = faceExtents(part, right, down)
+	local along = ((x + 0.5) / resW - 0.5) * widthStuds
+	local downAmt = ((y + 0.5) / resH - 0.5) * heightStuds
+	-- the face plane sits half the part's normal-extent off the centre
+	local halfNormal = (math.abs(normal.X * part.Size.X) + math.abs(normal.Y * part.Size.Y) + math.abs(normal.Z * part.Size.Z)) * 0.5
+	local faceCentre = part.Position + normal * halfNormal
+	return faceCentre + right * along + down * downAmt
+end
+
+--[=[
+	@within Surface
+	The world downhill direction on a face (world-down projected onto the face plane), or `nil` if
+	the face is horizontal (a floor/ceiling - fluid pools, no single downhill).
+]=]
+function Surface.faceDownhill(normal: Vector3): Vector3?
+	local worldDown = Vector3.new(0, -1, 0)
+	local d = worldDown - normal.Unit * worldDown:Dot(normal.Unit)
+	if d.Magnitude < 1e-3 then
+		return nil
+	end
+	return d.Unit
+end
+
 --[=[
 	@within Surface
 	The orientation for a BloodProxy facing along a hit `normal`: returns the canvas `right` and

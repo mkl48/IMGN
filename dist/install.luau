@@ -1233,6 +1233,38 @@ local function bloodRaycastParams(): RaycastParams
 	return params
 end
 
+-- Blood reaching an edge at `worldPos` (on a face with outward `normal`, flowing along world
+-- `downhill`): follow the geometry if it can, else fall. (1) wrap around a convex corner onto the
+-- same part's adjacent face; (2) flow onto a surface just past/below the edge; (3) otherwise detach
+-- as a falling droplet. Shared by the proxy and face-canvas renderers.
+local function shedFrom(hitPart: BasePart?, worldPos: Vector3, normal: Vector3, downhill: Vector3, amount: number)
+	amount = math.max(2, amount)
+
+	-- 1) wrap onto the adjacent face the blood exits toward (its normal best matches downhill),
+	-- unless that's the face we're on or an underside.
+	if hitPart then
+		local nid = Surface.faceFromNormal(hitPart, downhill)
+		local wrapN = hitPart.CFrame:VectorToWorldSpace(Vector3.fromNormalId(nid)).Unit
+		if wrapN:Dot(normal) < 0.9 and wrapN:Dot(Vector3.new(0, -1, 0)) < 0.45 then
+			Blood.Splat(hitPart, worldPos + wrapN * 0.05, wrapN, amount)
+			return
+		end
+	end
+
+	-- 2) a surface just past/below the edge to continue on (wall meets floor, ledge to a step)
+	local params = bloodRaycastParams()
+	local start = worldPos + normal * 0.05
+	local hit = Workspace:Raycast(start + downhill * 0.1, Vector3.new(0, -SETTINGS.WrapReach, 0), params)
+		or Workspace:Raycast(start, downhill * SETTINGS.WrapReach, params)
+	if hit and hit.Instance then
+		Blood.Splat(hit.Instance, hit.Position, hit.Normal, amount)
+		return
+	end
+
+	-- 3) nothing to travel down -> a real hanging drip
+	Blood.Emit(worldPos + normal * 0.2, downhill * 4 + Vector3.new(0, -3, 0), { Amount = amount })
+end
+
 -- ============================ BloodProxy ============================
 
 local BloodProxy = {}
@@ -1413,37 +1445,9 @@ function BloodProxy.edgeDistanceScale(self: any, worldPos: Vector3): number
 	return tExit / self.SizeU -- studs -> scale (downhill is the up/U axis)
 end
 
--- Blood reaching an edge: follow the geometry if it can (wrap around a corner / flow onto the
--- next surface), and only fall as a droplet when there's genuinely nothing to travel down.
+-- Blood reaching a proxy edge -> shared wrap/continue/drip from that world point.
 function BloodProxy.shed(self: any, x: number, y: number, amount: number)
-	local edge = BloodProxy.worldOfScale(self, x, y)
-	local downhill = -self.Up
-
-	-- 1) wrap around a convex corner onto the SAME part's adjacent face (e.g. top -> front). The
-	-- face the blood exits toward is the one whose normal best matches downhill; only wrap if it's a
-	-- different, non-underside face (so we don't try to flow onto the bottom of something).
-	if self.HitPart then
-		local nid = Surface.faceFromNormal(self.HitPart, downhill)
-		local wrapN = self.HitPart.CFrame:VectorToWorldSpace(Vector3.fromNormalId(nid)).Unit
-		if wrapN:Dot(self.Normal) < 0.9 and wrapN:Dot(Vector3.new(0, -1, 0)) < 0.45 then
-			Blood.Splat(self.HitPart, edge + wrapN * 0.05, wrapN, amount)
-			return
-		end
-	end
-
-	-- 2) is there a surface just below/past the edge to continue on? (wall meets floor, ledge to a
-	-- step). Probe straight down, then along the downhill direction.
-	local params = bloodRaycastParams()
-	local start = edge + self.Normal * 0.05
-	local hit = Workspace:Raycast(start + downhill * 0.1, Vector3.new(0, -SETTINGS.WrapReach, 0), params)
-		or Workspace:Raycast(start, downhill * SETTINGS.WrapReach, params)
-	if hit and hit.Instance then
-		Blood.Splat(hit.Instance, hit.Position, hit.Normal, amount)
-		return
-	end
-
-	-- 3) nothing to travel down -> a real hanging drip that detaches and falls
-	Blood.Emit(edge + self.Normal * 0.2, downhill * 4 + Vector3.new(0, -3, 0), { Amount = math.max(2, amount) })
+	shedFrom(self.HitPart, BloodProxy.worldOfScale(self, x, y), self.Normal, -self.Up, amount)
 end
 
 -- (Pixel renderer) shed off the bottom edge if enough fluid pooled there (throttled)
@@ -1481,6 +1485,99 @@ function BloodProxy.Splat(self: any, worldPos: Vector3, amount: number)
 	end
 end
 
+-- ============================ FaceCanvas (Pixel renderer) ============================
+-- "Pixel" paints directly on the hit part's actual face - a SurfaceGui adorned to the face, so it
+-- lies flush and aligned (never floating/rotated), one canvas per part+face, Sparse-rendered. When
+-- blood reaches the edge it wraps onto the adjacent face (a new FaceCanvas) and continues.
+
+local FaceCanvas = {}
+FaceCanvas.__index = FaceCanvas
+local faceCanvases: { [BasePart]: { [Enum.NormalId]: any } } = setmetatable({}, { __mode = "k" }) :: any
+
+function FaceCanvas.new(hitPart: BasePart, faceId: Enum.NormalId)
+	local normal, right, down = Surface.faceVectors(hitPart, faceId)
+	local gravity = Surface.gravityVector(right, down)
+	if SETTINGS.FlipDrip then
+		gravity = Vector2.new(gravity.X, -gravity.Y)
+	end
+	local downhill = Surface.faceDownhill(normal)
+
+	local s = hitPart.Size
+	local widthStuds = math.abs(right.X * s.X) + math.abs(right.Y * s.Y) + math.abs(right.Z * s.Z)
+	local heightStuds = math.abs(down.X * s.X) + math.abs(down.Y * s.Y) + math.abs(down.Z * s.Z)
+	local resW = math.clamp(math.floor(widthStuds * SETTINGS.PixelsPerStud), 8, SETTINGS.MaxResolution)
+	local resH = math.clamp(math.floor(heightStuds * SETTINGS.PixelsPerStud), 8, SETTINGS.MaxResolution)
+
+	local gui = Instance.new("SurfaceGui")
+	gui.Name = "IMGNBlood"
+	gui.Face = faceId
+	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	gui.PixelsPerStud = 50
+	gui.Adornee = hitPart
+	gui.Parent = hitPart
+
+	local liquid = Liquid.new({
+		Canvas = Canvas.new({ Resolution = Vector2.new(resW, resH), Parent = gui, Driver = "Sparse" }),
+		Preset = SETTINGS.Preset,
+		Gravity = gravity,
+		EdgeFade = SETTINGS.EdgeFade,
+	})
+	liquid:Start()
+
+	local self = setmetatable({
+		HitPart = hitPart,
+		Face = faceId,
+		Normal = normal,
+		Downhill = downhill,
+		Liquid = liquid,
+		Gui = gui,
+		ResW = resW,
+		ResH = resH,
+		_cd = 0,
+	}, FaceCanvas)
+
+	if SETTINGS.EdgeDrip and downhill then -- only faces with a downhill shed (floors just pool)
+		liquid.OnStep = function(dt)
+			FaceCanvas.checkEdge(self, dt)
+		end
+	end
+	return self
+end
+
+function FaceCanvas.Splat(self: any, worldPos: Vector3, amount: number)
+	local x, y = Surface.worldToPixel(self.HitPart, self.Face, worldPos, self.ResW, self.ResH)
+	self.Liquid:Splat(x, y, amount, { Spread = 3 + amount })
+end
+
+function FaceCanvas.checkEdge(self: any, dt: number)
+	self._cd -= dt
+	if self._cd > 0 then
+		return
+	end
+	local x, taken = self.Liquid:TakeFromBottom(SETTINGS.DripMin, SETTINGS.DripTake)
+	if not x then
+		return
+	end
+	self._cd = SETTINGS.DripInterval
+	local pos = Surface.pixelToWorld(self.HitPart, self.Face, x, self.ResH - 1, self.ResW, self.ResH)
+	shedFrom(self.HitPart, pos, self.Normal, self.Downhill or Vector3.new(0, -1, 0), taken :: number)
+end
+
+local function faceCanvasFor(hitPart: BasePart, worldPos: Vector3, normal: Vector3)
+	local faceId = Surface.faceFromNormal(hitPart, normal)
+	local byFace = faceCanvases[hitPart]
+	if not byFace then
+		byFace = {}
+		faceCanvases[hitPart] = byFace
+	end
+	local fc = byFace[faceId]
+	if not fc or not fc.Gui.Parent then
+		fc = FaceCanvas.new(hitPart, faceId)
+		byFace[faceId] = fc
+	end
+	return fc
+end
+
 -- does this canvas' rectangle already cover the hit point?
 local function covers(p: any, worldPos: Vector3): boolean
 	local lp = p.Part.CFrame:PointToObjectSpace(worldPos)
@@ -1516,7 +1613,13 @@ end
 	`hitPart` is what it landed on (so the proxy can follow it); pass `nil` for a static splat.
 ]=]
 function Blood.Splat(hitPart: BasePart?, worldPos: Vector3, normal: Vector3, amount: number?)
-	proxyFor(hitPart, worldPos, normal):Splat(worldPos, amount or SETTINGS.SplatAmount)
+	amount = amount or SETTINGS.SplatAmount
+	if SETTINGS.Renderer == "Pixel" and hitPart then
+		-- paint directly on the part's face (aligned/flush), wrapping to adjacent faces at edges
+		faceCanvasFor(hitPart, worldPos, normal):Splat(worldPos, amount)
+	else
+		proxyFor(hitPart, worldPos, normal):Splat(worldPos, amount)
+	end
 end
 
 local function popDroplet(drop: BasePart)
@@ -1739,6 +1842,44 @@ function Surface.worldToPixel(
 	local u = if widthStuds > 0 then along / widthStuds + 0.5 else 0.5
 	local v = if heightStuds > 0 then downAmt / heightStuds + 0.5 else 0.5
 	return math.clamp(math.floor(u * resW), 0, resW - 1), math.clamp(math.floor(v * resH), 0, resH - 1)
+end
+
+-- studs spanned by a face along its right/down axes
+local function faceExtents(part: BasePart, right: Vector3, down: Vector3): (number, number)
+	local s = part.Size
+	local w = math.abs(right.X * s.X) + math.abs(right.Y * s.Y) + math.abs(right.Z * s.Z)
+	local h = math.abs(down.X * s.X) + math.abs(down.Y * s.Y) + math.abs(down.Z * s.Z)
+	return w, h
+end
+
+--[=[
+	@within Surface
+	The world position of a `(x, y)` pixel on `part`'s `normalId` face (the inverse of worldToPixel),
+	placed on the face plane. NEEDS STUDIO CHECK (same face convention).
+]=]
+function Surface.pixelToWorld(part: BasePart, normalId: Enum.NormalId, x: number, y: number, resW: number, resH: number): Vector3
+	local normal, right, down = Surface.faceVectors(part, normalId)
+	local widthStuds, heightStuds = faceExtents(part, right, down)
+	local along = ((x + 0.5) / resW - 0.5) * widthStuds
+	local downAmt = ((y + 0.5) / resH - 0.5) * heightStuds
+	-- the face plane sits half the part's normal-extent off the centre
+	local halfNormal = (math.abs(normal.X * part.Size.X) + math.abs(normal.Y * part.Size.Y) + math.abs(normal.Z * part.Size.Z)) * 0.5
+	local faceCentre = part.Position + normal * halfNormal
+	return faceCentre + right * along + down * downAmt
+end
+
+--[=[
+	@within Surface
+	The world downhill direction on a face (world-down projected onto the face plane), or `nil` if
+	the face is horizontal (a floor/ceiling - fluid pools, no single downhill).
+]=]
+function Surface.faceDownhill(normal: Vector3): Vector3?
+	local worldDown = Vector3.new(0, -1, 0)
+	local d = worldDown - normal.Unit * worldDown:Dot(normal.Unit)
+	if d.Magnitude < 1e-3 then
+		return nil
+	end
+	return d.Unit
 end
 
 --[=[
