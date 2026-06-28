@@ -18,6 +18,7 @@ local Workspace = game:GetService("Workspace")
 
 local Canvas = require(script.Parent.Canvas)
 local Liquid = require(script.Parent.Liquid)
+local VectorBlood = require(script.Vector)
 local Surface = require(script.Surface)
 
 --[=[
@@ -28,14 +29,18 @@ local Surface = require(script.Surface)
 local Blood = {}
 
 local SETTINGS = {
-	ProxySize = 8, -- footprint of a blood proxy, in studs. Bigger = blood streaks within ONE
-	-- continuous canvas instead of tiling into visible squares (fewer proxies, fewer seams).
+	-- "Vector" (default): smooth animated Path2D drips - no pixels, no edges, cheap on any surface.
+	-- "Pixel": the Liquid cellular sim (raster; tiles into proxies). Vector is recommended for blood.
+	Renderer = "Vector",
+	VectorFresh = Color3.fromRGB(135, 8, 10),
+	VectorDry = Color3.fromRGB(62, 16, 12),
+	ProxySize = 10, -- footprint of a blood proxy, in studs (drip room; vector is cheap at any size)
 	ProxyThickness = 0.08,
 	ProxyOffset = 0.02, -- how far off the surface to float the proxy (avoid z-fighting)
-	PixelsPerStud = 6, -- resolution per proxy stud (ProxySize * this = canvas size, capped below)
+	PixelsPerStud = 6, -- (Pixel renderer only) resolution per proxy stud, capped below
 	MaxResolution = 64,
-	EdgeFade = 3, -- pixels of alpha falloff at a proxy's border, so its square edge blends out
-	ReuseRadius = 5, -- splats within this many studs reuse a proxy (fewer, bigger blood patches)
+	EdgeFade = 3, -- (Pixel renderer only) border alpha falloff so its square edge blends out
+	ReuseRadius = 6, -- splats within this many studs reuse a proxy (fewer, bigger blood patches)
 	Preset = "Blood",
 	DropletSize = 0.4,
 	DropletColor = Color3.fromRGB(120, 6, 8),
@@ -112,8 +117,8 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 		right = -right
 	end
 
+	local vector = SETTINGS.Renderer == "Vector"
 	local size = SETTINGS.ProxySize
-	local res = math.clamp(math.floor(size * SETTINGS.PixelsPerStud), 8, SETTINGS.MaxResolution)
 
 	local part = Instance.new("Part")
 	part.Name = "BloodProxy"
@@ -141,19 +146,7 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 	local gui = Instance.new("SurfaceGui")
 	gui.Name = "IMGNBlood"
 	gui.Face = Enum.NormalId.Back -- the +Z face, which faces outward
-	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
-	gui.PixelsPerStud = 50
 	gui.Adornee = part
-	gui.Parent = part
-
-	local canvas = Canvas.new({ Resolution = Vector2.new(res, res), Parent = gui })
-	local liquid = Liquid.new({
-		Canvas = canvas,
-		Preset = SETTINGS.Preset,
-		Gravity = gravity,
-		EdgeFade = SETTINGS.EdgeFade,
-	})
-	liquid:Start()
 
 	local self = setmetatable({
 		Part = part,
@@ -161,32 +154,64 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 		Center = worldPos,
 		Normal = normal,
 		Up = up,
-		Liquid = liquid,
 		Size = size,
-		Res = res,
 		IsDrip = gravity.Y > 0.5, -- a wall/slope sheds off its bottom edge; a floor just pools
 		_dripCD = 0,
 	}, BloodProxy)
 
-	-- cross-surface dripping: when fluid reaches the bottom edge, shed it as a falling droplet that
-	-- lands on (and drips down) whatever is below - cascading down a ramp and onto the ground.
-	if SETTINGS.EdgeDrip and self.IsDrip then
-		liquid.OnStep = function(dt)
-			BloodProxy.checkEdge(self, dt)
+	if vector then
+		-- vector: a fixed 100x100 virtual canvas, smooth Path2D drips, +Y = downhill
+		gui.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
+		gui.CanvasSize = Vector2.new(100, 100)
+		gui.Parent = part
+		self.Vector = VectorBlood.new(gui, {
+			Fresh = SETTINGS.VectorFresh,
+			Dry = SETTINGS.VectorDry,
+			OnDrip = if SETTINGS.EdgeDrip and self.IsDrip then function(x)
+				BloodProxy.shed(self, x, SETTINGS.SplatAmount * 0.6)
+			end else nil,
+		})
+		self.Vector:Start()
+	else
+		-- pixel: the Liquid cellular sim on a Frame canvas
+		gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+		gui.PixelsPerStud = 50
+		gui.Parent = part
+		local res = math.clamp(math.floor(size * SETTINGS.PixelsPerStud), 8, SETTINGS.MaxResolution)
+		self.Res = res
+		self.Liquid = Liquid.new({
+			Canvas = Canvas.new({ Resolution = Vector2.new(res, res), Parent = gui }),
+			Preset = SETTINGS.Preset,
+			Gravity = gravity,
+			EdgeFade = SETTINGS.EdgeFade,
+		})
+		self.Liquid:Start()
+		if SETTINGS.EdgeDrip and self.IsDrip then
+			self.Liquid.OnStep = function(dt)
+				BloodProxy.checkEdge(self, dt)
+			end
 		end
 	end
 
 	return self
 end
 
--- world position of a canvas pixel, just off the front of the surface
-function BloodProxy.worldOfPixel(self: any, px: number, py: number): Vector3
-	local lx = ((px + 0.5) / self.Res - 0.5) * self.Size
-	local ly = (0.5 - (py + 0.5) / self.Res) * self.Size
+-- world position of a canvas point (x, y in 0..1 scale), just off the front of the surface
+function BloodProxy.worldOfScale(self: any, x: number, y: number): Vector3
+	local lx = (x - 0.5) * self.Size
+	local ly = (0.5 - y) * self.Size -- +Y scale is downhill, +Y local is up-slope
 	return self.Part.CFrame:PointToWorldSpace(Vector3.new(lx, ly, SETTINGS.ProxyThickness))
 end
 
--- shed a drip off the bottom edge if enough fluid has pooled there (throttled)
+-- shed a falling droplet off the bottom edge at scale-x `x`, continuing the cascade below
+function BloodProxy.shed(self: any, x: number, amount: number)
+	local pos = BloodProxy.worldOfScale(self, x, 0.97)
+	local downhill = -self.Up
+	local velocity = downhill * 6 + Vector3.new(0, -2, 0)
+	Blood.Emit(pos + self.Normal * 0.2, velocity, { Amount = math.max(2, amount) })
+end
+
+-- (Pixel renderer) shed off the bottom edge if enough fluid pooled there (throttled)
 function BloodProxy.checkEdge(self: any, dt: number)
 	self._dripCD -= dt
 	if self._dripCD > 0 then
@@ -197,25 +222,22 @@ function BloodProxy.checkEdge(self: any, dt: number)
 		return
 	end
 	self._dripCD = SETTINGS.DripInterval
-
-	local pos = BloodProxy.worldOfPixel(self, x, self.Res - 1)
-	-- carry it down the surface so it lands a few studs lower (new proxy) or off the end (ground)
-	local downhill = -self.Up
-	local velocity = downhill * 6 + Vector3.new(0, -2, 0)
-	Blood.Emit(pos + self.Normal * 0.2, velocity, { Amount = math.max(2, taken :: number) })
+	BloodProxy.shed(self, (x + 0.5) / self.Res, taken :: number)
 end
 
--- world point -> this proxy's canvas pixel (proxy is a known fixed-size part, so this is exact)
-function BloodProxy.Pixel(self: any, worldPos: Vector3): (number, number)
+-- world point -> this proxy's canvas scale (0..1, +Y down)
+function BloodProxy.Scale(self: any, worldPos: Vector3): (number, number)
 	local lp = self.Part.CFrame:PointToObjectSpace(worldPos)
-	local u = 0.5 + lp.X / self.Size
-	local v = 0.5 - lp.Y / self.Size -- +Y local is up-slope, so canvas v grows downward
-	return math.clamp(math.floor(u * self.Res), 0, self.Res - 1), math.clamp(math.floor(v * self.Res), 0, self.Res - 1)
+	return math.clamp(0.5 + lp.X / self.Size, 0, 1), math.clamp(0.5 - lp.Y / self.Size, 0, 1)
 end
 
 function BloodProxy.Splat(self: any, worldPos: Vector3, amount: number)
-	local px, py = BloodProxy.Pixel(self, worldPos)
-	self.Liquid:Splat(px, py, amount, { Spread = 3 + amount })
+	local sx, sy = BloodProxy.Scale(self, worldPos)
+	if self.Vector then
+		self.Vector:Splat(sx, sy, amount)
+	else
+		self.Liquid:Splat(math.floor(sx * self.Res), math.floor(sy * self.Res), amount, { Spread = 3 + amount })
+	end
 end
 
 -- find a nearby proxy on the same part facing the same way, or make a new one

@@ -1123,6 +1123,7 @@ local Workspace = game:GetService("Workspace")
 
 local Canvas = require(script.Parent.Canvas)
 local Liquid = require(script.Parent.Liquid)
+local VectorBlood = require(script.Vector)
 local Surface = require(script.Surface)
 
 --[=[
@@ -1133,14 +1134,18 @@ local Surface = require(script.Surface)
 local Blood = {}
 
 local SETTINGS = {
-	ProxySize = 8, -- footprint of a blood proxy, in studs. Bigger = blood streaks within ONE
-	-- continuous canvas instead of tiling into visible squares (fewer proxies, fewer seams).
+	-- "Vector" (default): smooth animated Path2D drips - no pixels, no edges, cheap on any surface.
+	-- "Pixel": the Liquid cellular sim (raster; tiles into proxies). Vector is recommended for blood.
+	Renderer = "Vector",
+	VectorFresh = Color3.fromRGB(135, 8, 10),
+	VectorDry = Color3.fromRGB(62, 16, 12),
+	ProxySize = 10, -- footprint of a blood proxy, in studs (drip room; vector is cheap at any size)
 	ProxyThickness = 0.08,
 	ProxyOffset = 0.02, -- how far off the surface to float the proxy (avoid z-fighting)
-	PixelsPerStud = 6, -- resolution per proxy stud (ProxySize * this = canvas size, capped below)
+	PixelsPerStud = 6, -- (Pixel renderer only) resolution per proxy stud, capped below
 	MaxResolution = 64,
-	EdgeFade = 3, -- pixels of alpha falloff at a proxy's border, so its square edge blends out
-	ReuseRadius = 5, -- splats within this many studs reuse a proxy (fewer, bigger blood patches)
+	EdgeFade = 3, -- (Pixel renderer only) border alpha falloff so its square edge blends out
+	ReuseRadius = 6, -- splats within this many studs reuse a proxy (fewer, bigger blood patches)
 	Preset = "Blood",
 	DropletSize = 0.4,
 	DropletColor = Color3.fromRGB(120, 6, 8),
@@ -1217,8 +1222,8 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 		right = -right
 	end
 
+	local vector = SETTINGS.Renderer == "Vector"
 	local size = SETTINGS.ProxySize
-	local res = math.clamp(math.floor(size * SETTINGS.PixelsPerStud), 8, SETTINGS.MaxResolution)
 
 	local part = Instance.new("Part")
 	part.Name = "BloodProxy"
@@ -1246,19 +1251,7 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 	local gui = Instance.new("SurfaceGui")
 	gui.Name = "IMGNBlood"
 	gui.Face = Enum.NormalId.Back -- the +Z face, which faces outward
-	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
-	gui.PixelsPerStud = 50
 	gui.Adornee = part
-	gui.Parent = part
-
-	local canvas = Canvas.new({ Resolution = Vector2.new(res, res), Parent = gui })
-	local liquid = Liquid.new({
-		Canvas = canvas,
-		Preset = SETTINGS.Preset,
-		Gravity = gravity,
-		EdgeFade = SETTINGS.EdgeFade,
-	})
-	liquid:Start()
 
 	local self = setmetatable({
 		Part = part,
@@ -1266,32 +1259,64 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 		Center = worldPos,
 		Normal = normal,
 		Up = up,
-		Liquid = liquid,
 		Size = size,
-		Res = res,
 		IsDrip = gravity.Y > 0.5, -- a wall/slope sheds off its bottom edge; a floor just pools
 		_dripCD = 0,
 	}, BloodProxy)
 
-	-- cross-surface dripping: when fluid reaches the bottom edge, shed it as a falling droplet that
-	-- lands on (and drips down) whatever is below - cascading down a ramp and onto the ground.
-	if SETTINGS.EdgeDrip and self.IsDrip then
-		liquid.OnStep = function(dt)
-			BloodProxy.checkEdge(self, dt)
+	if vector then
+		-- vector: a fixed 100x100 virtual canvas, smooth Path2D drips, +Y = downhill
+		gui.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
+		gui.CanvasSize = Vector2.new(100, 100)
+		gui.Parent = part
+		self.Vector = VectorBlood.new(gui, {
+			Fresh = SETTINGS.VectorFresh,
+			Dry = SETTINGS.VectorDry,
+			OnDrip = if SETTINGS.EdgeDrip and self.IsDrip then function(x)
+				BloodProxy.shed(self, x, SETTINGS.SplatAmount * 0.6)
+			end else nil,
+		})
+		self.Vector:Start()
+	else
+		-- pixel: the Liquid cellular sim on a Frame canvas
+		gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+		gui.PixelsPerStud = 50
+		gui.Parent = part
+		local res = math.clamp(math.floor(size * SETTINGS.PixelsPerStud), 8, SETTINGS.MaxResolution)
+		self.Res = res
+		self.Liquid = Liquid.new({
+			Canvas = Canvas.new({ Resolution = Vector2.new(res, res), Parent = gui }),
+			Preset = SETTINGS.Preset,
+			Gravity = gravity,
+			EdgeFade = SETTINGS.EdgeFade,
+		})
+		self.Liquid:Start()
+		if SETTINGS.EdgeDrip and self.IsDrip then
+			self.Liquid.OnStep = function(dt)
+				BloodProxy.checkEdge(self, dt)
+			end
 		end
 	end
 
 	return self
 end
 
--- world position of a canvas pixel, just off the front of the surface
-function BloodProxy.worldOfPixel(self: any, px: number, py: number): Vector3
-	local lx = ((px + 0.5) / self.Res - 0.5) * self.Size
-	local ly = (0.5 - (py + 0.5) / self.Res) * self.Size
+-- world position of a canvas point (x, y in 0..1 scale), just off the front of the surface
+function BloodProxy.worldOfScale(self: any, x: number, y: number): Vector3
+	local lx = (x - 0.5) * self.Size
+	local ly = (0.5 - y) * self.Size -- +Y scale is downhill, +Y local is up-slope
 	return self.Part.CFrame:PointToWorldSpace(Vector3.new(lx, ly, SETTINGS.ProxyThickness))
 end
 
--- shed a drip off the bottom edge if enough fluid has pooled there (throttled)
+-- shed a falling droplet off the bottom edge at scale-x `x`, continuing the cascade below
+function BloodProxy.shed(self: any, x: number, amount: number)
+	local pos = BloodProxy.worldOfScale(self, x, 0.97)
+	local downhill = -self.Up
+	local velocity = downhill * 6 + Vector3.new(0, -2, 0)
+	Blood.Emit(pos + self.Normal * 0.2, velocity, { Amount = math.max(2, amount) })
+end
+
+-- (Pixel renderer) shed off the bottom edge if enough fluid pooled there (throttled)
 function BloodProxy.checkEdge(self: any, dt: number)
 	self._dripCD -= dt
 	if self._dripCD > 0 then
@@ -1302,25 +1327,22 @@ function BloodProxy.checkEdge(self: any, dt: number)
 		return
 	end
 	self._dripCD = SETTINGS.DripInterval
-
-	local pos = BloodProxy.worldOfPixel(self, x, self.Res - 1)
-	-- carry it down the surface so it lands a few studs lower (new proxy) or off the end (ground)
-	local downhill = -self.Up
-	local velocity = downhill * 6 + Vector3.new(0, -2, 0)
-	Blood.Emit(pos + self.Normal * 0.2, velocity, { Amount = math.max(2, taken :: number) })
+	BloodProxy.shed(self, (x + 0.5) / self.Res, taken :: number)
 end
 
--- world point -> this proxy's canvas pixel (proxy is a known fixed-size part, so this is exact)
-function BloodProxy.Pixel(self: any, worldPos: Vector3): (number, number)
+-- world point -> this proxy's canvas scale (0..1, +Y down)
+function BloodProxy.Scale(self: any, worldPos: Vector3): (number, number)
 	local lp = self.Part.CFrame:PointToObjectSpace(worldPos)
-	local u = 0.5 + lp.X / self.Size
-	local v = 0.5 - lp.Y / self.Size -- +Y local is up-slope, so canvas v grows downward
-	return math.clamp(math.floor(u * self.Res), 0, self.Res - 1), math.clamp(math.floor(v * self.Res), 0, self.Res - 1)
+	return math.clamp(0.5 + lp.X / self.Size, 0, 1), math.clamp(0.5 - lp.Y / self.Size, 0, 1)
 end
 
 function BloodProxy.Splat(self: any, worldPos: Vector3, amount: number)
-	local px, py = BloodProxy.Pixel(self, worldPos)
-	self.Liquid:Splat(px, py, amount, { Spread = 3 + amount })
+	local sx, sy = BloodProxy.Scale(self, worldPos)
+	if self.Vector then
+		self.Vector:Splat(sx, sy, amount)
+	else
+		self.Liquid:Splat(math.floor(sx * self.Res), math.floor(sy * self.Res), amount, { Spread = 3 + amount })
+	end
 end
 
 -- find a nearby proxy on the same part facing the same way, or make a new one
@@ -1612,6 +1634,205 @@ function Surface.dripBasis(normal: Vector3): (Vector3, Vector3, Vector2)
 end
 
 return Surface
+]])
+mod("Vector", _4, [[
+-- IMGN
+-- _Classes/Blood/Vector.luau
+-- Plinko Labs
+--
+-- Vector blood: instead of a pixel grid (which tiles into visible squares and pixelates), a splat
+-- is drawn as smooth, animated Path2D strokes - a blob plus a few drips that GROW downward over
+-- time, each a Bezier path that tapers and dries. No pixels, so no edges and no resolution limit;
+-- a whole splat is a handful of instances, not thousands of Frames.
+--
+-- The canvas is a FixedSize (100x100 virtual) SurfaceGui, so all positions are 0..1 scale with +Y
+-- downhill (the proxy is oriented that way) and Path2D Thickness is in those virtual units. When a
+-- drip reaches the bottom it fires OnDrip(x) so the engine can shed a 3D droplet onto the surface
+-- below. NEEDS A STUDIO PASS: Path2D's exact thickness units / parenting are runtime-only.
+
+local RunService = game:GetService("RunService")
+
+local Vector = {}
+Vector.__index = Vector
+
+--[=[
+	@class VectorBlood
+	@within Blood
+	Renders blood as animated Path2D strokes on a SurfaceGui. Created by a [BloodProxy] when the
+	engine's `Renderer` is `"Vector"`.
+]=]
+
+local function circle(parent: Instance, x: number, y: number, size: number, color: Color3): Frame
+	local f = Instance.new("Frame")
+	f.AnchorPoint = Vector2.new(0.5, 0.5)
+	f.Position = UDim2.fromScale(x, y)
+	f.Size = UDim2.fromScale(size, size)
+	f.BackgroundColor3 = color
+	f.BorderSizePixel = 0
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0.5, 0)
+	corner.Parent = f
+	f.Parent = parent
+	return f
+end
+
+local function newPath(parent: Instance, color: Color3, thickness: number): any
+	local p = Instance.new("Path2D")
+	p.Color3 = color
+	p.Thickness = thickness
+	p.Parent = parent
+	return p
+end
+
+local function setPath(path: any, x0, y0, x1, y1, x2, y2)
+	path:SetControlPoints({
+		Path2DControlPoint.new(UDim2.fromScale(x0, y0)),
+		Path2DControlPoint.new(UDim2.fromScale(x1, y1)),
+		Path2DControlPoint.new(UDim2.fromScale(x2, y2)),
+	})
+end
+
+export type VectorConfig = {
+	Fresh: Color3,
+	Dry: Color3,
+	DripWidth: number?, -- stroke thickness in virtual units (canvas is 100 wide)
+	GrowSpeed: number?, -- how fast drips extend (scale per second)
+	DryRate: number?, -- 0..1 per second
+	MaxDrips: number?,
+	OnDrip: ((x: number) -> ())?, -- fired when a drip reaches the bottom edge (x in 0..1)
+}
+
+function Vector.new(surfaceGui: SurfaceGui, config: VectorConfig)
+	local container = Instance.new("Frame")
+	container.Name = "VectorBlood"
+	container.Size = UDim2.fromScale(1, 1)
+	container.BackgroundTransparency = 1
+	container.BorderSizePixel = 0
+	container.Parent = surfaceGui
+
+	local self = setmetatable({
+		Fresh = config.Fresh,
+		Dry = config.Dry,
+		DripWidth = config.DripWidth or 3,
+		GrowSpeed = config.GrowSpeed or 0.6,
+		DryRate = config.DryRate or 0.06,
+		MaxDrips = config.MaxDrips or 4,
+		OnDrip = config.OnDrip,
+		_container = container,
+		_drips = {},
+		_blobs = {},
+		_active = false,
+		_conn = nil,
+	}, Vector)
+
+	return self
+end
+
+--[=[
+	@within VectorBlood
+	Splats blood at `(x, y)` (0..1 scale, +Y down) - a blob plus `amount`-scaled drips that grow.
+]=]
+function Vector.Splat(self: any, x: number, y: number, amount: number)
+	table.insert(self._blobs, {
+		frame = circle(self._container, x, y, math.clamp(0.04 + amount * 0.015, 0.04, 0.18), self.Fresh),
+		dry = 0,
+	})
+
+	local count = math.clamp(math.floor(amount / 2), 1, self.MaxDrips)
+	for _ = 1, count do
+		local dx = (math.random() - 0.5) * 0.12
+		local width = self.DripWidth * (0.6 + amount / 8)
+		table.insert(self._drips, {
+			x = math.clamp(x + dx, 0.02, 0.98),
+			y = y,
+			wiggle = (math.random() - 0.5) * 0.08,
+			length = 0,
+			target = math.clamp((0.2 + math.random() * 0.5) * (amount / 4), 0.1, 0.9),
+			path = newPath(self._container, self.Fresh, width),
+			head = circle(self._container, x + dx, y, width * 0.012 + 0.02, self.Fresh),
+			dry = 0,
+			shed = false,
+		})
+	end
+
+	self._active = true
+end
+
+--[=[
+	@within VectorBlood
+	Advances the drip animation. Called by the loop; safe to call directly for a fixed step.
+]=]
+function Vector.Step(self: any, dt: number)
+	if not self._active then
+		return
+	end
+	local active = false
+
+	for _, d in self._drips do
+		if d.length < d.target then
+			d.length = math.min(d.target, d.length + self.GrowSpeed * dt)
+			active = true
+		end
+		local endY = math.min(0.99, d.y + d.length)
+		setPath(d.path, d.x, d.y, d.x + d.wiggle, d.y + d.length * 0.5, d.x, endY)
+		d.head.Position = UDim2.fromScale(d.x, endY)
+
+		if d.dry < 1 then
+			d.dry = math.min(1, d.dry + self.DryRate * dt)
+			active = true
+			local color = self.Fresh:Lerp(self.Dry, d.dry)
+			d.path.Color3 = color
+			d.head.BackgroundColor3 = color
+		end
+
+		-- reached the bottom edge: shed a droplet onto whatever's below
+		if not d.shed and endY >= 0.95 then
+			d.shed = true
+			if self.OnDrip then
+				self.OnDrip(d.x)
+			end
+		end
+	end
+
+	for _, b in self._blobs do
+		if b.dry < 1 then
+			b.dry = math.min(1, b.dry + self.DryRate * dt)
+			active = true
+			b.frame.BackgroundColor3 = self.Fresh:Lerp(self.Dry, b.dry)
+		end
+	end
+
+	self._active = active
+end
+
+--[=[
+	@within VectorBlood
+	Starts the per-frame animation loop (sleeps automatically once everything has grown + dried).
+]=]
+function Vector.Start(self: any)
+	if self._conn then
+		return
+	end
+	self._conn = RunService.Heartbeat:Connect(function(dt)
+		Vector.Step(self, math.min(dt, 1 / 30))
+	end)
+end
+
+function Vector.Stop(self: any)
+	if self._conn then
+		self._conn:Disconnect()
+		self._conn = nil
+	end
+end
+
+function Vector.Destroy(self: any)
+	Vector.Stop(self)
+	self._container:Destroy()
+	self._drips = {}
+	self._blobs = {}
+end
+
+return Vector
 ]])
 local _5 = mod("Canvas", _2, [[
 -- IMGN
@@ -8186,5 +8407,5 @@ end
 return Image
 ]])
 
-print("[IMGN] installed 55 modules under ReplicatedStorage.IMGN")
+print("[IMGN] installed 56 modules under ReplicatedStorage.IMGN")
 return true

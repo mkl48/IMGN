@@ -184,7 +184,11 @@ See `examples/BloodDrip.server.luau`.
 
 ### Blood engine (`IMGN.Blood`)
 
-A full droplet-and-drip system built on `Liquid`: throw 3D blood that lands on surfaces and drips down them, correctly following each surface's **downhill** — walls, slopes, and rotated/moving parts.
+A full droplet-and-drip system: throw 3D blood that lands on surfaces and drips down them, correctly following each surface's **downhill** — walls, slopes, and rotated/moving parts.
+
+**Two renderers** (set with `IMGN.Blood.Configure { Renderer = … }`):
+- **`"Vector"`** *(default)* — drips are smooth, animated **`Path2D` strokes** (a blob + tapering drips that grow downward and dry). No pixels, so **no tiles, no edges, no resolution limit**, and a whole splat is a handful of instances — cheap on a surface of any size. Recommended.
+- **`"Pixel"`** — the `Liquid` cellular fluid sim (raster, on a Frame canvas). Physically richer pooling, but tiles into proxies and pixelates. Use it when you want true fluid spreading.
 
 ```lua
 -- a kill brick that sprays blood when stepped on
