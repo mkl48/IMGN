@@ -83,6 +83,7 @@ function Vector.new(surfaceGui: SurfaceGui, config: VectorConfig)
 		_container = container,
 		_drips = {},
 		_blobs = {},
+		_puddles = {},
 		_active = false,
 		_conn = nil,
 	}, Vector)
@@ -92,24 +93,52 @@ end
 
 --[=[
 	@within VectorBlood
-	Splats blood at `(x, y)` (0..1 scale, +Y down) - a blob plus `amount`-scaled drips that grow.
+	Splats blood at `(x, y)` (0..1 scale, +Y down). `options.Puddle` makes a growing puddle (for
+	floors); otherwise a blob + drips that grow downward and stop at `options.EdgeY` (the surface's
+	real edge in scale, default `0.96`), shedding there.
 ]=]
-function Vector.Splat(self: any, x: number, y: number, amount: number)
+function Vector.Splat(self: any, x: number, y: number, amount: number, options: { EdgeY: number?, Puddle: boolean? }?)
+	local opts = options or {}
+
 	table.insert(self._blobs, {
-		frame = circle(self._container, x, y, math.clamp(0.04 + amount * 0.015, 0.04, 0.18), self.Fresh),
+		frame = circle(self._container, x, y, math.clamp(0.04 + amount * 0.015, 0.04, 0.2), self.Fresh),
 		dry = 0,
 	})
+
+	if opts.Puddle then
+		-- a floor: spread into a growing puddle instead of dripping
+		table.insert(self._puddles, {
+			frame = circle(self._container, x, y, 0.02, self.Fresh),
+			radius = 0.02,
+			target = math.clamp(0.08 + amount * 0.05, 0.08, 0.6),
+			dry = 0,
+		})
+		self._active = true
+		return
+	end
+
+	local edgeY = math.min(opts.EdgeY or 0.96, 0.96)
+	if edgeY <= y + 0.01 then
+		-- the splat is right at the edge: just shed, no room to drip
+		if self.OnDrip then
+			self.OnDrip(x, edgeY)
+		end
+		self._active = true
+		return
+	end
 
 	local count = math.clamp(math.floor(amount / 2), 1, self.MaxDrips)
 	for _ = 1, count do
 		local dx = (math.random() - 0.5) * 0.12
 		local width = self.DripWidth * (0.6 + amount / 8)
+		local wantLen = math.clamp((0.2 + math.random() * 0.5) * (amount / 4), 0.08, 0.9)
 		table.insert(self._drips, {
 			x = math.clamp(x + dx, 0.02, 0.98),
 			y = y,
 			wiggle = (math.random() - 0.5) * 0.08,
 			length = 0,
-			target = math.clamp((0.2 + math.random() * 0.5) * (amount / 4), 0.1, 0.9),
+			target = math.min(wantLen, edgeY - y), -- never grow past the real edge
+			limit = edgeY,
 			path = newPath(self._container, self.Fresh, width),
 			head = circle(self._container, x + dx, y, width * 0.012 + 0.02, self.Fresh),
 			dry = 0,
@@ -135,7 +164,7 @@ function Vector.Step(self: any, dt: number)
 			d.length = math.min(d.target, d.length + self.GrowSpeed * dt)
 			active = true
 		end
-		local endY = math.min(0.99, d.y + d.length)
+		local endY = math.min(d.limit, d.y + d.length)
 		setPath(d.path, d.x, d.y, d.x + d.wiggle, d.y + d.length * 0.5, d.x, endY)
 		d.head.Position = UDim2.fromScale(d.x, endY)
 
@@ -147,12 +176,25 @@ function Vector.Step(self: any, dt: number)
 			d.head.BackgroundColor3 = color
 		end
 
-		-- reached the bottom edge: shed a droplet onto whatever's below
-		if not d.shed and endY >= 0.95 then
+		-- reached the surface's real edge: shed a droplet onto whatever's below
+		if not d.shed and endY >= d.limit - 1e-3 then
 			d.shed = true
 			if self.OnDrip then
-				self.OnDrip(d.x)
+				self.OnDrip(d.x, d.limit)
 			end
+		end
+	end
+
+	for _, p in self._puddles do
+		if p.radius < p.target then
+			p.radius = math.min(p.target, p.radius + self.GrowSpeed * 0.4 * dt)
+			p.frame.Size = UDim2.fromScale(p.radius, p.radius)
+			active = true
+		end
+		if p.dry < 1 then
+			p.dry = math.min(1, p.dry + self.DryRate * dt)
+			active = true
+			p.frame.BackgroundColor3 = self.Fresh:Lerp(self.Dry, p.dry)
 		end
 	end
 
@@ -192,6 +234,7 @@ function Vector.Destroy(self: any)
 	self._container:Destroy()
 	self._drips = {}
 	self._blobs = {}
+	self._puddles = {}
 end
 
 return Vector

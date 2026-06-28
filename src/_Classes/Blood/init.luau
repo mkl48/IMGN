@@ -167,8 +167,8 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 		self.Vector = VectorBlood.new(gui, {
 			Fresh = SETTINGS.VectorFresh,
 			Dry = SETTINGS.VectorDry,
-			OnDrip = if SETTINGS.EdgeDrip and self.IsDrip then function(x)
-				BloodProxy.shed(self, x, SETTINGS.SplatAmount * 0.6)
+			OnDrip = if SETTINGS.EdgeDrip and self.IsDrip then function(x, y)
+				BloodProxy.shed(self, x, y, SETTINGS.SplatAmount * 0.6)
 			end else nil,
 		})
 		self.Vector:Start()
@@ -203,9 +203,36 @@ function BloodProxy.worldOfScale(self: any, x: number, y: number): Vector3
 	return self.Part.CFrame:PointToWorldSpace(Vector3.new(lx, ly, SETTINGS.ProxyThickness))
 end
 
--- shed a falling droplet off the bottom edge at scale-x `x`, continuing the cascade below
-function BloodProxy.shed(self: any, x: number, amount: number)
-	local pos = BloodProxy.worldOfScale(self, x, 0.97)
+-- distance (in 0..1 scale, downhill) from a splat point to the hit part's real edge, so drips
+-- stop at the actual surface edge instead of floating out onto the oversized proxy.
+function BloodProxy.edgeDistanceScale(self: any, worldPos: Vector3): number
+	local hp = self.HitPart
+	if not hp then
+		return 0.96
+	end
+	local localP = hp.CFrame:PointToObjectSpace(worldPos)
+	local localD = hp.CFrame:VectorToObjectSpace(-self.Up) -- downhill in the part's local space
+	local half = hp.Size * 0.5
+	local tExit = math.huge
+	for _, axis in { "X", "Y", "Z" } do
+		local d = localD[axis]
+		if math.abs(d) > 1e-4 then
+			local bound = if d > 0 then half[axis] else -half[axis]
+			local t = (bound - localP[axis]) / d
+			if t > 0 then
+				tExit = math.min(tExit, t)
+			end
+		end
+	end
+	if tExit == math.huge then
+		return 0.96
+	end
+	return tExit / self.Size -- studs -> proxy scale
+end
+
+-- shed a falling droplet off the edge at scale `(x, y)`, continuing the cascade below
+function BloodProxy.shed(self: any, x: number, y: number, amount: number)
+	local pos = BloodProxy.worldOfScale(self, x, y)
 	local downhill = -self.Up
 	local velocity = downhill * 6 + Vector3.new(0, -2, 0)
 	Blood.Emit(pos + self.Normal * 0.2, velocity, { Amount = math.max(2, amount) })
@@ -222,7 +249,7 @@ function BloodProxy.checkEdge(self: any, dt: number)
 		return
 	end
 	self._dripCD = SETTINGS.DripInterval
-	BloodProxy.shed(self, (x + 0.5) / self.Res, taken :: number)
+	BloodProxy.shed(self, (x + 0.5) / self.Res, 0.97, taken :: number)
 end
 
 -- world point -> this proxy's canvas scale (0..1, +Y down)
@@ -234,7 +261,13 @@ end
 function BloodProxy.Splat(self: any, worldPos: Vector3, amount: number)
 	local sx, sy = BloodProxy.Scale(self, worldPos)
 	if self.Vector then
-		self.Vector:Splat(sx, sy, amount)
+		if self.IsDrip then
+			-- stop drips at the part's real edge (or the proxy's, whichever is nearer)
+			local edgeY = math.clamp(sy + BloodProxy.edgeDistanceScale(self, worldPos), sy + 0.02, 0.96)
+			self.Vector:Splat(sx, sy, amount, { EdgeY = edgeY })
+		else
+			self.Vector:Splat(sx, sy, amount, { Puddle = true }) -- floor/ceiling: spread a puddle
+		end
 	else
 		self.Liquid:Splat(math.floor(sx * self.Res), math.floor(sy * self.Res), amount, { Spread = 3 + amount })
 	end
