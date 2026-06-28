@@ -2418,7 +2418,8 @@ end
 --[=[
 	@within Canvas
 	Runs `shader(x, y, currentColor, currentAlpha)` for every pixel and writes back whatever colour
-	(and optional alpha) it returns; returning `nil` leaves the pixel untouched. This is the
+	(and optional alpha) it returns; returning `nil` leaves the pixel untouched. A returned colour is
+	**opaque by default** (return an explicit alpha to keep it translucent). This is the
 	procedural/generated path - gradients, noise, plots, data viz.
 ]=]
 function Canvas.Shader(self: Canvas, shader: (x: number, y: number, color: Color3, alpha: number) -> (Color3?, number?))
@@ -2428,7 +2429,9 @@ function Canvas.Shader(self: Canvas, shader: (x: number, y: number, color: Color
 			local current, currentAlpha = PixelBuffer.Get(self._buffer, x, y)
 			local color, alpha = shader(x, y, current, currentAlpha)
 			if color then
-				PixelBuffer.Set(self._buffer, x, y, color, if alpha ~= nil then alpha else currentAlpha)
+				-- default a painted colour to opaque, so a Shader on a fresh (transparent) canvas
+				-- is actually visible
+				PixelBuffer.Set(self._buffer, x, y, color, if alpha ~= nil then alpha else 1)
 			end
 		end
 	end
