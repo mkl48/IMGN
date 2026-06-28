@@ -23,12 +23,15 @@ local RaycasterClass = require(script._Classes.Raycaster)
 local ImageHelper = require(script._Patterns.Image)
 local DitherHelper = require(script._Patterns.Dither)
 local TextureHelper = require(script._Patterns.Texture)
+local ChartHelper = require(script._Patterns.Chart)
+local IdenticonHelper = require(script._Patterns.Identicon)
 local ConfigModule = require(script._Core.Config)
 
 local IMGN = {}
 
 export type Canvas = Canvas.Canvas
 export type CanvasConfig = Canvas.CanvasConfig
+export type Region = Canvas.Region
 export type App = AppClass.App
 export type AppConfig = AppClass.AppConfig
 export type Object = AppClass.Object
@@ -123,6 +126,22 @@ end
 	textures, and `IMGN.Texture.fromCanvas(canvas)` turns a loaded image into a wall/sprite texture.
 ]=]
 IMGN.Texture = TextureHelper
+
+--[=[
+	@within IMGN
+	Chart drawing onto a canvas/region: `IMGN.Chart.line(target, data, opts)`,
+	`IMGN.Chart.bar(target, data, opts)`, `IMGN.Chart.pie(target, slices)`.
+]=]
+IMGN.Chart = ChartHelper
+
+--[=[
+	@within IMGN
+	Draws a deterministic identicon (symmetric avatar) for `seed` onto a canvas/region - a unique
+	per-player/per-item icon with no uploads. See [Identicon].
+]=]
+function IMGN.Identicon(target: any, seed: any, options: any?)
+	IdenticonHelper.draw(target, seed, options)
+end
 
 --[=[
 	@within IMGN

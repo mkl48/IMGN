@@ -65,12 +65,15 @@ local RaycasterClass = require(script._Classes.Raycaster)
 local ImageHelper = require(script._Patterns.Image)
 local DitherHelper = require(script._Patterns.Dither)
 local TextureHelper = require(script._Patterns.Texture)
+local ChartHelper = require(script._Patterns.Chart)
+local IdenticonHelper = require(script._Patterns.Identicon)
 local ConfigModule = require(script._Core.Config)
 
 local IMGN = {}
 
 export type Canvas = Canvas.Canvas
 export type CanvasConfig = Canvas.CanvasConfig
+export type Region = Canvas.Region
 export type App = AppClass.App
 export type AppConfig = AppClass.AppConfig
 export type Object = AppClass.Object
@@ -165,6 +168,22 @@ end
 	textures, and `IMGN.Texture.fromCanvas(canvas)` turns a loaded image into a wall/sprite texture.
 ]=]
 IMGN.Texture = TextureHelper
+
+--[=[
+	@within IMGN
+	Chart drawing onto a canvas/region: `IMGN.Chart.line(target, data, opts)`,
+	`IMGN.Chart.bar(target, data, opts)`, `IMGN.Chart.pie(target, slices)`.
+]=]
+IMGN.Chart = ChartHelper
+
+--[=[
+	@within IMGN
+	Draws a deterministic identicon (symmetric avatar) for `seed` onto a canvas/region - a unique
+	per-player/per-item icon with no uploads. See [Identicon].
+]=]
+function IMGN.Identicon(target: any, seed: any, options: any?)
+	IdenticonHelper.draw(target, seed, options)
+end
 
 --[=[
 	@within IMGN
@@ -2219,6 +2238,7 @@ local Draw = require(script.Parent.Parent._Patterns.Draw)
 local Font = require(script.Parent.Parent._Patterns.Font)
 local Image = require(script.Parent.Parent._Patterns.Image)
 local Dither = require(script.Parent.Parent._Patterns.Dither)
+local Region = require(script.Region)
 
 local Config = ConfigModule.Config
 
@@ -2285,6 +2305,8 @@ export type CanvasConfig = {
 	Driver: Drivers.DriverType?,
 	AutoRender: boolean?,
 }
+
+export type Region = Region.Region
 
 export type Canvas = typeof(setmetatable(
 	{} :: {
@@ -2578,6 +2600,16 @@ end
 
 --[=[
 	@within Canvas
+	Returns a [Region] - a sub-canvas at `(x, y)` of size `width` x `height` with its own local
+	coordinates, clipped to it. Draw on the region in local space; with the `Sparse` driver this
+	lets one giant canvas stay cheap while you only ever touch the regions you draw in.
+]=]
+function Canvas.Query(self: Canvas, x: number, y: number, width: number, height: number): Region.Region
+	return Region.new(self, x, y, width, height)
+end
+
+--[=[
+	@within Canvas
 	Snaps every pixel to its nearest colour in `palette` (an array of `Color3`). Reduces the canvas
 	to those colours - call `:Render()` after.
 ]=]
@@ -2684,6 +2716,163 @@ function Canvas.Destroy(self: Canvas)
 end
 
 return Canvas
+]])
+mod("Region", _5, [[
+-- IMGN
+-- _Classes/Canvas/Region.luau
+-- Plinko Labs
+--
+-- A Region is a sub-canvas: a window onto a parent Canvas at a position + size, with its OWN local
+-- (0,0)-origin coordinate space. Everything you draw is in the region's coordinates and clipped to
+-- it, then written into the parent at the offset. Paired with the Sparse driver this is the way to
+-- handle giant surfaces: one big logical Canvas (empty pixels cost nothing), and you `:Query` a
+-- region wherever you actually want to draw - a splat, a UI panel, a tile - and work in convenient
+-- local space without touching the rest of the canvas.
+
+local Draw = require(script.Parent.Parent.Parent._Patterns.Draw)
+local Font = require(script.Parent.Parent.Parent._Patterns.Font)
+
+--[=[
+	@class Region
+	A sub-canvas of a [Canvas] (from [Canvas:Query]) with local coordinates clipped to its bounds.
+	Has the same drawing surface as a Canvas - `SetPixel`, `Draw*`, `Text`, `Shader`, `Fill` - plus
+	`Width`/`Height` (the region size). Call the parent's `:Render()` (or this region's, which
+	forwards) to show edits.
+]=]
+local Region = {}
+Region.__index = Region
+
+export type Region = typeof(setmetatable({} :: any, Region))
+
+function Region.new(canvas: any, x: number, y: number, width: number, height: number): Region
+	-- clamp the window to the parent canvas
+	x = math.clamp(math.floor(x), 0, canvas.Width)
+	y = math.clamp(math.floor(y), 0, canvas.Height)
+	width = math.clamp(math.floor(width), 0, canvas.Width - x)
+	height = math.clamp(math.floor(height), 0, canvas.Height - y)
+	return setmetatable({
+		Canvas = canvas,
+		X = x,
+		Y = y,
+		Width = width,
+		Height = height,
+	}, Region)
+end
+
+--[=[
+	@within Region
+	Writes a pixel at local `(x, y)`; clipped to the region.
+]=]
+function Region.SetPixel(self: Region, x: number, y: number, color: Color3, alpha: number?)
+	if x < 0 or y < 0 or x >= self.Width or y >= self.Height then
+		return
+	end
+	self.Canvas:SetPixel(self.X + x, self.Y + y, color, alpha)
+end
+
+--[=[
+	@within Region
+	Reads the pixel at local `(x, y)`. Out of bounds returns transparent black.
+]=]
+function Region.GetPixel(self: Region, x: number, y: number): (Color3, number)
+	if x < 0 or y < 0 or x >= self.Width or y >= self.Height then
+		return Color3.new(0, 0, 0), 0
+	end
+	return self.Canvas:GetPixel(self.X + x, self.Y + y)
+end
+
+--[=[
+	@within Region
+	Fills the whole region with `color`/`alpha`.
+]=]
+function Region.Fill(self: Region, color: Color3, alpha: number?)
+	for y = 0, self.Height - 1 do
+		for x = 0, self.Width - 1 do
+			self.Canvas:SetPixel(self.X + x, self.Y + y, color, alpha)
+		end
+	end
+end
+
+--[=[
+	@within Region
+	Clears the region to transparent.
+]=]
+function Region.Clear(self: Region)
+	Region.Fill(self, Color3.new(0, 0, 0), 0)
+end
+
+local function plotter(self: Region, color: Color3, alpha: number?)
+	return function(x: number, y: number)
+		Region.SetPixel(self, x, y, color, alpha)
+	end
+end
+
+--[=[
+	@within Region
+	Line from `(x0, y0)` to `(x1, y1)` in local space.
+]=]
+function Region.DrawLine(self: Region, x0: number, y0: number, x1: number, y1: number, color: Color3, alpha: number?)
+	Draw.line(plotter(self, color, alpha), x0, y0, x1, y1)
+end
+
+--[=[
+	@within Region
+	Rectangle at local `(x, y)`, size `width` x `height`.
+]=]
+function Region.DrawRect(self: Region, x: number, y: number, width: number, height: number, color: Color3, filled: boolean?, alpha: number?)
+	Draw.rect(plotter(self, color, alpha), x, y, width, height, filled)
+end
+
+--[=[
+	@within Region
+	Circle of `radius` centred on local `(cx, cy)`.
+]=]
+function Region.DrawCircle(self: Region, cx: number, cy: number, radius: number, color: Color3, filled: boolean?, alpha: number?)
+	Draw.circle(plotter(self, color, alpha), cx, cy, radius, filled)
+end
+
+--[=[
+	@within Region
+	Bitmap text at local `(x, y)`.
+]=]
+function Region.Text(self: Region, text: string, x: number, y: number, color: Color3, scale: number?, alpha: number?): number
+	return Font.draw(plotter(self, color, alpha), text, math.floor(x), math.floor(y), scale)
+end
+
+--[=[
+	@within Region
+	Runs `shader(x, y, color, alpha)` over every pixel of the region (local coords); a returned
+	colour is opaque unless an alpha is returned, `nil` leaves the pixel.
+]=]
+function Region.Shader(self: Region, shader: (x: number, y: number, color: Color3, alpha: number) -> (Color3?, number?))
+	for y = 0, self.Height - 1 do
+		for x = 0, self.Width - 1 do
+			local current, currentAlpha = Region.GetPixel(self, x, y)
+			local color, alpha = shader(x, y, current, currentAlpha)
+			if color then
+				Region.SetPixel(self, x, y, color, if alpha ~= nil then alpha else 1)
+			end
+		end
+	end
+end
+
+--[=[
+	@within Region
+	A sub-region of this region (coordinates relative to this region).
+]=]
+function Region.Query(self: Region, x: number, y: number, width: number, height: number): Region
+	return Region.new(self.Canvas, self.X + x, self.Y + y, width, height)
+end
+
+--[=[
+	@within Region
+	Flushes the parent canvas (forwards to its `:Render`).
+]=]
+function Region.Render(self: Region)
+	self.Canvas:Render()
+end
+
+return Region
 ]])
 local _6 = mod("Liquid", _2, [[
 -- IMGN
@@ -9261,6 +9450,151 @@ return function<T>(): T
 end
 ]])
 local _20 = folder("_Patterns", _1)
+mod("Chart", _20, [[
+-- IMGN
+-- _Patterns/Chart.luau
+-- Plinko Labs
+--
+-- Charts drawn onto any canvas/region: line, bar and pie. `target` is anything with `Width`,
+-- `Height`, `SetPixel`, `DrawLine`, `DrawRect` (a Canvas or a Region), so a chart drops straight
+-- onto a HUD, a stat panel, or a sub-region of a bigger canvas. Useful for the boring-but-needed
+-- stuff: economy dashboards, leaderboards, fps/ping overlays, admin tooling.
+
+--[=[
+	@class Chart
+	Line / bar / pie chart drawing onto a [Canvas] or [Region]. Reached via `IMGN.Chart`.
+]=]
+local Chart = {}
+
+local function extent(data: { number }): (number, number)
+	local min, max = math.huge, -math.huge
+	for _, v in data do
+		min = math.min(min, v)
+		max = math.max(max, v)
+	end
+	if min == math.huge then
+		return 0, 1
+	end
+	if max == min then
+		max = min + 1
+	end
+	return min, max
+end
+
+--[=[
+	@within Chart
+	Plots `data` (an array of numbers) as a line graph. `options`: `Color`, `Min`/`Max` (else auto),
+	`Pad` (margin px). The line is drawn left-to-right, low values at the bottom.
+]=]
+function Chart.line(target: any, data: { number }, options: { Color: Color3?, Min: number?, Max: number?, Pad: number? }?)
+	local opts = options or {}
+	local n = #data
+	if n < 2 then
+		return
+	end
+	local W, H = target.Width, target.Height
+	local pad = opts.Pad or 1
+	local dmin, dmax = extent(data)
+	local lo = opts.Min or dmin
+	local hi = opts.Max or dmax
+	if hi == lo then
+		hi = lo + 1
+	end
+	local color = opts.Color or Color3.fromRGB(90, 200, 255)
+	local innerW, innerH = W - 1 - 2 * pad, H - 1 - 2 * pad
+
+	local function point(i: number): (number, number)
+		local x = pad + (i - 1) / (n - 1) * innerW
+		local v = (data[i] - lo) / (hi - lo)
+		local y = (H - 1 - pad) - v * innerH
+		return math.round(x), math.round(y)
+	end
+
+	for i = 1, n - 1 do
+		local x0, y0 = point(i)
+		local x1, y1 = point(i + 1)
+		target:DrawLine(x0, y0, x1, y1, color)
+	end
+end
+
+--[=[
+	@within Chart
+	Plots `data` as vertical bars. `options`: `Color`, `Max` (else auto), `Gap` (px between bars).
+]=]
+function Chart.bar(target: any, data: { number }, options: { Color: Color3?, Max: number?, Gap: number? }?)
+	local opts = options or {}
+	local n = #data
+	if n == 0 then
+		return
+	end
+	local W, H = target.Width, target.Height
+	local _, max = extent(data)
+	max = opts.Max or max
+	if max <= 0 then
+		max = 1
+	end
+	local color = opts.Color or Color3.fromRGB(120, 220, 140)
+	local gap = opts.Gap or 1
+	local slot = W / n
+
+	for i = 1, n do
+		local h = math.max(0, math.round(data[i] / max * (H - 1)))
+		local x = math.round((i - 1) * slot)
+		local w = math.max(1, math.floor(slot) - gap)
+		target:DrawRect(x, H - h, w, h, color, true)
+	end
+end
+
+--[=[
+	@within Chart
+	Draws a pie chart from `slices` (`{ { value = n, color = Color3 }, ... }`). Fills each sector by
+	scanning the disc; centred, sized to fit.
+]=]
+function Chart.pie(target: any, slices: { { value: number, color: Color3 } })
+	local W, H = target.Width, target.Height
+	local cx, cy = (W - 1) / 2, (H - 1) / 2
+	local radius = math.min(W, H) / 2 - 1
+
+	local total = 0
+	for _, s in slices do
+		total += s.value
+	end
+	if total <= 0 then
+		return
+	end
+
+	-- cumulative end fraction per slice
+	local ends = {}
+	local acc = 0
+	for i, s in slices do
+		acc += s.value
+		ends[i] = acc / total
+	end
+
+	local TAU = math.pi * 2
+	local r2 = radius * radius
+	for y = 0, H - 1 do
+		for x = 0, W - 1 do
+			local dx, dy = x - cx, y - cy
+			if dx * dx + dy * dy <= r2 then
+				local ang = math.atan2(dy, dx)
+				if ang < 0 then
+					ang += TAU
+				end
+				local frac = ang / TAU
+				for i, e in ends do
+					if frac <= e then
+						target:SetPixel(x, y, slices[i].color)
+						break
+					end
+				end
+			end
+		end
+	end
+end
+
+return Chart
+]])
 mod("Dither", _20, [[
 -- IMGN
 -- _Patterns/Dither.luau
@@ -9624,6 +9958,82 @@ end
 
 return Font
 ]])
+mod("Identicon", _20, [[
+-- IMGN
+-- _Patterns/Identicon.luau
+-- Plinko Labs
+--
+-- Deterministic GitHub-style avatars: hash a seed (a username, UserId, item id, anything) into a
+-- symmetric coloured grid. Same seed always gives the same icon, every seed looks different - so
+-- every player/item gets a unique avatar with zero uploads and zero moderation. Draws onto any
+-- canvas/region.
+
+--[=[
+	@class Identicon
+	Procedural symmetric avatars from a seed. Reached via `IMGN.Identicon`.
+]=]
+local Identicon = {}
+
+-- djb2 string hash -> 0 .. 2^32
+local function hash(s: string): number
+	local h = 5381
+	for i = 1, #s do
+		h = (h * 33 + string.byte(s, i)) % 4294967296
+	end
+	return h
+end
+
+local function bitAt(h: number, i: number): boolean
+	return math.floor(h / 2 ^ i) % 2 >= 1
+end
+
+--[=[
+	@within Identicon
+	Draws an identicon for `seed` onto `target` (a Canvas or Region). `options`: `Grid` (cells per
+	side, default 5), `Color`/`Background` (else derived from the seed), `Density` (0..1 chance a
+	cell is filled, default 0.5).
+]=]
+function Identicon.draw(target: any, seed: any, options: { Grid: number?, Color: Color3?, Background: Color3?, Density: number? }?)
+	local opts = options or {}
+	local grid = opts.Grid or 5
+	local h = hash(tostring(seed))
+	local color = opts.Color or Color3.fromHSV((math.floor(h / 2 ^ 24) % 256) / 256, 0.55, 0.72)
+	local background = opts.Background or Color3.fromRGB(235, 238, 242)
+
+	local W, Hh = target.Width, target.Height
+	local cell = math.max(1, math.floor(math.min(W, Hh) / grid))
+	local span = cell * grid
+	local offX = math.floor((W - span) / 2)
+	local offY = math.floor((Hh - span) / 2)
+
+	-- background panel
+	target:DrawRect(offX, offY, span, span, background, true)
+
+	-- fill the left half + centre column from the hash bits, mirror to the right -> symmetric
+	local half = math.ceil(grid / 2)
+	local threshold = (opts.Density or 0.5) * 32 -- bit-derived value in 0..31 compared to this
+	local bit = 0
+	for col = 0, half - 1 do
+		for row = 0, grid - 1 do
+			-- a 0..31 value from 5 hash bits per cell
+			local v = 0
+			for b = 0, 4 do
+				if bitAt(h, (bit + b) % 31) then
+					v += 2 ^ b
+				end
+			end
+			bit += 5
+			if v < threshold then
+				for _, c in { col, grid - 1 - col } do
+					target:DrawRect(offX + c * cell, offY + row * cell, cell, cell, color, true)
+				end
+			end
+		end
+	end
+end
+
+return Identicon
+]])
 mod("Image", _20, [[
 -- IMGN
 -- _Patterns/Image.luau
@@ -9936,5 +10346,5 @@ end
 return Texture
 ]])
 
-print("[IMGN] installed 62 modules under ReplicatedStorage.IMGN")
+print("[IMGN] installed 65 modules under ReplicatedStorage.IMGN")
 return true

@@ -17,6 +17,7 @@ local Draw = require(script.Parent.Parent._Patterns.Draw)
 local Font = require(script.Parent.Parent._Patterns.Font)
 local Image = require(script.Parent.Parent._Patterns.Image)
 local Dither = require(script.Parent.Parent._Patterns.Dither)
+local Region = require(script.Region)
 
 local Config = ConfigModule.Config
 
@@ -83,6 +84,8 @@ export type CanvasConfig = {
 	Driver: Drivers.DriverType?,
 	AutoRender: boolean?,
 }
+
+export type Region = Region.Region
 
 export type Canvas = typeof(setmetatable(
 	{} :: {
@@ -372,6 +375,16 @@ end
 ]=]
 function Canvas.LoadPixels(self: Canvas, data: any, options: Image.LoadOptions?): (number, number)
 	return Image.blit(self, Image.fromPixels(data), options)
+end
+
+--[=[
+	@within Canvas
+	Returns a [Region] - a sub-canvas at `(x, y)` of size `width` x `height` with its own local
+	coordinates, clipped to it. Draw on the region in local space; with the `Sparse` driver this
+	lets one giant canvas stay cheap while you only ever touch the regions you draw in.
+]=]
+function Canvas.Query(self: Canvas, x: number, y: number, width: number, height: number): Region.Region
+	return Region.new(self, x, y, width, height)
 end
 
 --[=[

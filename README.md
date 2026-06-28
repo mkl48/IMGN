@@ -231,6 +231,43 @@ IMGN.Blood.Configure({ FlipDrip = true })
 
 See `examples/KillBrick.server.luau`.
 
+## Regions (sub-canvases) — for giant surfaces
+
+`canvas:Query(x, y, w, h)` returns a **`Region`**: a sub-canvas with its own local `(0,0)` origin, clipped to its bounds, that writes into the parent at the offset. Paired with the **`Sparse` driver** this is the clean way to handle a *huge* logical surface: one big canvas (empty pixels cost nothing), and you `:Query` a region wherever you actually draw — a splat, a tile, a UI panel — and work in convenient local coordinates.
+
+```lua
+local panel = canvas:Query(40, 20, 32, 32)   -- a 32×32 window into the canvas
+panel:DrawCircle(16, 16, 10, color, true)    -- local coords, clipped to the panel
+panel:Text("HP", 1, 1, color)
+panel.Width, panel.Height                    -- 32, 32
+```
+
+A `Region` has the same drawing surface as a `Canvas` (`SetPixel`, `Draw*`, `Text`, `Shader`, `Fill`), and you can `:Query` a region of a region.
+
+## Charts
+
+`IMGN.Chart` draws line / bar / pie charts onto any canvas **or region** — stat screens, economy dashboards, leaderboards, fps/ping overlays.
+
+```lua
+IMGN.Chart.line(target, { 5, 8, 6, 12, 9 }, { Min = 0, Max = 12, Color = c })
+IMGN.Chart.bar(target, { 5, 10, 7, 3 }, { Max = 10 })
+IMGN.Chart.pie(target, { { value = 3, color = a }, { value = 1, color = b } })
+```
+
+See `examples/Dashboard.server.luau` (a live line + bar panel).
+
+## Identicons
+
+`IMGN.Identicon(target, seed)` draws a deterministic **GitHub-style avatar** from any seed (a name, UserId, item id) — a unique icon per player/item with **zero uploads, zero moderation**.
+
+```lua
+for i, name in players do
+    IMGN.Identicon(canvas:Query(col*26, row*26, 24, 24), name)
+end
+```
+
+See `examples/Identicons.server.luau`.
+
 ## Software 3D (raycaster)
 
 `IMGN.Raycaster` is a textured **software 3D engine** on a canvas — Doom/Wolfenstein-style raycasting, rendered into GUI frames with no MeshParts. It casts one ray per column over a grid map (fast), draws perspective-correct **textured** walls with **distance fog** + face shading, a faded floor/ceiling, and depth-sorted **billboard sprites**.
@@ -426,6 +463,8 @@ See [`examples/`](examples):
 - **Weather** — rain/snow particle presets falling across a surface.
 - **PaintApp** — a working paint program using `canvas:OnInput` (works on a SurfaceGui too).
 - **Dither** — an animated plasma crushed through GameBoy / 1-bit / CGA palettes.
+- **Dashboard** — a live line + bar chart panel (`IMGN.Chart`) drawn into `:Query` regions.
+- **Identicons** — a grid of 16 unique seed-based avatars, no uploads.
 
 - **GradientSurface** — procedural gradient on a part via `:Shader`.
 - **PaintCanvas** — click-drag finger paint on a `ScreenGui` with `AutoRender`.
