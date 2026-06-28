@@ -1145,9 +1145,11 @@ local SETTINGS = {
 	ProxySize = 10, -- (Fluid/Vector) footprint of a localized patch, in studs (clamped to the part)
 	ProxyThickness = 0.08,
 	ProxyOffset = 0.02, -- how far off the surface to float the canvas (avoid z-fighting)
-	PixelsPerStud = 4, -- (Pixel) resolution per stud of the full-part canvas
+	PixelsPerStud = 4, -- (Pixel) resolution per stud of the canvas
 	FluidPixelsPerStud = 3, -- (Fluid) low res - the circles melt the grid so it still looks smooth
-	MaxResolution = 160, -- per-axis cap so a huge part doesn't make a giant grid
+	MaxCanvasStuds = 18, -- (Pixel) if the part is bigger than this, use a good-size patch near the
+	-- splat instead of one stretched canvas - keeps pixel density (and detail) consistent.
+	MaxResolution = 96, -- per-axis pixel cap (safety net)
 	EdgeFade = 0, -- (Fluid/Pixel) border alpha falloff (0 = off; the canvas now matches the part)
 	ReuseRadius = 6, -- (Fluid/Vector) splats within this many studs reuse a patch
 	Preset = "Blood",
@@ -1256,15 +1258,28 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 
 	local renderer = SETTINGS.Renderer
 	local vector = renderer == "Vector"
-	local fullFace = renderer == "Pixel" -- cover the whole part (sparse) vs a localized patch
+	local pixel = renderer == "Pixel"
 
-	-- size + position the canvas. Full-face: a rectangle covering the whole part, centred on its
-	-- face. Patch: a small square clamped to fit inside the part around the splat.
+	-- size + position the canvas. Pixel: cover the whole part if it fits within MaxCanvasStuds,
+	-- otherwise a good-size patch near the splat (so pixel density stays consistent on huge parts).
+	-- Fluid/Vector: a small square patch clamped to fit inside the part around the splat.
 	local sizeR, sizeU, center
-	if fullFace and hitPart then
-		sizeR = math.max(extentAlong(hitPart, right), 0.5)
-		sizeU = math.max(extentAlong(hitPart, up), 0.5)
-		center = hitPart.Position + normal * (extentAlong(hitPart, normal) * 0.5)
+	if pixel and hitPart then
+		local extR = math.max(extentAlong(hitPart, right), 0.5)
+		local extU = math.max(extentAlong(hitPart, up), 0.5)
+		local maxStuds = SETTINGS.MaxCanvasStuds
+		sizeR = math.min(extR, maxStuds)
+		sizeU = math.min(extU, maxStuds)
+		local faceCenter = hitPart.Position + normal * (extentAlong(hitPart, normal) * 0.5)
+		if sizeR >= extR - 1e-3 and sizeU >= extU - 1e-3 then
+			center = faceCenter -- the whole part fits in one canvas
+		else
+			-- too big: a patch centred near the splat but kept fully inside the part
+			local rel = worldPos - faceCenter
+			local aR = math.clamp(rel:Dot(right), -(extR - sizeR) * 0.5, (extR - sizeR) * 0.5)
+			local aU = math.clamp(rel:Dot(up), -(extU - sizeU) * 0.5, (extU - sizeU) * 0.5)
+			center = faceCenter + right * aR + up * aU
+		end
 	else
 		local s = SETTINGS.ProxySize
 		if hitPart then
@@ -1311,7 +1326,6 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 		Up = up,
 		SizeR = sizeR,
 		SizeU = sizeU,
-		FullFace = fullFace,
 		IsDrip = gravity.Y > 0.5, -- a wall/slope sheds off its bottom edge; a floor just pools
 		_dripCD = 0,
 	}, BloodProxy)
@@ -1335,14 +1349,14 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 		gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
 		gui.PixelsPerStud = 50
 		gui.Parent = part
-		local ppstud = if fullFace then SETTINGS.PixelsPerStud else SETTINGS.FluidPixelsPerStud
+		local ppstud = if pixel then SETTINGS.PixelsPerStud else SETTINGS.FluidPixelsPerStud
 		self.ResW = math.clamp(math.floor(sizeR * ppstud), 8, SETTINGS.MaxResolution)
 		self.ResH = math.clamp(math.floor(sizeU * ppstud), 8, SETTINGS.MaxResolution)
 		self.Liquid = Liquid.new({
 			Canvas = Canvas.new({
 				Resolution = Vector2.new(self.ResW, self.ResH),
 				Parent = gui,
-				Driver = if fullFace then "Sparse" else "Blob",
+				Driver = if pixel then "Sparse" else "Blob", -- Pixel: sparse full/patch; Fluid: blob
 			}),
 			Preset = SETTINGS.Preset,
 			Gravity = gravity,
@@ -1422,8 +1436,15 @@ function BloodProxy.Splat(self: any, worldPos: Vector3, amount: number)
 	end
 end
 
--- find an existing canvas for this hit, or make one. Full-face (Pixel) keeps ONE canvas per
--- part+face (it covers the whole part); patch renderers reuse any canvas within ReuseRadius.
+-- does this canvas' rectangle already cover the hit point?
+local function covers(p: any, worldPos: Vector3): boolean
+	local lp = p.Part.CFrame:PointToObjectSpace(worldPos)
+	return math.abs(lp.X) <= p.SizeR * 0.5 + 0.05 and math.abs(lp.Y) <= p.SizeU * 0.5 + 0.05
+end
+
+-- find an existing canvas on the same face that already covers this hit, or make a new one. This
+-- works for both a whole-part canvas (covers everything) and good-size patches (each covers its
+-- own region) - a big plate just ends up with a few patches where blood actually landed.
 local function proxyFor(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 	local key = hitPart or Workspace
 	local list = proxiesByPart[key]
@@ -1431,16 +1452,12 @@ local function proxyFor(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 		list = {}
 		proxiesByPart[key] = list
 	end
-	local fullFace = SETTINGS.Renderer == "Pixel"
 	for i = #list, 1, -1 do
 		local p = list[i]
 		if not p.Part.Parent then
 			table.remove(list, i) -- cleaned up elsewhere
-		elseif p.Normal:Dot(normal) > 0.8 then
-			-- same face (full-face), or a near-enough patch
-			if fullFace or (p.Center - worldPos).Magnitude <= SETTINGS.ReuseRadius then
-				return p
-			end
+		elseif p.Normal:Dot(normal) > 0.8 and covers(p, worldPos) then
+			return p
 		end
 	end
 	local proxy = BloodProxy.new(hitPart, worldPos, normal)
