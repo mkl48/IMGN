@@ -231,6 +231,47 @@ IMGN.Blood.Configure({ FlipDrip = true })
 
 See `examples/KillBrick.server.luau`.
 
+## Particles
+
+`IMGN.Particles` is a 2D particle emitter on a canvas — fire, sparks, rain, snow, explosions, confetti. Particles move under gravity, fade with age, and only the moving pixels repaint.
+
+```lua
+local fire = IMGN.Particles({
+    Canvas = IMGN.Surface(part, Enum.NormalId.Front, { Resolution = Vector2.new(72, 72) }),
+    Preset = "Fire",          -- Sparks / Rain / Snow / Explosion / Confetti
+    Position = Vector2.new(36, 66),
+})
+fire:Start()        -- continuous emission
+fire:Burst(30)      -- or a one-shot burst (explosions, confetti)
+```
+
+Every field (`Rate`, `Gravity`, `SpeedMin/Max`, `Spread`, `Direction`, `Life…`, `ColorStart/End`) is overridable; share one canvas between several emitters. See `examples/Particles.server.luau`.
+
+## Interactive input
+
+`canvas:OnInput(fn)` maps clicks/touches/drags to canvas pixels, so a canvas becomes something you can *draw on* — on a `ScreenGui` HUD or a `SurfaceGui` (an **in-world touchscreen**).
+
+```lua
+canvas:OnInput(function(x, y, phase)   -- phase = "Began" | "Changed" | "Ended"
+    if phase ~= "Ended" then
+        canvas:DrawCircle(x, y, 3, Color3.new(0, 0, 0), true)
+    end
+end)
+-- or one-off: local px, py = canvas:PixelAt(input.Position)
+```
+
+See `examples/PaintApp.client.luau` (a working paint program).
+
+## Dithering & palettes
+
+`canvas:Dither(palette)` (Floyd–Steinberg) and `canvas:Quantize(palette)` reduce a canvas to a set of colours — the retro / GameBoy look, *and* fewer colours mean longer runs, so the `RowMerge`/`GreedyMesh`/`RichText` drivers get much cheaper.
+
+```lua
+canvas:Dither(IMGN.Palette.Grayscale(4))         -- 4-shade dithered
+canvas:Dither({ Color3.fromRGB(15,56,15), Color3.fromRGB(155,188,15) })  -- any palette
+canvas:Render()
+```
+
 ## Loading real images
 
 IMGN can draw actual image files — PNG/BMP/TGA/JPG — onto a canvas. The decoder ([osgl-rbx/image](https://github.com/osgl-rbx/image)) is **bundled inside IMGN**, so there's nothing extra to install — just hand it the file bytes. No `EditableImage`, no verification.
@@ -361,6 +402,8 @@ See [`examples/`](examples):
 - **BloodDrip** — realistic dripping blood via the `Liquid` sim (`IMGN.Liquid`).
 - **KillBrick** — step on it, die, and spray blood that drips downhill (`IMGN.Blood`).
 - **BloodArena** — a test play area + a click-to-bleed button that follows your character.
+- **Particles** — a fire with bursting sparks (`IMGN.Particles`).
+- **PaintApp** — a working paint program using `canvas:OnInput` (works on a SurfaceGui too).
 
 - **GradientSurface** — procedural gradient on a part via `:Shader`.
 - **PaintCanvas** — click-drag finger paint on a `ScreenGui` with `AutoRender`.

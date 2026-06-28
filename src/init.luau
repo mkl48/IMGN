@@ -18,7 +18,9 @@ local Canvas = require(script._Classes.Canvas)
 local AppClass = require(script._Classes.App)
 local LiquidClass = require(script._Classes.Liquid)
 local BloodModule = require(script._Classes.Blood)
+local ParticlesClass = require(script._Classes.Particles)
 local ImageHelper = require(script._Patterns.Image)
+local DitherHelper = require(script._Patterns.Dither)
 local ConfigModule = require(script._Core.Config)
 
 local IMGN = {}
@@ -31,6 +33,8 @@ export type Object = AppClass.Object
 export type ObjectConfig = AppClass.ObjectConfig
 export type Liquid = LiquidClass.Liquid
 export type LiquidConfig = LiquidClass.LiquidConfig
+export type Particles = ParticlesClass.Particles
+export type ParticlesConfig = ParticlesClass.ParticlesConfig
 export type Config = ConfigModule.Config
 
 --[=[
@@ -79,6 +83,25 @@ end
 	`IMGN.Blood.Configure{ … }` tunes it. Drips follow the surface's downhill (walls/slopes/rotation).
 ]=]
 IMGN.Blood = BloodModule
+
+--[=[
+	@within IMGN
+	Creates a [Particles] emitter (see [ParticlesConfig]) drawing on a canvas - `Preset` is "Fire",
+	"Sparks", "Rain", "Snow", "Explosion" or "Confetti". `:Start()` for continuous emission or
+	`:Burst(n)` for a one-shot.
+]=]
+function IMGN.Particles(config: ParticlesConfig): Particles
+	return ParticlesClass.new(config)
+end
+
+--[=[
+	@within IMGN
+	Palette helpers for [Canvas:Dither] / [Canvas:Quantize]. `IMGN.Palette.Grayscale(n)` builds an
+	n-shade grayscale palette; pass any `{ Color3 }` array for a custom palette.
+]=]
+IMGN.Palette = {
+	Grayscale = DitherHelper.grayscale,
+}
 
 --[=[
 	@within IMGN

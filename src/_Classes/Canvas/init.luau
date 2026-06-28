@@ -16,6 +16,7 @@ local Drivers = require(script.Parent.Parent._Drivers)
 local Draw = require(script.Parent.Parent._Patterns.Draw)
 local Font = require(script.Parent.Parent._Patterns.Font)
 local Image = require(script.Parent.Parent._Patterns.Image)
+local Dither = require(script.Parent.Parent._Patterns.Dither)
 
 local Config = ConfigModule.Config
 
@@ -92,6 +93,7 @@ export type Canvas = typeof(setmetatable(
 		_autoRender: boolean,
 		_heartbeat: RBXScriptConnection?,
 		_mounted: boolean,
+		_container: Frame?,
 	},
 	Canvas
 ))
@@ -149,7 +151,7 @@ end
 ]=]
 function Canvas.Mount(self: Canvas, parent: Instance)
 	assert(not self._mounted, "IMGN Canvas: already mounted")
-	self._driver:Mount(parent)
+	self._container = self._driver:Mount(parent)
 	self._mounted = true
 
 	-- Push whatever's already in the buffer (e.g. a Background fill) to the screen.
@@ -174,9 +176,9 @@ function Canvas.MountAsync(self: Canvas, parent: Instance, async: AsyncOptions?)
 
 	local driver = self._driver :: any
 	if driver.MountAsync then
-		driver:MountAsync(parent, pacerFor(async))
+		self._container = driver:MountAsync(parent, pacerFor(async))
 	else
-		driver:Mount(parent)
+		self._container = driver:Mount(parent)
 		if async and async.OnProgress then
 			async.OnProgress(1)
 		end
@@ -367,6 +369,90 @@ end
 ]=]
 function Canvas.LoadPixels(self: Canvas, data: any, options: Image.LoadOptions?): (number, number)
 	return Image.blit(self, Image.fromPixels(data), options)
+end
+
+--[=[
+	@within Canvas
+	Snaps every pixel to its nearest colour in `palette` (an array of `Color3`). Reduces the canvas
+	to those colours - call `:Render()` after.
+]=]
+function Canvas.Quantize(self: Canvas, palette: { Color3 })
+	Dither.quantize(self, palette)
+end
+
+--[=[
+	@within Canvas
+	Floyd-Steinberg dithers the canvas to `palette` (the retro look), so few colours read as smooth
+	shading - and longer colour runs make the RowMerge/GreedyMesh/RichText drivers cheaper. Call
+	`:Render()` after.
+]=]
+function Canvas.Dither(self: Canvas, palette: { Color3 })
+	Dither.floydSteinberg(self, palette)
+end
+
+--[=[
+	@within Canvas
+	Maps an absolute screen / SurfaceGui position (e.g. an input's `Position`) to a canvas pixel
+	`(x, y)`, or `nil` if it's outside the canvas. The canvas must be mounted.
+]=]
+function Canvas.PixelAt(self: Canvas, absolutePosition: Vector2): (number?, number?)
+	local container = self._container
+	if not container then
+		return nil
+	end
+	local size = container.AbsoluteSize
+	if size.X <= 0 or size.Y <= 0 then
+		return nil
+	end
+	local rel = absolutePosition - container.AbsolutePosition
+	local px = math.floor(rel.X / size.X * self.Width)
+	local py = math.floor(rel.Y / size.Y * self.Height)
+	if px < 0 or px >= self.Width or py < 0 or py >= self.Height then
+		return nil
+	end
+	return px, py
+end
+
+--[=[
+	@within Canvas
+	Makes the canvas interactive: calls `callback(x, y, phase)` with the pixel under a click/touch/
+	drag (`phase` is `"Began"`/`"Changed"`/`"Ended"`). Works on a `ScreenGui` or a `SurfaceGui` (an
+	in-world touchscreen). Returns a function that disconnects the listeners. Mount first.
+]=]
+function Canvas.OnInput(self: Canvas, callback: (x: number, y: number, phase: string) -> ()): () -> ()
+	local container = self._container
+	assert(container, "IMGN Canvas: mount before OnInput")
+	container.Active = true
+
+	local function fire(input: InputObject, phase: string)
+		local t = input.UserInputType
+		if
+			t == Enum.UserInputType.MouseButton1
+			or t == Enum.UserInputType.MouseMovement
+			or t == Enum.UserInputType.Touch
+		then
+			local px, py = Canvas.PixelAt(self, Vector2.new(input.Position.X, input.Position.Y))
+			if px then
+				callback(px :: number, py :: number, phase)
+			end
+		end
+	end
+
+	local began = container.InputBegan:Connect(function(input)
+		fire(input, "Began")
+	end)
+	local changed = container.InputChanged:Connect(function(input)
+		fire(input, "Changed")
+	end)
+	local ended = container.InputEnded:Connect(function(input)
+		fire(input, "Ended")
+	end)
+
+	return function()
+		began:Disconnect()
+		changed:Disconnect()
+		ended:Disconnect()
+	end
 end
 
 --[=[

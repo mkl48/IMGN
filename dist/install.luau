@@ -60,7 +60,9 @@ local Canvas = require(script._Classes.Canvas)
 local AppClass = require(script._Classes.App)
 local LiquidClass = require(script._Classes.Liquid)
 local BloodModule = require(script._Classes.Blood)
+local ParticlesClass = require(script._Classes.Particles)
 local ImageHelper = require(script._Patterns.Image)
+local DitherHelper = require(script._Patterns.Dither)
 local ConfigModule = require(script._Core.Config)
 
 local IMGN = {}
@@ -73,6 +75,8 @@ export type Object = AppClass.Object
 export type ObjectConfig = AppClass.ObjectConfig
 export type Liquid = LiquidClass.Liquid
 export type LiquidConfig = LiquidClass.LiquidConfig
+export type Particles = ParticlesClass.Particles
+export type ParticlesConfig = ParticlesClass.ParticlesConfig
 export type Config = ConfigModule.Config
 
 --[=[
@@ -121,6 +125,25 @@ end
 	`IMGN.Blood.Configure{ … }` tunes it. Drips follow the surface's downhill (walls/slopes/rotation).
 ]=]
 IMGN.Blood = BloodModule
+
+--[=[
+	@within IMGN
+	Creates a [Particles] emitter (see [ParticlesConfig]) drawing on a canvas - `Preset` is "Fire",
+	"Sparks", "Rain", "Snow", "Explosion" or "Confetti". `:Start()` for continuous emission or
+	`:Burst(n)` for a one-shot.
+]=]
+function IMGN.Particles(config: ParticlesConfig): Particles
+	return ParticlesClass.new(config)
+end
+
+--[=[
+	@within IMGN
+	Palette helpers for [Canvas:Dither] / [Canvas:Quantize]. `IMGN.Palette.Grayscale(n)` builds an
+	n-shade grayscale palette; pass any `{ Color3 }` array for a custom palette.
+]=]
+IMGN.Palette = {
+	Grayscale = DitherHelper.grayscale,
+}
 
 --[=[
 	@within IMGN
@@ -2174,6 +2197,7 @@ local Drivers = require(script.Parent.Parent._Drivers)
 local Draw = require(script.Parent.Parent._Patterns.Draw)
 local Font = require(script.Parent.Parent._Patterns.Font)
 local Image = require(script.Parent.Parent._Patterns.Image)
+local Dither = require(script.Parent.Parent._Patterns.Dither)
 
 local Config = ConfigModule.Config
 
@@ -2250,6 +2274,7 @@ export type Canvas = typeof(setmetatable(
 		_autoRender: boolean,
 		_heartbeat: RBXScriptConnection?,
 		_mounted: boolean,
+		_container: Frame?,
 	},
 	Canvas
 ))
@@ -2307,7 +2332,7 @@ end
 ]=]
 function Canvas.Mount(self: Canvas, parent: Instance)
 	assert(not self._mounted, "IMGN Canvas: already mounted")
-	self._driver:Mount(parent)
+	self._container = self._driver:Mount(parent)
 	self._mounted = true
 
 	-- Push whatever's already in the buffer (e.g. a Background fill) to the screen.
@@ -2332,9 +2357,9 @@ function Canvas.MountAsync(self: Canvas, parent: Instance, async: AsyncOptions?)
 
 	local driver = self._driver :: any
 	if driver.MountAsync then
-		driver:MountAsync(parent, pacerFor(async))
+		self._container = driver:MountAsync(parent, pacerFor(async))
 	else
-		driver:Mount(parent)
+		self._container = driver:Mount(parent)
 		if async and async.OnProgress then
 			async.OnProgress(1)
 		end
@@ -2525,6 +2550,90 @@ end
 ]=]
 function Canvas.LoadPixels(self: Canvas, data: any, options: Image.LoadOptions?): (number, number)
 	return Image.blit(self, Image.fromPixels(data), options)
+end
+
+--[=[
+	@within Canvas
+	Snaps every pixel to its nearest colour in `palette` (an array of `Color3`). Reduces the canvas
+	to those colours - call `:Render()` after.
+]=]
+function Canvas.Quantize(self: Canvas, palette: { Color3 })
+	Dither.quantize(self, palette)
+end
+
+--[=[
+	@within Canvas
+	Floyd-Steinberg dithers the canvas to `palette` (the retro look), so few colours read as smooth
+	shading - and longer colour runs make the RowMerge/GreedyMesh/RichText drivers cheaper. Call
+	`:Render()` after.
+]=]
+function Canvas.Dither(self: Canvas, palette: { Color3 })
+	Dither.floydSteinberg(self, palette)
+end
+
+--[=[
+	@within Canvas
+	Maps an absolute screen / SurfaceGui position (e.g. an input's `Position`) to a canvas pixel
+	`(x, y)`, or `nil` if it's outside the canvas. The canvas must be mounted.
+]=]
+function Canvas.PixelAt(self: Canvas, absolutePosition: Vector2): (number?, number?)
+	local container = self._container
+	if not container then
+		return nil
+	end
+	local size = container.AbsoluteSize
+	if size.X <= 0 or size.Y <= 0 then
+		return nil
+	end
+	local rel = absolutePosition - container.AbsolutePosition
+	local px = math.floor(rel.X / size.X * self.Width)
+	local py = math.floor(rel.Y / size.Y * self.Height)
+	if px < 0 or px >= self.Width or py < 0 or py >= self.Height then
+		return nil
+	end
+	return px, py
+end
+
+--[=[
+	@within Canvas
+	Makes the canvas interactive: calls `callback(x, y, phase)` with the pixel under a click/touch/
+	drag (`phase` is `"Began"`/`"Changed"`/`"Ended"`). Works on a `ScreenGui` or a `SurfaceGui` (an
+	in-world touchscreen). Returns a function that disconnects the listeners. Mount first.
+]=]
+function Canvas.OnInput(self: Canvas, callback: (x: number, y: number, phase: string) -> ()): () -> ()
+	local container = self._container
+	assert(container, "IMGN Canvas: mount before OnInput")
+	container.Active = true
+
+	local function fire(input: InputObject, phase: string)
+		local t = input.UserInputType
+		if
+			t == Enum.UserInputType.MouseButton1
+			or t == Enum.UserInputType.MouseMovement
+			or t == Enum.UserInputType.Touch
+		then
+			local px, py = Canvas.PixelAt(self, Vector2.new(input.Position.X, input.Position.Y))
+			if px then
+				callback(px :: number, py :: number, phase)
+			end
+		end
+	end
+
+	local began = container.InputBegan:Connect(function(input)
+		fire(input, "Began")
+	end)
+	local changed = container.InputChanged:Connect(function(input)
+		fire(input, "Changed")
+	end)
+	local ended = container.InputEnded:Connect(function(input)
+		fire(input, "Ended")
+	end)
+
+	return function()
+		began:Disconnect()
+		changed:Disconnect()
+		ended:Disconnect()
+	end
 end
 
 --[=[
@@ -3038,8 +3147,255 @@ end
 
 return Liquid
 ]])
-local _7 = folder("_Core", _1)
-mod("Config", _7, [[
+local _7 = mod("Particles", _2, [[
+-- IMGN
+-- _Classes/Particles/init.luau
+-- Plinko Labs
+--
+-- A 2D particle system on a canvas: an emitter spawns short-lived particles that move under
+-- gravity, fade with age, and draw themselves as pixels. Presets cover Fire/Sparks/Rain/Snow/
+-- Explosion/Confetti; everything (rate, speed, spread, gravity, life, colour) is tunable. Each
+-- particle erases its previous pixel and draws its new one, so only the moving pixels repaint, and
+-- the loop sleeps when there are no particles and nothing's emitting.
+
+local RunService = game:GetService("RunService")
+
+local Canvas = require(script.Parent.Canvas)
+
+--[=[
+	@class Particles
+	A particle emitter drawing on a [Canvas]. Create with [IMGN.Particles], `:Start` for continuous
+	emission or `:Burst(n)` for a one-shot, and `:Stop` to stop emitting.
+]=]
+local Particles = {}
+Particles.__index = Particles
+
+local PI = math.pi
+
+type Preset = {
+	Rate: number,
+	Direction: number,
+	Spread: number,
+	SpeedMin: number,
+	SpeedMax: number,
+	Gravity: number,
+	LifeMin: number,
+	LifeMax: number,
+	ColorStart: Color3,
+	ColorEnd: Color3,
+	RandomColors: boolean?,
+	Sky: boolean?, -- spawn across the top edge (rain/snow) rather than from a point
+}
+
+local PRESETS: { [string]: Preset } = {
+	Fire = { Rate = 70, Direction = -PI / 2, Spread = 0.7, SpeedMin = 10, SpeedMax = 26, Gravity = -14, LifeMin = 0.5, LifeMax = 1.0, ColorStart = Color3.fromRGB(255, 235, 120), ColorEnd = Color3.fromRGB(190, 25, 0) },
+	Sparks = { Rate = 0, Direction = 0, Spread = PI * 2, SpeedMin = 25, SpeedMax = 70, Gravity = 90, LifeMin = 0.3, LifeMax = 0.8, ColorStart = Color3.fromRGB(255, 210, 90), ColorEnd = Color3.fromRGB(120, 20, 0) },
+	Rain = { Rate = 120, Direction = PI / 2, Spread = 0.08, SpeedMin = 70, SpeedMax = 100, Gravity = 30, LifeMin = 1.2, LifeMax = 1.8, ColorStart = Color3.fromRGB(150, 180, 255), ColorEnd = Color3.fromRGB(120, 150, 230), Sky = true },
+	Snow = { Rate = 45, Direction = PI / 2, Spread = 0.5, SpeedMin = 8, SpeedMax = 18, Gravity = 4, LifeMin = 3, LifeMax = 6, ColorStart = Color3.fromRGB(255, 255, 255), ColorEnd = Color3.fromRGB(220, 230, 245), Sky = true },
+	Explosion = { Rate = 0, Direction = 0, Spread = PI * 2, SpeedMin = 35, SpeedMax = 90, Gravity = 50, LifeMin = 0.4, LifeMax = 0.9, ColorStart = Color3.fromRGB(255, 190, 70), ColorEnd = Color3.fromRGB(80, 0, 0) },
+	Confetti = { Rate = 0, Direction = -PI / 2, Spread = 1.2, SpeedMin = 30, SpeedMax = 75, Gravity = 60, LifeMin = 1.2, LifeMax = 2.4, ColorStart = Color3.fromRGB(255, 80, 120), ColorEnd = Color3.fromRGB(255, 80, 120), RandomColors = true },
+}
+
+export type ParticlesConfig = {
+	Canvas: Canvas.Canvas?,
+	Resolution: Vector2?,
+	Parent: Instance?,
+	Driver: any?,
+	Preset: string?,
+	Position: Vector2?, -- emit point (default centre, or top for Sky presets)
+	-- any preset field can be overridden:
+	Rate: number?,
+	Gravity: number?,
+	SpeedMin: number?,
+	SpeedMax: number?,
+	Spread: number?,
+	Direction: number?,
+	LifeMin: number?,
+	LifeMax: number?,
+	ColorStart: Color3?,
+	ColorEnd: Color3?,
+}
+
+export type Particles = typeof(setmetatable({} :: any, Particles))
+
+local function pick<T>(v: T?, d: T): T
+	if v == nil then
+		return d
+	end
+	return v
+end
+
+function Particles.new(config: ParticlesConfig): Particles
+	local preset = PRESETS[config.Preset or "Fire"]
+	assert(preset, `IMGN.Particles: unknown Preset "{tostring(config.Preset)}"`)
+
+	local canvas = config.Canvas
+	if not canvas then
+		assert(config.Resolution, "IMGN.Particles: pass a Canvas or a Resolution")
+		canvas = Canvas.new({ Resolution = config.Resolution, Parent = config.Parent, Driver = config.Driver })
+	end
+
+	local sky = preset.Sky == true
+	local position = config.Position or (if sky then Vector2.new(canvas.Width / 2, 0) else Vector2.new(canvas.Width / 2, canvas.Height / 2))
+
+	return setmetatable({
+		Canvas = canvas,
+		Width = canvas.Width,
+		Height = canvas.Height,
+		Position = position,
+		Rate = pick(config.Rate, preset.Rate),
+		Direction = pick(config.Direction, preset.Direction),
+		Spread = pick(config.Spread, preset.Spread),
+		SpeedMin = pick(config.SpeedMin, preset.SpeedMin),
+		SpeedMax = pick(config.SpeedMax, preset.SpeedMax),
+		Gravity = pick(config.Gravity, preset.Gravity),
+		LifeMin = pick(config.LifeMin, preset.LifeMin),
+		LifeMax = pick(config.LifeMax, preset.LifeMax),
+		ColorStart = pick(config.ColorStart, preset.ColorStart),
+		ColorEnd = pick(config.ColorEnd, preset.ColorEnd),
+		RandomColors = preset.RandomColors == true,
+		_sky = sky,
+		_particles = {},
+		_spawnAcc = 0,
+		_emitting = false,
+		_conn = nil,
+	}, Particles)
+end
+
+local function spawnOne(self: Particles)
+	local angle = self.Direction + (math.random() - 0.5) * self.Spread
+	local speed = self.SpeedMin + math.random() * (self.SpeedMax - self.SpeedMin)
+	local px = self.Position.X
+	if self._sky then
+		px = math.random() * self.Width -- spread across the top
+	end
+	table.insert(self._particles, {
+		x = px,
+		y = self.Position.Y,
+		vx = math.cos(angle) * speed,
+		vy = math.sin(angle) * speed,
+		life = self.LifeMin + math.random() * (self.LifeMax - self.LifeMin),
+		maxLife = 0,
+		color = if self.RandomColors then Color3.fromHSV(math.random(), 0.9, 1) else self.ColorStart,
+		lpx = -1,
+		lpy = -1,
+	})
+	local p = self._particles[#self._particles]
+	p.maxLife = p.life
+end
+
+--[=[
+	@within Particles
+	Spawns `count` particles immediately (a one-shot burst - explosions, confetti).
+]=]
+function Particles.Burst(self: Particles, count: number)
+	for _ = 1, count do
+		spawnOne(self)
+	end
+	if not self._conn then
+		Particles.Start(self, true)
+	end
+end
+
+--[=[
+	@within Particles
+	Advances the system: emits per `Rate`, moves/ages/draws every particle, drops dead ones.
+]=]
+function Particles.Step(self: Particles, dt: number)
+	local canvas = self.Canvas
+	local W, H = self.Width, self.Height
+	local gravity = self.Gravity
+	local colorEnd = self.ColorEnd
+
+	if self._emitting and self.Rate > 0 then
+		self._spawnAcc += self.Rate * dt
+		while self._spawnAcc >= 1 do
+			self._spawnAcc -= 1
+			spawnOne(self)
+		end
+	end
+
+	local list = self._particles
+	local i = 1
+	while i <= #list do
+		local p = list[i]
+		-- erase last drawn pixel
+		if p.lpx >= 0 then
+			canvas:SetPixel(p.lpx, p.lpy, Color3.new(0, 0, 0), 0)
+		end
+
+		p.vy += gravity * dt
+		p.x += p.vx * dt
+		p.y += p.vy * dt
+		p.life -= dt
+
+		if p.life <= 0 then
+			list[i] = list[#list] -- swap-remove (already erased)
+			list[#list] = nil
+		else
+			local nx, ny = math.round(p.x), math.round(p.y)
+			if nx >= 0 and nx < W and ny >= 0 and ny < H then
+				local t = p.life / p.maxLife -- 1 fresh -> 0 dead
+				canvas:SetPixel(nx, ny, p.color:Lerp(colorEnd, 1 - t), math.clamp(t * 1.5, 0, 1))
+				p.lpx, p.lpy = nx, ny
+			else
+				p.lpx = -1
+			end
+			i += 1
+		end
+	end
+
+	canvas:Render()
+
+	-- sleep when nothing's left to do
+	if not self._emitting and #list == 0 and self._conn then
+		self._conn:Disconnect()
+		self._conn = nil
+	end
+end
+
+--[=[
+	@within Particles
+	Starts continuous emission (per `Rate`) and the update loop. Pass `false` rate-wise by leaving
+	`Rate` at 0 and using `:Burst` instead.
+]=]
+function Particles.Start(self: Particles, _internal: boolean?)
+	if not _internal then
+		self._emitting = true
+	end
+	if self._conn then
+		return
+	end
+	self._conn = RunService.Heartbeat:Connect(function(dt)
+		Particles.Step(self, math.min(dt, 1 / 30))
+	end)
+end
+
+--[=[
+	@within Particles
+	Stops emitting new particles; existing ones finish their life, then the loop sleeps.
+]=]
+function Particles.Stop(self: Particles)
+	self._emitting = false
+end
+
+--[=[
+	@within Particles
+	Stops everything and destroys the canvas.
+]=]
+function Particles.Destroy(self: Particles)
+	if self._conn then
+		self._conn:Disconnect()
+		self._conn = nil
+	end
+	self._particles = {}
+	self.Canvas:Destroy()
+end
+
+return Particles
+]])
+local _8 = folder("_Core", _1)
+mod("Config", _8, [[
 -- IMGN
 -- _Core/Config.luau
 -- Plinko Labs
@@ -3130,7 +3486,7 @@ return {
 	configure = configure,
 }
 ]])
-mod("PixelBuffer", _7, [[
+mod("PixelBuffer", _8, [[
 -- IMGN
 -- _Core/PixelBuffer.luau
 -- Plinko Labs
@@ -3238,7 +3594,7 @@ end
 
 return PixelBuffer
 ]])
-local _8 = mod("_Drivers", _1, [[
+local _9 = mod("_Drivers", _1, [[
 -- IMGN
 -- _Drivers/init.luau
 -- Plinko Labs
@@ -3301,7 +3657,7 @@ end
 
 return Drivers
 ]])
-mod("Blob", _8, [[
+mod("Blob", _9, [[
 -- IMGN
 -- _Drivers/Blob.luau
 -- Plinko Labs
@@ -3453,7 +3809,7 @@ end
 
 return Blob
 ]])
-mod("GreedyMesh", _8, [[
+mod("GreedyMesh", _9, [[
 -- IMGN
 -- _Drivers/GreedyMesh.luau
 -- Plinko Labs
@@ -3638,7 +3994,7 @@ end
 
 return GreedyMesh
 ]])
-mod("PixelGrid", _8, [[
+mod("PixelGrid", _9, [[
 -- IMGN
 -- _Drivers/PixelGrid.luau
 -- Plinko Labs
@@ -3833,7 +4189,7 @@ end
 
 return PixelGrid
 ]])
-mod("RichText", _8, [[
+mod("RichText", _9, [[
 -- IMGN
 -- _Drivers/RichText.luau
 -- Plinko Labs
@@ -4000,7 +4356,7 @@ end
 
 return RichText
 ]])
-mod("RowMerge", _8, [[
+mod("RowMerge", _9, [[
 -- IMGN
 -- _Drivers/RowMerge.luau
 -- Plinko Labs
@@ -4184,7 +4540,7 @@ end
 
 return RowMerge
 ]])
-mod("Sparse", _8, [[
+mod("Sparse", _9, [[
 -- IMGN
 -- _Drivers/Sparse.luau
 -- Plinko Labs
@@ -4335,8 +4691,8 @@ end
 
 return Sparse
 ]])
-local _9 = folder("_Packages", _1)
-local _10 = mod("Image", _9, [[
+local _10 = folder("_Packages", _1)
+local _11 = mod("Image", _10, [[
 local Reader = script.ImageReader.Reader
 
 local ImageReader = require(script.ImageReader)
@@ -4356,7 +4712,7 @@ return {
     ImageFormat = require(script.ImageFormat),
     ImageError = require(script.ImageError)
 }]])
-mod("Cursor", _10, [[
+mod("Cursor", _11, [[
 local ImageError = require(script.Parent.ImageError)
 
 type ImageError = ImageError.ImageError
@@ -4559,7 +4915,7 @@ return {
 	new = new
 }
 ]])
-mod("DataReader", _10, [[
+mod("DataReader", _11, [[
 local ImageReader = script.Parent.ImageReader
 local ImageReaderTypes = require(ImageReader.types)
 
@@ -4574,7 +4930,7 @@ function DataReader.convertToBuffer(dataStream: ImageReaderTypes.ReadableData): 
 end
 
 return DataReader]])
-local _11 = mod("DynamicImage", _10, [[
+local _12 = mod("DynamicImage", _11, [[
 local Reader = require(script.Parent.ImageReader.Reader)
 local ImageFormat = require(script.Parent.ImageFormat)
 local ImageError = require(script.Parent.ImageError)
@@ -4627,7 +4983,7 @@ return {
 	end,
 }
 ]])
-mod("types", _11, [[
+mod("types", _12, [[
 local ImageFormat = require(script.Parent.Parent.ImageFormat)
 
 export type DynamicImage<T> = {
@@ -4643,7 +4999,7 @@ export type DynamicImage<T> = {
 }
 
 return nil]])
-mod("ImageError", _10, [[
+mod("ImageError", _11, [[
 local Result = require(script.Parent.Result)
 local SafeEnum = require(script.Parent.SafeEnum)
 
@@ -4658,7 +5014,7 @@ local ImageError = {
 }
 
 return ImageError]])
-mod("ImageFormat", _10, [[
+mod("ImageFormat", _11, [[
 local SafeEnum = require(script.Parent.SafeEnum)
 
 type Extensions = "BMP"
@@ -4694,7 +5050,7 @@ end
 
 return ImageFormat :: typeof(ImageFormat)
 ]])
-local _12 = mod("ImageReader", _10, [[
+local _13 = mod("ImageReader", _11, [[
 local types = require(script.types)
 local structs = require(script.structs)
 
@@ -4780,7 +5136,7 @@ return {
 	end,
 }
 ]])
-local _13 = mod("Reader", _12, [[
+local _14 = mod("Reader", _13, [[
 --!strict
 
 local ImageReader = script.Parent
@@ -4825,7 +5181,7 @@ return {
         return CODECS
     end
 }]])
-mod("Bmp", _13, [[
+mod("Bmp", _14, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5257,7 +5613,7 @@ end
 
 return Bmp
 ]])
-local _14 = mod("Jpeg", _13, [[
+local _15 = mod("Jpeg", _14, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5427,7 +5783,7 @@ end
 
 return Jpg
 ]])
-local _15 = mod("Decoder", _14, [[
+local _16 = mod("Decoder", _15, [[
 local JPEG = {}
 
 local HUFFMAN_MODULE = require(script.HuffmanTable)
@@ -6573,7 +6929,7 @@ end
 
 return JPEG
 ]])
-mod("BitStream", _15, [[
+mod("BitStream", _16, [[
 local module = {}
 
 function module.CreateBitStream(data)
@@ -6635,7 +6991,7 @@ function module.CreateBitStream(data)
 end
 
 return module]])
-mod("HuffmanTable", _15, [[
+mod("HuffmanTable", _16, [[
 local module = {}
 
 local function BitsFromLength(root, element, pos)
@@ -6714,7 +7070,7 @@ function module.GetCode(huffmanTable, bitStream)
 end
 
 return module]])
-mod("types", _14, [[
+mod("types", _15, [[
 local Jpg = script.Parent
 local Reader = Jpg.Parent
 local ImageReader = Reader.Parent
@@ -6735,7 +7091,7 @@ export type JpgHeader = {
 }
 
 return nil]])
-local _16 = mod("Png", _13, [[
+local _17 = mod("Png", _14, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7001,7 +7357,7 @@ end
 
 return Png
 ]])
-mod("BppConvert", _16, [[
+mod("BppConvert", _17, [[
 local Preprocess = require(script.Parent.Preprocess)
 local fourBit = Preprocess[0.5]
 local twoBit = Preprocess[0.25]
@@ -7109,8 +7465,8 @@ end
 
 return Convert
 ]])
-local _17 = folder("Chunks", _16)
-mod("IDAT", _17, [[
+local _18 = folder("Chunks", _17)
+mod("IDAT", _18, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7128,7 +7484,7 @@ return function(cursor: Cursor, file, chunk)
     return
 end
 ]])
-mod("IEND", _17, [[
+mod("IEND", _18, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7140,7 +7496,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("PLTE", _17, [[
+mod("PLTE", _18, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7152,7 +7508,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("gAMA", _17, [[
+mod("gAMA", _18, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Chunks = script.Parent
@@ -7166,7 +7522,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("sRGB", _17, [[
+mod("sRGB", _18, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7178,7 +7534,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("tEXt", _17, [[
+mod("tEXt", _18, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7197,7 +7553,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("tRNS", _17, [[
+mod("tRNS", _18, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7232,7 +7588,7 @@ return function(cursor: Cursor, file, data)
 	}
 end
 ]])
-mod("Deflate", _16, [=[
+mod("Deflate", _17, [=[
 --[[
 
 LUA MODULE
@@ -7709,7 +8065,7 @@ function Deflate:InflateZlib(io)
 end
 
 return Deflate]=])
-mod("IDHR", _16, [[
+mod("IDHR", _17, [[
 local Reader = script.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7743,7 +8099,7 @@ return function(PNG, cursor: Cursor)
     }
 end
 ]])
-mod("Interlacing", _16, [[
+mod("Interlacing", _17, [[
 local Interlacing = {}
 
 local X_STEP = { 8, 8, 4, 4, 2, 2, 1 }
@@ -7911,7 +8267,7 @@ end
 
 return Interlacing
 ]])
-mod("Preprocess", _16, [[
+mod("Preprocess", _17, [[
 local util = require(script.Parent.Parent.util)
 
 local createRGBAColor = util.createRGBAColor
@@ -7972,7 +8328,7 @@ return {
 	end,
 }
 ]])
-mod("Unfilter", _16, [[
+mod("Unfilter", _17, [[
 local Unfilter = {}
 
 -- 0
@@ -8166,9 +8522,9 @@ end
 
 return Unfilter
 ]])
-mod("util", _16, [[
+mod("util", _17, [[
 return require(script.Parent.Parent.util)]])
-mod("Tga", _13, [[
+mod("Tga", _14, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -8385,7 +8741,7 @@ end
 
 return Tga
 ]])
-mod("util", _13, [[
+mod("util", _14, [[
 local util = {}
 
 function util.createRGBAColor(r: number, g: number, b: number, a: number?): number
@@ -8414,7 +8770,7 @@ function util.beToLe16(beValue: number)
 end
 
 return util]])
-mod("structs", _12, [[
+mod("structs", _13, [[
 export type Dimensions = { width: number, height: number }
 
 export type function getAppropriateDecoder(ty: type, tys: type)
@@ -8422,7 +8778,7 @@ export type function getAppropriateDecoder(ty: type, tys: type)
 end
 
 return nil]])
-mod("types", _12, [[
+mod("types", _13, [[
 local ImageFormat = require(script.Parent.Parent.ImageFormat)
 local ImageError = require(script.Parent.Parent.ImageError)
 local Cursor = require(script.Parent.Parent.Cursor)
@@ -8460,7 +8816,7 @@ export type ImageReader<T> = {
 }
 
 return nil]])
-mod("Result", _10, [[
+mod("Result", _11, [[
 export type Result<T, E> = {
     isOk: boolean,
     value: {T | E},
@@ -8539,7 +8895,7 @@ function Result.castSmallToDefault<T, E>(result: SmallResult<T, E>): Result<T, E
 end
 
 return Result]])
-mod("SafeEnum", _10, [[
+mod("SafeEnum", _11, [[
 local counter = -1
 
 return function<T>(): T
@@ -8547,8 +8903,114 @@ return function<T>(): T
 	return counter
 end
 ]])
-local _18 = folder("_Patterns", _1)
-mod("Draw", _18, [[
+local _19 = folder("_Patterns", _1)
+mod("Dither", _19, [[
+-- IMGN
+-- _Patterns/Dither.luau
+-- Plinko Labs
+--
+-- Colour reduction for a Canvas: snap every pixel to the nearest colour in a palette (Quantize),
+-- or do it with Floyd-Steinberg error diffusion (Dither) so the limited palette reads as smooth
+-- shading - the classic retro / GameBoy look. Beyond looks, fewer colours means longer same-colour
+-- runs, which makes the RowMerge / GreedyMesh / RichText drivers dramatically cheaper.
+
+local Dither = {}
+
+export type Palette = { Color3 }
+
+-- nearest palette colour to (r,g,b) by squared distance
+local function nearest(palette: Palette, r: number, g: number, b: number): Color3
+	local best, bestD = palette[1], math.huge
+	for _, c in palette do
+		local dr, dg, db = r - c.R, g - c.G, b - c.B
+		local d = dr * dr + dg * dg + db * db
+		if d < bestD then
+			bestD = d
+			best = c
+		end
+	end
+	return best
+end
+
+--[=[
+	@class Dither
+	Palette reduction for a [Canvas] - reached via [Canvas:Quantize] and [Canvas:Dither].
+]=]
+
+--[=[
+	@within Dither
+	Snaps every visible pixel of `canvas` to its nearest colour in `palette` (no error diffusion).
+]=]
+function Dither.quantize(canvas: any, palette: Palette)
+	local W, H = canvas.Width, canvas.Height
+	for y = 0, H - 1 do
+		for x = 0, W - 1 do
+			local c, a = canvas:GetPixel(x, y)
+			if a > 0.004 then
+				canvas:SetPixel(x, y, nearest(palette, c.R, c.G, c.B), a)
+			end
+		end
+	end
+end
+
+--[=[
+	@within Dither
+	Floyd-Steinberg dithers `canvas` to `palette`: snaps each visible pixel to the nearest palette
+	colour and pushes the rounding error onto its neighbours, so the limited palette looks shaded.
+]=]
+function Dither.floydSteinberg(canvas: any, palette: Palette)
+	local W, H = canvas.Width, canvas.Height
+	local r, g, b, alpha = {}, {}, {}, {}
+
+	for y = 0, H - 1 do
+		for x = 0, W - 1 do
+			local c, a = canvas:GetPixel(x, y)
+			local i = y * W + x + 1
+			r[i], g[i], b[i], alpha[i] = c.R, c.G, c.B, a
+		end
+	end
+
+	local function spread(x: number, y: number, er: number, eg: number, eb: number, f: number)
+		if x >= 0 and x < W and y >= 0 and y < H then
+			local j = y * W + x + 1
+			r[j] += er * f
+			g[j] += eg * f
+			b[j] += eb * f
+		end
+	end
+
+	for y = 0, H - 1 do
+		for x = 0, W - 1 do
+			local i = y * W + x + 1
+			if alpha[i] > 0.004 then
+				local p = nearest(palette, r[i], g[i], b[i])
+				local er, eg, eb = r[i] - p.R, g[i] - p.G, b[i] - p.B
+				canvas:SetPixel(x, y, p, alpha[i])
+				spread(x + 1, y, er, eg, eb, 7 / 16)
+				spread(x - 1, y + 1, er, eg, eb, 3 / 16)
+				spread(x, y + 1, er, eg, eb, 5 / 16)
+				spread(x + 1, y + 1, er, eg, eb, 1 / 16)
+			end
+		end
+	end
+end
+
+--[=[
+	@within Dither
+	A grayscale palette of `n` evenly-spaced shades (n >= 2).
+]=]
+function Dither.grayscale(n: number): Palette
+	local palette = {}
+	for i = 0, n - 1 do
+		local v = i / (n - 1)
+		table.insert(palette, Color3.new(v, v, v))
+	end
+	return palette
+end
+
+return Dither
+]])
+mod("Draw", _19, [[
 -- IMGN
 -- _Patterns/Draw.luau
 -- Plinko Labs
@@ -8682,7 +9144,7 @@ end
 
 return Draw
 ]])
-mod("Font", _18, [[
+mod("Font", _19, [[
 -- IMGN
 -- _Patterns/Font.luau
 -- Plinko Labs
@@ -8805,7 +9267,7 @@ end
 
 return Font
 ]])
-mod("Image", _18, [[
+mod("Image", _19, [[
 -- IMGN
 -- _Patterns/Image.luau
 -- Plinko Labs
@@ -9035,5 +9497,5 @@ end
 return Image
 ]])
 
-print("[IMGN] installed 58 modules under ReplicatedStorage.IMGN")
+print("[IMGN] installed 60 modules under ReplicatedStorage.IMGN")
 return true
