@@ -29,21 +29,22 @@ local Surface = require(script.Surface)
 local Blood = {}
 
 local SETTINGS = {
-	-- "Fluid" (default): the Liquid cellular SIM (real flowing/pooling dynamics) rendered with the
-	--   Blob driver - overlapping circles, so it's smooth/organic, not square pixels. Realistic.
-	-- "Vector": smooth animated Path2D drips (scripted, not simulated, but the cheapest).
-	-- "Pixel": the Liquid sim on square Frames (the original raster look).
-	Renderer = "Fluid",
+	-- "Pixel" (default): the Liquid cellular SIM on a canvas that covers the WHOLE part (the
+	--   original full-surface look), rendered with the Sparse driver so only painted pixels cost
+	--   anything - the way to run it on big parts without the lag.
+	-- "Fluid": the Liquid sim on a small Blob-circle patch (smooth/organic, localized).
+	-- "Vector": smooth animated Path2D drips (scripted, the cheapest).
+	Renderer = "Pixel",
 	VectorFresh = Color3.fromRGB(135, 8, 10),
 	VectorDry = Color3.fromRGB(62, 16, 12),
-	ProxySize = 10, -- max footprint of a blood proxy, in studs (clamped to the part so it can't overhang)
+	ProxySize = 10, -- (Fluid/Vector) footprint of a localized patch, in studs (clamped to the part)
 	ProxyThickness = 0.08,
-	ProxyOffset = 0.02, -- how far off the surface to float the proxy (avoid z-fighting)
+	ProxyOffset = 0.02, -- how far off the surface to float the canvas (avoid z-fighting)
+	PixelsPerStud = 4, -- (Pixel) resolution per stud of the full-part canvas
 	FluidPixelsPerStud = 3, -- (Fluid) low res - the circles melt the grid so it still looks smooth
-	PixelsPerStud = 6, -- (Pixel) resolution per proxy stud
-	MaxResolution = 56,
-	EdgeFade = 3, -- (Fluid/Pixel) border alpha falloff so the canvas edge blends out
-	ReuseRadius = 6, -- splats within this many studs reuse a proxy (fewer, bigger blood patches)
+	MaxResolution = 160, -- per-axis cap so a huge part doesn't make a giant grid
+	EdgeFade = 0, -- (Fluid/Pixel) border alpha falloff (0 = off; the canvas now matches the part)
+	ReuseRadius = 6, -- (Fluid/Vector) splats within this many studs reuse a patch
 	Preset = "Blood",
 	DropletSize = 0.4,
 	DropletColor = Color3.fromRGB(120, 6, 8),
@@ -113,6 +114,15 @@ BloodProxy.__index = BloodProxy
 -- proxies grouped by the part they landed on, for reuse + cleanup (weak so GC can collect)
 local proxiesByPart: { [BasePart]: { any } } = setmetatable({}, { __mode = "k" }) :: any
 
+-- full extent (studs) of `part`'s box projected onto world direction `dir`
+local function extentAlong(part: BasePart, dir: Vector3): number
+	local cf = part.CFrame
+	local s = part.Size
+	return math.abs(dir:Dot(cf.RightVector)) * s.X
+		+ math.abs(dir:Dot(cf.UpVector)) * s.Y
+		+ math.abs(dir:Dot(cf.LookVector)) * s.Z
+end
+
 -- distance from `worldPos` along world `dir` until it exits `part`'s box (studs)
 local function exitDistance(part: BasePart, worldPos: Vector3, dir: Vector3): number
 	local localP = part.CFrame:PointToObjectSpace(worldPos)
@@ -141,26 +151,35 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 
 	local renderer = SETTINGS.Renderer
 	local vector = renderer == "Vector"
+	local fullFace = renderer == "Pixel" -- cover the whole part (sparse) vs a localized patch
 
-	-- clamp the proxy to fit inside the hit part around the splat, so blood never floats out past
-	-- the part's real edges (the proxy is otherwise oversized).
-	local size = SETTINGS.ProxySize
-	if hitPart then
-		local dRight = math.min(exitDistance(hitPart, worldPos, right), exitDistance(hitPart, worldPos, -right))
-		local dUp = math.min(exitDistance(hitPart, worldPos, up), exitDistance(hitPart, worldPos, -up))
-		size = math.clamp(math.min(size, 2 * dRight, 2 * dUp), 1, SETTINGS.ProxySize)
+	-- size + position the canvas. Full-face: a rectangle covering the whole part, centred on its
+	-- face. Patch: a small square clamped to fit inside the part around the splat.
+	local sizeR, sizeU, center
+	if fullFace and hitPart then
+		sizeR = math.max(extentAlong(hitPart, right), 0.5)
+		sizeU = math.max(extentAlong(hitPart, up), 0.5)
+		center = hitPart.Position + normal * (extentAlong(hitPart, normal) * 0.5)
+	else
+		local s = SETTINGS.ProxySize
+		if hitPart then
+			local dR = math.min(exitDistance(hitPart, worldPos, right), exitDistance(hitPart, worldPos, -right))
+			local dU = math.min(exitDistance(hitPart, worldPos, up), exitDistance(hitPart, worldPos, -up))
+			s = math.clamp(math.min(s, 2 * dR, 2 * dU), 1, SETTINGS.ProxySize)
+		end
+		sizeR, sizeU, center = s, s, worldPos
 	end
 
 	local part = Instance.new("Part")
 	part.Name = "BloodProxy"
-	part.Size = Vector3.new(size, size, SETTINGS.ProxyThickness)
+	part.Size = Vector3.new(sizeR, sizeU, SETTINGS.ProxyThickness)
 	part.Transparency = 1 -- only the SurfaceGui is visible
 	part.CanCollide = false
 	part.CanQuery = false
 	part.CastShadow = false
 	part.Massless = true
 	-- (right, up, normal) is right-handed, so the part's +Z face (Back) points outward along normal
-	part.CFrame = CFrame.fromMatrix(worldPos + normal * SETTINGS.ProxyOffset, right, up, normal)
+	part.CFrame = CFrame.fromMatrix(center + normal * SETTINGS.ProxyOffset, right, up, normal)
 
 	if hitPart and not hitPart.Anchored then
 		part.Anchored = false
@@ -182,16 +201,18 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 	local self = setmetatable({
 		Part = part,
 		HitPart = hitPart,
-		Center = worldPos,
+		Center = center,
 		Normal = normal,
 		Up = up,
-		Size = size,
+		SizeR = sizeR,
+		SizeU = sizeU,
+		FullFace = fullFace,
 		IsDrip = gravity.Y > 0.5, -- a wall/slope sheds off its bottom edge; a floor just pools
 		_dripCD = 0,
 	}, BloodProxy)
 
 	if vector then
-		-- vector: a fixed 100x100 virtual canvas, smooth Path2D drips, +Y = downhill
+		-- a fixed 100x100 virtual canvas, smooth Path2D drips, +Y = downhill
 		gui.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
 		gui.CanvasSize = Vector2.new(100, 100)
 		gui.Parent = part
@@ -204,20 +225,19 @@ function BloodProxy.new(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 		})
 		self.Vector:Start()
 	else
-		-- the Liquid cellular sim. "Fluid" renders it with the Blob driver (smooth circles) at low
-		-- res; "Pixel" uses square Frames at higher res.
-		local fluid = renderer == "Fluid"
+		-- the Liquid cellular sim. "Pixel" = full part, Sparse driver (only painted pixels cost);
+		-- "Fluid" = a Blob-circle patch.
 		gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
 		gui.PixelsPerStud = 50
 		gui.Parent = part
-		local ppstud = if fluid then SETTINGS.FluidPixelsPerStud else SETTINGS.PixelsPerStud
-		local res = math.clamp(math.floor(size * ppstud), 8, SETTINGS.MaxResolution)
-		self.Res = res
+		local ppstud = if fullFace then SETTINGS.PixelsPerStud else SETTINGS.FluidPixelsPerStud
+		self.ResW = math.clamp(math.floor(sizeR * ppstud), 8, SETTINGS.MaxResolution)
+		self.ResH = math.clamp(math.floor(sizeU * ppstud), 8, SETTINGS.MaxResolution)
 		self.Liquid = Liquid.new({
 			Canvas = Canvas.new({
-				Resolution = Vector2.new(res, res),
+				Resolution = Vector2.new(self.ResW, self.ResH),
 				Parent = gui,
-				Driver = if fluid then "Blob" else "PixelGrid",
+				Driver = if fullFace then "Sparse" else "Blob",
 			}),
 			Preset = SETTINGS.Preset,
 			Gravity = gravity,
@@ -236,13 +256,13 @@ end
 
 -- world position of a canvas point (x, y in 0..1 scale), just off the front of the surface
 function BloodProxy.worldOfScale(self: any, x: number, y: number): Vector3
-	local lx = (x - 0.5) * self.Size
-	local ly = (0.5 - y) * self.Size -- +Y scale is downhill, +Y local is up-slope
+	local lx = (x - 0.5) * self.SizeR
+	local ly = (0.5 - y) * self.SizeU -- +Y scale is downhill, +Y local is up-slope
 	return self.Part.CFrame:PointToWorldSpace(Vector3.new(lx, ly, SETTINGS.ProxyThickness))
 end
 
 -- distance (in 0..1 scale, downhill) from a splat point to the hit part's real edge, so drips
--- stop at the actual surface edge instead of floating out onto the oversized proxy.
+-- stop at the actual surface edge instead of floating out onto the canvas.
 function BloodProxy.edgeDistanceScale(self: any, worldPos: Vector3): number
 	if not self.HitPart then
 		return 0.96
@@ -251,7 +271,7 @@ function BloodProxy.edgeDistanceScale(self: any, worldPos: Vector3): number
 	if tExit == math.huge then
 		return 0.96
 	end
-	return tExit / self.Size -- studs -> proxy scale
+	return tExit / self.SizeU -- studs -> scale (downhill is the up/U axis)
 end
 
 -- shed a falling droplet off the edge at scale `(x, y)`, continuing the cascade below
@@ -273,13 +293,13 @@ function BloodProxy.checkEdge(self: any, dt: number)
 		return
 	end
 	self._dripCD = SETTINGS.DripInterval
-	BloodProxy.shed(self, (x + 0.5) / self.Res, 0.97, taken :: number)
+	BloodProxy.shed(self, (x + 0.5) / self.ResW, 0.97, taken :: number)
 end
 
 -- world point -> this proxy's canvas scale (0..1, +Y down)
 function BloodProxy.Scale(self: any, worldPos: Vector3): (number, number)
 	local lp = self.Part.CFrame:PointToObjectSpace(worldPos)
-	return math.clamp(0.5 + lp.X / self.Size, 0, 1), math.clamp(0.5 - lp.Y / self.Size, 0, 1)
+	return math.clamp(0.5 + lp.X / self.SizeR, 0, 1), math.clamp(0.5 - lp.Y / self.SizeU, 0, 1)
 end
 
 function BloodProxy.Splat(self: any, worldPos: Vector3, amount: number)
@@ -293,11 +313,12 @@ function BloodProxy.Splat(self: any, worldPos: Vector3, amount: number)
 			self.Vector:Splat(sx, sy, amount, { Puddle = true }) -- floor/ceiling: spread a puddle
 		end
 	else
-		self.Liquid:Splat(math.floor(sx * self.Res), math.floor(sy * self.Res), amount, { Spread = 3 + amount })
+		self.Liquid:Splat(math.floor(sx * self.ResW), math.floor(sy * self.ResH), amount, { Spread = 3 + amount })
 	end
 end
 
--- find a nearby proxy on the same part facing the same way, or make a new one
+-- find an existing canvas for this hit, or make one. Full-face (Pixel) keeps ONE canvas per
+-- part+face (it covers the whole part); patch renderers reuse any canvas within ReuseRadius.
 local function proxyFor(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 	local key = hitPart or Workspace
 	local list = proxiesByPart[key]
@@ -305,12 +326,16 @@ local function proxyFor(hitPart: BasePart?, worldPos: Vector3, normal: Vector3)
 		list = {}
 		proxiesByPart[key] = list
 	end
+	local fullFace = SETTINGS.Renderer == "Pixel"
 	for i = #list, 1, -1 do
 		local p = list[i]
 		if not p.Part.Parent then
 			table.remove(list, i) -- cleaned up elsewhere
-		elseif (p.Center - worldPos).Magnitude <= SETTINGS.ReuseRadius and p.Normal:Dot(normal) > 0.8 then
-			return p
+		elseif p.Normal:Dot(normal) > 0.8 then
+			-- same face (full-face), or a near-enough patch
+			if fullFace or (p.Center - worldPos).Magnitude <= SETTINGS.ReuseRadius then
+				return p
+			end
 		end
 	end
 	local proxy = BloodProxy.new(hitPart, worldPos, normal)

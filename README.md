@@ -113,6 +113,7 @@ A driver turns the pixel buffer into instances. Pick per canvas via `Driver`. Th
 | **`GreedyMesh`** | one Frame per merged 2D **rectangle** | **static / flat images** — merges runs in *both* axes (a 50×50 flat block → 1 Frame, not 50). 90%+ fewer instances on pixel art |
 | **`RichText`** | **one `TextLabel`** for the whole image | **lowest** instance count — the image is block glyphs (█) with per-pixel `<font>` colour, RLE-compressed. Approximate alignment (monospace + `TextScaled`), low-res only (~64×64; RichText has a ~16k-char ceiling). Not pixel-perfect |
 | **`Blob`** | one *overlapping circle* per pixel | **smooth/organic** output from a low-res buffer — circles merge into metaball-like blobs with no square edges. Ideal for fluids (the blood engine's `"Fluid"` renderer uses it) |
+| **`Sparse`** | one Frame per *visible* pixel (pooled) | instance count tracks **painted area, not canvas area** — run a full-resolution sim/canvas over a huge surface and only pay for the pixels with something on them. The blood engine's `"Pixel"` renderer uses it for big parts |
 
 So for loading a photo/sprite once, `GreedyMesh` is usually the sweet spot; for a tiny icon where instance count must be near-zero, try `RichText`. For anything that animates, stay on `PixelGrid`.
 
@@ -188,9 +189,9 @@ See `examples/BloodDrip.server.luau`.
 A full droplet-and-drip system: throw 3D blood that lands on surfaces and drips down them, correctly following each surface's **downhill** — walls, slopes, and rotated/moving parts.
 
 **Three renderers** (set with `IMGN.Blood.Configure { Renderer = … }`):
-- **`"Fluid"`** *(default)* — the `Liquid` cellular **simulation** (real emergent flow, branching, pooling) rendered with the **`Blob` driver**: each cell is an *overlapping circle*, so a low-res sim melts into smooth, organic blobs — the realism of the sim *without* the square pixels. The proxy is clamped to the part so nothing floats past the edge.
-- **`"Vector"`** — smooth animated **`Path2D` strokes** (a blob + drips that grow + dry). Scripted rather than simulated, but the cheapest; drips stop at the surface's real edge and shed, floors puddle.
-- **`"Pixel"`** — the `Liquid` sim on square Frames (the original raster look).
+- **`"Pixel"`** *(default)* — the `Liquid` cellular **simulation** on a canvas that **covers the whole part** (the original full-surface look), rendered with the **`Sparse` driver** so only *painted* pixels cost anything. So you get the real sim over a full big wall, but the instance count tracks the blood, not the wall — no lag.
+- **`"Fluid"`** — the sim on a small **`Blob`-circle** patch (smooth/organic, localized).
+- **`"Vector"`** — smooth animated **`Path2D` strokes** (scripted, the cheapest); drips stop at the surface's real edge and shed, floors puddle.
 
 ```lua
 -- a kill brick that sprays blood when stepped on
