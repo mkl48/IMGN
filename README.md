@@ -231,6 +231,26 @@ IMGN.Blood.Configure({ FlipDrip = true })
 
 See `examples/KillBrick.server.luau`.
 
+## Software 3D (raycaster)
+
+`IMGN.Raycaster` is a textured **software 3D engine** on a canvas — Doom/Wolfenstein-style raycasting, rendered into GUI frames with no MeshParts. It casts one ray per column over a grid map (fast), draws perspective-correct **textured** walls with **distance fog** + face shading, a faded floor/ceiling, and depth-sorted **billboard sprites**.
+
+```lua
+local rc = IMGN.Raycaster({
+    Canvas = IMGN.Surface(part, Enum.NormalId.Front, { Resolution = Vector2.new(96, 64) }),
+    Map = { "#####", "#...#", "#.#.#", "#...#", "#####" },   -- chars = wall ids, "." = empty
+    Textures = {
+        ["#"] = IMGN.Texture.brick(Color3.fromRGB(150,60,50), Color3.fromRGB(40,20,18)),
+    },
+    StartX = 2.5, StartY = 2.5, StartAngle = 0,
+})
+rc:AddSprite(3.5, 3.5, IMGN.Texture.checker(c1, c2))   -- a billboard
+rc:Start()      -- built-in WASD + arrow/Q-E controls, renders every frame
+-- or drive it yourself: rc:Move(forward, strafe, dt) / rc:Turn(da) / rc:Render()
+```
+
+**Textures** are `(u, v) -> Color3?` samplers — `IMGN.Texture.brick/checker/solid(...)`, or `IMGN.Texture.fromCanvas(canvas)` to **wallpaper a level with a loaded image**. It's resolution-bound (every pixel redraws each frame), so keep the canvas modest and drop the resolution if it's heavy. See `examples/Raycaster.client.luau`.
+
 ## Particles
 
 `IMGN.Particles` is a 2D particle emitter on a canvas — fire, sparks, rain, snow, explosions, confetti. Particles move under gravity, fade with age, and only the moving pixels repaint.
@@ -396,7 +416,7 @@ See [`examples/`](examples):
 - **Starfield** — a warp-speed flight through projected 3D stars.
 - **Mandelbrot** — a self-zooming fractal via `:Shader`.
 - **Snake** — the classic, with a bitmap-font scoreboard (WASD / arrows).
-- **Raycaster** — a Wolfenstein-style first-person 3D view (W/S walk, A/D turn).
+- **Raycaster** — a textured software-3D level (`IMGN.Raycaster`): brick/checker walls + a sprite, WASD + turn.
 - **LoadImage** — decode a real PNG onto a part (decoder bundled).
 - **WebImage** — load an image by URL through the bundled web service (`server/`).
 - **BloodDrip** — realistic dripping blood via the `Liquid` sim (`IMGN.Liquid`).

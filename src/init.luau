@@ -19,8 +19,10 @@ local AppClass = require(script._Classes.App)
 local LiquidClass = require(script._Classes.Liquid)
 local BloodModule = require(script._Classes.Blood)
 local ParticlesClass = require(script._Classes.Particles)
+local RaycasterClass = require(script._Classes.Raycaster)
 local ImageHelper = require(script._Patterns.Image)
 local DitherHelper = require(script._Patterns.Dither)
+local TextureHelper = require(script._Patterns.Texture)
 local ConfigModule = require(script._Core.Config)
 
 local IMGN = {}
@@ -35,6 +37,8 @@ export type Liquid = LiquidClass.Liquid
 export type LiquidConfig = LiquidClass.LiquidConfig
 export type Particles = ParticlesClass.Particles
 export type ParticlesConfig = ParticlesClass.ParticlesConfig
+export type Raycaster = RaycasterClass.Raycaster
+export type RaycasterConfig = RaycasterClass.RaycasterConfig
 export type Config = ConfigModule.Config
 
 --[=[
@@ -102,6 +106,23 @@ end
 IMGN.Palette = {
 	Grayscale = DitherHelper.grayscale,
 }
+
+--[=[
+	@within IMGN
+	Creates a [Raycaster] - a textured software-3D engine (Doom-style) on a canvas. Pass a `Map`
+	(rows of wall-id chars) and `Textures`; move with `:Move`/`:Turn` or `:Start()` for built-in
+	WASD, and `:Render()` each frame. Build wall/sprite textures with [IMGN.Texture].
+]=]
+function IMGN.Raycaster(config: RaycasterConfig): Raycaster
+	return RaycasterClass.new(config)
+end
+
+--[=[
+	@within IMGN
+	Texture generators for the [Raycaster]: `IMGN.Texture.brick/checker/solid(...)` build procedural
+	textures, and `IMGN.Texture.fromCanvas(canvas)` turns a loaded image into a wall/sprite texture.
+]=]
+IMGN.Texture = TextureHelper
 
 --[=[
 	@within IMGN

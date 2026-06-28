@@ -61,8 +61,10 @@ local AppClass = require(script._Classes.App)
 local LiquidClass = require(script._Classes.Liquid)
 local BloodModule = require(script._Classes.Blood)
 local ParticlesClass = require(script._Classes.Particles)
+local RaycasterClass = require(script._Classes.Raycaster)
 local ImageHelper = require(script._Patterns.Image)
 local DitherHelper = require(script._Patterns.Dither)
+local TextureHelper = require(script._Patterns.Texture)
 local ConfigModule = require(script._Core.Config)
 
 local IMGN = {}
@@ -77,6 +79,8 @@ export type Liquid = LiquidClass.Liquid
 export type LiquidConfig = LiquidClass.LiquidConfig
 export type Particles = ParticlesClass.Particles
 export type ParticlesConfig = ParticlesClass.ParticlesConfig
+export type Raycaster = RaycasterClass.Raycaster
+export type RaycasterConfig = RaycasterClass.RaycasterConfig
 export type Config = ConfigModule.Config
 
 --[=[
@@ -144,6 +148,23 @@ end
 IMGN.Palette = {
 	Grayscale = DitherHelper.grayscale,
 }
+
+--[=[
+	@within IMGN
+	Creates a [Raycaster] - a textured software-3D engine (Doom-style) on a canvas. Pass a `Map`
+	(rows of wall-id chars) and `Textures`; move with `:Move`/`:Turn` or `:Start()` for built-in
+	WASD, and `:Render()` each frame. Build wall/sprite textures with [IMGN.Texture].
+]=]
+function IMGN.Raycaster(config: RaycasterConfig): Raycaster
+	return RaycasterClass.new(config)
+end
+
+--[=[
+	@within IMGN
+	Texture generators for the [Raycaster]: `IMGN.Texture.brick/checker/solid(...)` build procedural
+	textures, and `IMGN.Texture.fromCanvas(canvas)` turns a loaded image into a wall/sprite texture.
+]=]
+IMGN.Texture = TextureHelper
 
 --[=[
 	@within IMGN
@@ -3397,8 +3418,341 @@ end
 
 return Particles
 ]])
-local _8 = folder("_Core", _1)
-mod("Config", _8, [[
+local _8 = mod("Raycaster", _2, [[
+-- IMGN
+-- _Classes/Raycaster/init.luau
+-- Plinko Labs
+--
+-- A software 3D engine on a Canvas - a textured raycaster (Wolfenstein/Doom style). It casts one
+-- ray per screen column across a grid map (DDA), draws a perspective-correct, textured wall slice
+-- with distance fog + N/S face shading, fills a faded floor/ceiling, and depth-sorts billboard
+-- sprites against the wall depth buffer. One ray per column (not per pixel) keeps it fast enough to
+-- run live on a Frame canvas. Real-time 3D, rendered into a GUI, no MeshParts.
+
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local Canvas = require(script.Parent.Canvas)
+
+--[=[
+	@class Raycaster
+	A textured raycasting 3D renderer drawing on a [Canvas]. Build with [IMGN.Raycaster], move the
+	camera (`:Move`/`:Turn`/`:SetCamera`), add `:AddSprite`s, and `:Render()` (or `:Start()` for a
+	built-in WASD loop).
+]=]
+local Raycaster = {}
+Raycaster.__index = Raycaster
+
+export type RaycasterConfig = {
+	Canvas: Canvas.Canvas?,
+	Resolution: Vector2?,
+	Parent: Instance?,
+	Driver: any?,
+	Map: { string }, -- rows of wall ids; "." or " " is empty, any other char is a wall id
+	Textures: { [string]: (u: number, v: number) -> Color3? }, -- per wall-id texture sampler
+	Default: ((u: number, v: number) -> Color3?)?, -- fallback wall texture
+	FOV: number?, -- degrees (default 66)
+	Ceiling: Color3?,
+	Floor: Color3?,
+	Fog: Color3?,
+	FogStart: number?,
+	FogEnd: number?,
+	StartX: number?,
+	StartY: number?,
+	StartAngle: number?,
+	MoveSpeed: number?,
+	TurnSpeed: number?,
+}
+
+export type Raycaster = typeof(setmetatable({} :: any, Raycaster))
+
+local function pick<T>(v: T?, d: T): T
+	if v == nil then
+		return d
+	end
+	return v
+end
+
+function Raycaster.new(config: RaycasterConfig): Raycaster
+	local canvas = config.Canvas
+	if not canvas then
+		assert(config.Resolution, "IMGN.Raycaster: pass a Canvas or a Resolution")
+		canvas = Canvas.new({ Resolution = config.Resolution, Parent = config.Parent, Driver = config.Driver })
+	end
+
+	local fog = config.Fog or Color3.fromRGB(20, 22, 30)
+	local ceiling = config.Ceiling or Color3.fromRGB(35, 40, 60)
+	local floor = config.Floor or Color3.fromRGB(45, 40, 35)
+
+	-- precompute the floor/ceiling vertical gradient (same every column): fade to fog at the horizon
+	local H = canvas.Height
+	local half = H / 2
+	local vert = {}
+	for y = 0, H - 1 do
+		if y < half then
+			vert[y] = ceiling:Lerp(fog, y / half) -- top -> horizon
+		else
+			vert[y] = fog:Lerp(floor, (y - half) / half) -- horizon -> bottom
+		end
+	end
+
+	local self = setmetatable({
+		Canvas = canvas,
+		Map = config.Map,
+		MapW = #config.Map[1],
+		MapH = #config.Map,
+		Fog = fog,
+		Ceiling = ceiling,
+		Floor = floor,
+		FogStart = config.FogStart or 1.5,
+		FogEnd = config.FogEnd or 12,
+		MoveSpeed = config.MoveSpeed or 3,
+		TurnSpeed = config.TurnSpeed or 2.4,
+		DefaultTexture = config.Default or function()
+			return Color3.fromRGB(120, 120, 130)
+		end,
+		_tex = config.Textures or {},
+		_sprites = {},
+		_depth = {},
+		_vert = vert,
+		_conn = nil,
+		PosX = config.StartX or 2,
+		PosY = config.StartY or 2,
+	}, Raycaster)
+
+	self._maxSteps = self.MapW + self.MapH + 8
+	local planeLen = math.tan(math.rad(config.FOV or 66) / 2)
+	self._planeLen = planeLen
+	Raycaster.SetCamera(self, self.PosX, self.PosY, config.StartAngle or 0)
+	return self
+end
+
+-- the wall id at a map cell ("0"/empty -> 0; out of bounds -> a border wall)
+function Raycaster.wallAt(self: Raycaster, mx: number, my: number): any
+	if mx < 0 or my < 0 or mx >= self.MapW or my >= self.MapH then
+		return "#"
+	end
+	local ch = string.sub(self.Map[my + 1], mx + 1, mx + 1)
+	if ch == "." or ch == " " or ch == "" then
+		return 0
+	end
+	return ch
+end
+
+--[=[
+	@within Raycaster
+	Points the camera: position `(x, y)` and facing `angle` (radians).
+]=]
+function Raycaster.SetCamera(self: Raycaster, x: number, y: number, angle: number)
+	self.PosX, self.PosY = x, y
+	self.DirX, self.DirY = math.cos(angle), math.sin(angle)
+	self.PlaneX, self.PlaneY = -self.DirY * self._planeLen, self.DirX * self._planeLen
+end
+
+--[=[
+	@within Raycaster
+	Moves the camera `forward` (+/-1) and `strafe` (+/-1) for `dt` seconds, sliding along walls.
+]=]
+function Raycaster.Move(self: Raycaster, forward: number, strafe: number, dt: number)
+	local speed = self.MoveSpeed * dt
+	local nx = self.PosX + (self.DirX * forward - self.DirY * strafe) * speed
+	local ny = self.PosY + (self.DirY * forward + self.DirX * strafe) * speed
+	if Raycaster.wallAt(self, math.floor(nx), math.floor(self.PosY)) == 0 then
+		self.PosX = nx
+	end
+	if Raycaster.wallAt(self, math.floor(self.PosX), math.floor(ny)) == 0 then
+		self.PosY = ny
+	end
+end
+
+--[=[
+	@within Raycaster
+	Rotates the camera by `amount` radians.
+]=]
+function Raycaster.Turn(self: Raycaster, amount: number)
+	local c, s = math.cos(amount), math.sin(amount)
+	local dx, dy = self.DirX, self.DirY
+	self.DirX, self.DirY = dx * c - dy * s, dx * s + dy * c
+	local px, py = self.PlaneX, self.PlaneY
+	self.PlaneX, self.PlaneY = px * c - py * s, px * s + py * c
+end
+
+--[=[
+	@within Raycaster
+	Adds a billboard sprite at world `(x, y)` with a texture sampler. Returns the sprite (mutate its
+	`X`/`Y` to move it).
+]=]
+function Raycaster.AddSprite(self: Raycaster, x: number, y: number, texture: (u: number, v: number) -> Color3?)
+	local sprite = { X = x, Y = y, Texture = texture }
+	table.insert(self._sprites, sprite)
+	return sprite
+end
+
+local function shade(self: Raycaster, color: Color3, dist: number, side: number): Color3
+	local f = math.clamp((self.FogEnd - dist) / (self.FogEnd - self.FogStart), 0, 1)
+	if side == 1 then
+		f *= 0.7 -- darken N/S faces so corners read
+	end
+	return color:Lerp(self.Fog, 1 - f)
+end
+
+--[=[
+	@within Raycaster
+	Renders the 3D view to the canvas and flushes it.
+]=]
+function Raycaster.Render(self: Raycaster)
+	local canvas = self.Canvas
+	local W, H = canvas.Width, canvas.Height
+	local posX, posY = self.PosX, self.PosY
+	local dirX, dirY = self.DirX, self.DirY
+	local planeX, planeY = self.PlaneX, self.PlaneY
+	local depth, vert = self._depth, self._vert
+	local halfH = H / 2
+
+	for x = 0, W - 1 do
+		local cameraX = 2 * x / W - 1
+		local rayX = dirX + planeX * cameraX
+		local rayY = dirY + planeY * cameraX
+
+		local mapX, mapY = math.floor(posX), math.floor(posY)
+		local deltaX = if rayX == 0 then 1e30 else math.abs(1 / rayX)
+		local deltaY = if rayY == 0 then 1e30 else math.abs(1 / rayY)
+		local stepX, sideX, stepY, sideY
+		if rayX < 0 then
+			stepX, sideX = -1, (posX - mapX) * deltaX
+		else
+			stepX, sideX = 1, (mapX + 1 - posX) * deltaX
+		end
+		if rayY < 0 then
+			stepY, sideY = -1, (posY - mapY) * deltaY
+		else
+			stepY, sideY = 1, (mapY + 1 - posY) * deltaY
+		end
+
+		local side, id, steps = 0, 0, 0
+		repeat
+			if sideX < sideY then
+				sideX += deltaX
+				mapX += stepX
+				side = 0
+			else
+				sideY += deltaY
+				mapY += stepY
+				side = 1
+			end
+			id = Raycaster.wallAt(self, mapX, mapY)
+			steps += 1
+		until id ~= 0 or steps > self._maxSteps
+
+		local dist = math.max(if side == 0 then sideX - deltaX else sideY - deltaY, 0.0001)
+		depth[x] = dist
+
+		local lineH = H / dist
+		local top = halfH - lineH / 2
+		local drawStart = math.max(0, math.floor(top))
+		local drawEnd = math.min(H - 1, math.floor(halfH + lineH / 2))
+
+		local wallX = if side == 0 then posY + dist * rayY else posX + dist * rayX
+		wallX -= math.floor(wallX)
+		if (side == 0 and rayX > 0) or (side == 1 and rayY < 0) then
+			wallX = 1 - wallX -- keep texture orientation consistent on opposite faces
+		end
+		local tex = self._tex[id] or self.DefaultTexture
+
+		-- ceiling above the wall, then the wall slice, then floor below
+		for y = 0, drawStart - 1 do
+			canvas:SetPixel(x, y, vert[y])
+		end
+		for y = drawStart, drawEnd do
+			local v = (y - top) / lineH
+			local c = tex(wallX, v) or self.DefaultTexture(wallX, v) or self.Floor
+			canvas:SetPixel(x, y, shade(self, c, dist, side))
+		end
+		for y = drawEnd + 1, H - 1 do
+			canvas:SetPixel(x, y, vert[y])
+		end
+	end
+
+	-- billboard sprites: depth-sorted, projected, depth-tested per column
+	local sprites = self._sprites
+	if #sprites > 0 then
+		table.sort(sprites, function(a, b)
+			local da = (a.X - posX) ^ 2 + (a.Y - posY) ^ 2
+			local db = (b.X - posX) ^ 2 + (b.Y - posY) ^ 2
+			return da > db -- far first
+		end)
+		local invDet = 1 / (planeX * dirY - dirX * planeY)
+		for _, sprite in sprites do
+			local relX, relY = sprite.X - posX, sprite.Y - posY
+			local tX = invDet * (dirY * relX - dirX * relY)
+			local tY = invDet * (-planeY * relX + planeX * relY) -- depth
+			if tY > 0.1 then
+				local screenX = math.floor((W / 2) * (1 + tX / tY))
+				local size = math.abs(math.floor(H / tY))
+				local startX = math.max(0, math.floor(screenX - size / 2))
+				local endX = math.min(W - 1, math.floor(screenX + size / 2))
+				local startY = math.max(0, math.floor(halfH - size / 2))
+				local endY = math.min(H - 1, math.floor(halfH + size / 2))
+				for stripe = startX, endX do
+					if tY < (depth[stripe] or 1e9) then -- in front of the wall here
+						local u = (stripe - (screenX - size / 2)) / size
+						for y = startY, endY do
+							local v = (y - (halfH - size / 2)) / size
+							local c = sprite.Texture(u, v)
+							if c then
+								canvas:SetPixel(stripe, y, shade(self, c, tY, 0))
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	canvas:Render()
+end
+
+--[=[
+	@within Raycaster
+	Starts a built-in loop: WASD to move + strafe, arrow/Q-E to turn, rendering every frame.
+	Client-side. Returns nothing; call [Raycaster:Stop] to end.
+]=]
+function Raycaster.Start(self: Raycaster)
+	if self._conn then
+		return
+	end
+	self._conn = RunService.RenderStepped:Connect(function(dt)
+		local fwd = (if UserInputService:IsKeyDown(Enum.KeyCode.W) then 1 else 0)
+			- (if UserInputService:IsKeyDown(Enum.KeyCode.S) then 1 else 0)
+		local strafe = (if UserInputService:IsKeyDown(Enum.KeyCode.D) then 1 else 0)
+			- (if UserInputService:IsKeyDown(Enum.KeyCode.A) then 1 else 0)
+		local turn = (if UserInputService:IsKeyDown(Enum.KeyCode.Right) or UserInputService:IsKeyDown(Enum.KeyCode.E) then 1 else 0)
+			- (if UserInputService:IsKeyDown(Enum.KeyCode.Left) or UserInputService:IsKeyDown(Enum.KeyCode.Q) then 1 else 0)
+		if fwd ~= 0 or strafe ~= 0 then
+			Raycaster.Move(self, fwd, strafe, dt)
+		end
+		if turn ~= 0 then
+			Raycaster.Turn(self, turn * self.TurnSpeed * dt)
+		end
+		Raycaster.Render(self)
+	end)
+end
+
+--[=[
+	@within Raycaster
+	Stops the built-in loop.
+]=]
+function Raycaster.Stop(self: Raycaster)
+	if self._conn then
+		self._conn:Disconnect()
+		self._conn = nil
+	end
+end
+
+return Raycaster
+]])
+local _9 = folder("_Core", _1)
+mod("Config", _9, [[
 -- IMGN
 -- _Core/Config.luau
 -- Plinko Labs
@@ -3489,7 +3843,7 @@ return {
 	configure = configure,
 }
 ]])
-mod("PixelBuffer", _8, [[
+mod("PixelBuffer", _9, [[
 -- IMGN
 -- _Core/PixelBuffer.luau
 -- Plinko Labs
@@ -3597,7 +3951,7 @@ end
 
 return PixelBuffer
 ]])
-local _9 = mod("_Drivers", _1, [[
+local _10 = mod("_Drivers", _1, [[
 -- IMGN
 -- _Drivers/init.luau
 -- Plinko Labs
@@ -3660,7 +4014,7 @@ end
 
 return Drivers
 ]])
-mod("Blob", _9, [[
+mod("Blob", _10, [[
 -- IMGN
 -- _Drivers/Blob.luau
 -- Plinko Labs
@@ -3812,7 +4166,7 @@ end
 
 return Blob
 ]])
-mod("GreedyMesh", _9, [[
+mod("GreedyMesh", _10, [[
 -- IMGN
 -- _Drivers/GreedyMesh.luau
 -- Plinko Labs
@@ -3997,7 +4351,7 @@ end
 
 return GreedyMesh
 ]])
-mod("PixelGrid", _9, [[
+mod("PixelGrid", _10, [[
 -- IMGN
 -- _Drivers/PixelGrid.luau
 -- Plinko Labs
@@ -4192,7 +4546,7 @@ end
 
 return PixelGrid
 ]])
-mod("RichText", _9, [[
+mod("RichText", _10, [[
 -- IMGN
 -- _Drivers/RichText.luau
 -- Plinko Labs
@@ -4359,7 +4713,7 @@ end
 
 return RichText
 ]])
-mod("RowMerge", _9, [[
+mod("RowMerge", _10, [[
 -- IMGN
 -- _Drivers/RowMerge.luau
 -- Plinko Labs
@@ -4543,7 +4897,7 @@ end
 
 return RowMerge
 ]])
-mod("Sparse", _9, [[
+mod("Sparse", _10, [[
 -- IMGN
 -- _Drivers/Sparse.luau
 -- Plinko Labs
@@ -4694,8 +5048,8 @@ end
 
 return Sparse
 ]])
-local _10 = folder("_Packages", _1)
-local _11 = mod("Image", _10, [[
+local _11 = folder("_Packages", _1)
+local _12 = mod("Image", _11, [[
 local Reader = script.ImageReader.Reader
 
 local ImageReader = require(script.ImageReader)
@@ -4715,7 +5069,7 @@ return {
     ImageFormat = require(script.ImageFormat),
     ImageError = require(script.ImageError)
 }]])
-mod("Cursor", _11, [[
+mod("Cursor", _12, [[
 local ImageError = require(script.Parent.ImageError)
 
 type ImageError = ImageError.ImageError
@@ -4918,7 +5272,7 @@ return {
 	new = new
 }
 ]])
-mod("DataReader", _11, [[
+mod("DataReader", _12, [[
 local ImageReader = script.Parent.ImageReader
 local ImageReaderTypes = require(ImageReader.types)
 
@@ -4933,7 +5287,7 @@ function DataReader.convertToBuffer(dataStream: ImageReaderTypes.ReadableData): 
 end
 
 return DataReader]])
-local _12 = mod("DynamicImage", _11, [[
+local _13 = mod("DynamicImage", _12, [[
 local Reader = require(script.Parent.ImageReader.Reader)
 local ImageFormat = require(script.Parent.ImageFormat)
 local ImageError = require(script.Parent.ImageError)
@@ -4986,7 +5340,7 @@ return {
 	end,
 }
 ]])
-mod("types", _12, [[
+mod("types", _13, [[
 local ImageFormat = require(script.Parent.Parent.ImageFormat)
 
 export type DynamicImage<T> = {
@@ -5002,7 +5356,7 @@ export type DynamicImage<T> = {
 }
 
 return nil]])
-mod("ImageError", _11, [[
+mod("ImageError", _12, [[
 local Result = require(script.Parent.Result)
 local SafeEnum = require(script.Parent.SafeEnum)
 
@@ -5017,7 +5371,7 @@ local ImageError = {
 }
 
 return ImageError]])
-mod("ImageFormat", _11, [[
+mod("ImageFormat", _12, [[
 local SafeEnum = require(script.Parent.SafeEnum)
 
 type Extensions = "BMP"
@@ -5053,7 +5407,7 @@ end
 
 return ImageFormat :: typeof(ImageFormat)
 ]])
-local _13 = mod("ImageReader", _11, [[
+local _14 = mod("ImageReader", _12, [[
 local types = require(script.types)
 local structs = require(script.structs)
 
@@ -5139,7 +5493,7 @@ return {
 	end,
 }
 ]])
-local _14 = mod("Reader", _13, [[
+local _15 = mod("Reader", _14, [[
 --!strict
 
 local ImageReader = script.Parent
@@ -5184,7 +5538,7 @@ return {
         return CODECS
     end
 }]])
-mod("Bmp", _14, [[
+mod("Bmp", _15, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5616,7 +5970,7 @@ end
 
 return Bmp
 ]])
-local _15 = mod("Jpeg", _14, [[
+local _16 = mod("Jpeg", _15, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -5786,7 +6140,7 @@ end
 
 return Jpg
 ]])
-local _16 = mod("Decoder", _15, [[
+local _17 = mod("Decoder", _16, [[
 local JPEG = {}
 
 local HUFFMAN_MODULE = require(script.HuffmanTable)
@@ -6932,7 +7286,7 @@ end
 
 return JPEG
 ]])
-mod("BitStream", _16, [[
+mod("BitStream", _17, [[
 local module = {}
 
 function module.CreateBitStream(data)
@@ -6994,7 +7348,7 @@ function module.CreateBitStream(data)
 end
 
 return module]])
-mod("HuffmanTable", _16, [[
+mod("HuffmanTable", _17, [[
 local module = {}
 
 local function BitsFromLength(root, element, pos)
@@ -7073,7 +7427,7 @@ function module.GetCode(huffmanTable, bitStream)
 end
 
 return module]])
-mod("types", _15, [[
+mod("types", _16, [[
 local Jpg = script.Parent
 local Reader = Jpg.Parent
 local ImageReader = Reader.Parent
@@ -7094,7 +7448,7 @@ export type JpgHeader = {
 }
 
 return nil]])
-local _17 = mod("Png", _14, [[
+local _18 = mod("Png", _15, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7360,7 +7714,7 @@ end
 
 return Png
 ]])
-mod("BppConvert", _17, [[
+mod("BppConvert", _18, [[
 local Preprocess = require(script.Parent.Preprocess)
 local fourBit = Preprocess[0.5]
 local twoBit = Preprocess[0.25]
@@ -7468,8 +7822,8 @@ end
 
 return Convert
 ]])
-local _18 = folder("Chunks", _17)
-mod("IDAT", _18, [[
+local _19 = folder("Chunks", _18)
+mod("IDAT", _19, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7487,7 +7841,7 @@ return function(cursor: Cursor, file, chunk)
     return
 end
 ]])
-mod("IEND", _18, [[
+mod("IEND", _19, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7499,7 +7853,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("PLTE", _18, [[
+mod("PLTE", _19, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7511,7 +7865,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("gAMA", _18, [[
+mod("gAMA", _19, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Chunks = script.Parent
@@ -7525,7 +7879,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("sRGB", _18, [[
+mod("sRGB", _19, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7537,7 +7891,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("tEXt", _18, [[
+mod("tEXt", _19, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7556,7 +7910,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("tRNS", _18, [[
+mod("tRNS", _19, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7591,7 +7945,7 @@ return function(cursor: Cursor, file, data)
 	}
 end
 ]])
-mod("Deflate", _17, [=[
+mod("Deflate", _18, [=[
 --[[
 
 LUA MODULE
@@ -8068,7 +8422,7 @@ function Deflate:InflateZlib(io)
 end
 
 return Deflate]=])
-mod("IDHR", _17, [[
+mod("IDHR", _18, [[
 local Reader = script.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -8102,7 +8456,7 @@ return function(PNG, cursor: Cursor)
     }
 end
 ]])
-mod("Interlacing", _17, [[
+mod("Interlacing", _18, [[
 local Interlacing = {}
 
 local X_STEP = { 8, 8, 4, 4, 2, 2, 1 }
@@ -8270,7 +8624,7 @@ end
 
 return Interlacing
 ]])
-mod("Preprocess", _17, [[
+mod("Preprocess", _18, [[
 local util = require(script.Parent.Parent.util)
 
 local createRGBAColor = util.createRGBAColor
@@ -8331,7 +8685,7 @@ return {
 	end,
 }
 ]])
-mod("Unfilter", _17, [[
+mod("Unfilter", _18, [[
 local Unfilter = {}
 
 -- 0
@@ -8525,9 +8879,9 @@ end
 
 return Unfilter
 ]])
-mod("util", _17, [[
+mod("util", _18, [[
 return require(script.Parent.Parent.util)]])
-mod("Tga", _14, [[
+mod("Tga", _15, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -8744,7 +9098,7 @@ end
 
 return Tga
 ]])
-mod("util", _14, [[
+mod("util", _15, [[
 local util = {}
 
 function util.createRGBAColor(r: number, g: number, b: number, a: number?): number
@@ -8773,7 +9127,7 @@ function util.beToLe16(beValue: number)
 end
 
 return util]])
-mod("structs", _13, [[
+mod("structs", _14, [[
 export type Dimensions = { width: number, height: number }
 
 export type function getAppropriateDecoder(ty: type, tys: type)
@@ -8781,7 +9135,7 @@ export type function getAppropriateDecoder(ty: type, tys: type)
 end
 
 return nil]])
-mod("types", _13, [[
+mod("types", _14, [[
 local ImageFormat = require(script.Parent.Parent.ImageFormat)
 local ImageError = require(script.Parent.Parent.ImageError)
 local Cursor = require(script.Parent.Parent.Cursor)
@@ -8819,7 +9173,7 @@ export type ImageReader<T> = {
 }
 
 return nil]])
-mod("Result", _11, [[
+mod("Result", _12, [[
 export type Result<T, E> = {
     isOk: boolean,
     value: {T | E},
@@ -8898,7 +9252,7 @@ function Result.castSmallToDefault<T, E>(result: SmallResult<T, E>): Result<T, E
 end
 
 return Result]])
-mod("SafeEnum", _11, [[
+mod("SafeEnum", _12, [[
 local counter = -1
 
 return function<T>(): T
@@ -8906,8 +9260,8 @@ return function<T>(): T
 	return counter
 end
 ]])
-local _19 = folder("_Patterns", _1)
-mod("Dither", _19, [[
+local _20 = folder("_Patterns", _1)
+mod("Dither", _20, [[
 -- IMGN
 -- _Patterns/Dither.luau
 -- Plinko Labs
@@ -9013,7 +9367,7 @@ end
 
 return Dither
 ]])
-mod("Draw", _19, [[
+mod("Draw", _20, [[
 -- IMGN
 -- _Patterns/Draw.luau
 -- Plinko Labs
@@ -9147,7 +9501,7 @@ end
 
 return Draw
 ]])
-mod("Font", _19, [[
+mod("Font", _20, [[
 -- IMGN
 -- _Patterns/Font.luau
 -- Plinko Labs
@@ -9270,7 +9624,7 @@ end
 
 return Font
 ]])
-mod("Image", _19, [[
+mod("Image", _20, [[
 -- IMGN
 -- _Patterns/Image.luau
 -- Plinko Labs
@@ -9499,6 +9853,88 @@ end
 
 return Image
 ]])
+mod("Texture", _20, [[
+-- IMGN
+-- _Patterns/Texture.luau
+-- Plinko Labs
+--
+-- Textures for the software 3D engine. A texture is just a function `(u, v) -> Color3?` sampling a
+-- colour at 0..1 coordinates (return `nil` for a transparent texel - used by sprites). These
+-- generators build common ones procedurally; `fromCanvas` turns any IMGN canvas (e.g. a loaded
+-- image) into a texture, so you can wallpaper a raycast level with real images.
 
-print("[IMGN] installed 60 modules under ReplicatedStorage.IMGN")
+--[=[
+	@class Texture
+	Procedural texture generators for [Raycaster]. Each returns a `(u, v) -> Color3?` sampler.
+]=]
+local Texture = {}
+
+export type Sampler = (u: number, v: number) -> Color3?
+
+--[=[
+	@within Texture
+	A flat colour.
+]=]
+function Texture.solid(color: Color3): Sampler
+	return function()
+		return color
+	end
+end
+
+--[=[
+	@within Texture
+	A checkerboard of `a`/`b` with `n` squares across.
+]=]
+function Texture.checker(a: Color3, b: Color3, n: number?): Sampler
+	local cells = n or 8
+	return function(u, v)
+		local cx = math.floor(u * cells) % 2
+		local cy = math.floor(v * cells) % 2
+		return if cx == cy then a else b
+	end
+end
+
+--[=[
+	@within Texture
+	A brick wall: `brick` blocks separated by `mortar`, `rows` tall, `cols` across, alternate rows
+	offset by half a brick.
+]=]
+function Texture.brick(brick: Color3, mortar: Color3, rows: number?, cols: number?): Sampler
+	local r = rows or 4
+	local c = cols or 2
+	local m = 0.09 -- mortar thickness (0..1 of a brick)
+	return function(u, v)
+		local row = math.floor(v * r)
+		local uu = (u + (row % 2) * 0.5) % 1
+		local fx = (uu * c) % 1
+		local fy = (v * r) % 1
+		if fx < m or fy < m then
+			return mortar
+		end
+		return brick
+	end
+end
+
+--[=[
+	@within Texture
+	Samples an IMGN canvas as a texture - so a loaded image becomes a wall/sprite texture. Texels
+	the canvas leaves transparent come back as `nil` (transparent).
+]=]
+function Texture.fromCanvas(canvas: any): Sampler
+	local w, h = canvas.Width, canvas.Height
+	return function(u, v)
+		local x = math.clamp(math.floor(u * w), 0, w - 1)
+		local y = math.clamp(math.floor(v * h), 0, h - 1)
+		local color, alpha = canvas:GetPixel(x, y)
+		if alpha <= 0.004 then
+			return nil
+		end
+		return color
+	end
+end
+
+return Texture
+]])
+
+print("[IMGN] installed 62 modules under ReplicatedStorage.IMGN")
 return true
