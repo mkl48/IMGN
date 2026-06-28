@@ -20,6 +20,8 @@ local LiquidClass = require(script._Classes.Liquid)
 local BloodModule = require(script._Classes.Blood)
 local ParticlesClass = require(script._Classes.Particles)
 local RaycasterClass = require(script._Classes.Raycaster)
+local RaymarcherClass = require(script._Classes.Raymarcher)
+local SDFHelper = require(script._Patterns.SDF)
 local ImageHelper = require(script._Patterns.Image)
 local DitherHelper = require(script._Patterns.Dither)
 local TextureHelper = require(script._Patterns.Texture)
@@ -43,6 +45,8 @@ export type Particles = ParticlesClass.Particles
 export type ParticlesConfig = ParticlesClass.ParticlesConfig
 export type Raycaster = RaycasterClass.Raycaster
 export type RaycasterConfig = RaycasterClass.RaycasterConfig
+export type Raymarcher = RaymarcherClass.Raymarcher
+export type RaymarcherConfig = RaymarcherClass.RaymarcherConfig
 export type Config = ConfigModule.Config
 
 --[=[
@@ -127,6 +131,23 @@ end
 	textures, and `IMGN.Texture.fromCanvas(canvas)` turns a loaded image into a wall/sprite texture.
 ]=]
 IMGN.Texture = TextureHelper
+
+--[=[
+	@within IMGN
+	Creates a [Raymarcher] - a software signed-distance-field 3D renderer (soft shadows, AO,
+	lighting) on a canvas. Give it a `Scene(p) -> distance` built from [IMGN.SDF] and a `Material`.
+	Heavy; use a small canvas.
+]=]
+function IMGN.Raymarcher(config: RaymarcherConfig): Raymarcher
+	return RaymarcherClass.new(config)
+end
+
+--[=[
+	@within IMGN
+	Signed-distance primitives + operators for [Raymarcher] scenes:
+	`IMGN.SDF.sphere/box/plane/torus/round/union/subtract/intersect/smoothUnion(...)`.
+]=]
+IMGN.SDF = SDFHelper
 
 --[=[
 	@within IMGN

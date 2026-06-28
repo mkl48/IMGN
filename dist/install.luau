@@ -62,6 +62,8 @@ local LiquidClass = require(script._Classes.Liquid)
 local BloodModule = require(script._Classes.Blood)
 local ParticlesClass = require(script._Classes.Particles)
 local RaycasterClass = require(script._Classes.Raycaster)
+local RaymarcherClass = require(script._Classes.Raymarcher)
+local SDFHelper = require(script._Patterns.SDF)
 local ImageHelper = require(script._Patterns.Image)
 local DitherHelper = require(script._Patterns.Dither)
 local TextureHelper = require(script._Patterns.Texture)
@@ -85,6 +87,8 @@ export type Particles = ParticlesClass.Particles
 export type ParticlesConfig = ParticlesClass.ParticlesConfig
 export type Raycaster = RaycasterClass.Raycaster
 export type RaycasterConfig = RaycasterClass.RaycasterConfig
+export type Raymarcher = RaymarcherClass.Raymarcher
+export type RaymarcherConfig = RaymarcherClass.RaymarcherConfig
 export type Config = ConfigModule.Config
 
 --[=[
@@ -169,6 +173,23 @@ end
 	textures, and `IMGN.Texture.fromCanvas(canvas)` turns a loaded image into a wall/sprite texture.
 ]=]
 IMGN.Texture = TextureHelper
+
+--[=[
+	@within IMGN
+	Creates a [Raymarcher] - a software signed-distance-field 3D renderer (soft shadows, AO,
+	lighting) on a canvas. Give it a `Scene(p) -> distance` built from [IMGN.SDF] and a `Material`.
+	Heavy; use a small canvas.
+]=]
+function IMGN.Raymarcher(config: RaymarcherConfig): Raymarcher
+	return RaymarcherClass.new(config)
+end
+
+--[=[
+	@within IMGN
+	Signed-distance primitives + operators for [Raymarcher] scenes:
+	`IMGN.SDF.sphere/box/plane/torus/round/union/subtract/intersect/smoothUnion(...)`.
+]=]
+IMGN.SDF = SDFHelper
 
 --[=[
 	@within IMGN
@@ -3974,8 +3995,259 @@ end
 
 return Raycaster
 ]])
-local _9 = folder("_Core", _1)
-mod("Config", _9, [[
+local _9 = mod("Raymarcher", _2, [[
+-- IMGN
+-- _Classes/Raymarcher/init.luau
+-- Plinko Labs
+--
+-- A software raymarcher (signed-distance-field renderer) on a Canvas. For every pixel it shoots a
+-- ray from the camera and SPHERE-TRACES the scene's SDF until it hits a surface, then shades the
+-- hit with diffuse lighting, SOFT SHADOWS (marching toward the light), AMBIENT OCCLUSION, a
+-- specular highlight and distance fog. The result is smooth, lit, shadowed 3D - the Shadertoy look
+-- - rendered into GUI frames, no meshes. It's heavy (per-pixel marching), so keep the canvas small.
+
+local RunService = game:GetService("RunService")
+
+local Canvas = require(script.Parent.Canvas)
+
+--[=[
+	@class Raymarcher
+	A signed-distance-field 3D renderer drawing on a [Canvas]. Give it a `Scene(p) -> distance` (built
+	from [SDF] primitives) and a `Material`, point the camera, and `:Render()` (or `:Start()` for an
+	orbiting loop).
+]=]
+local Raymarcher = {}
+Raymarcher.__index = Raymarcher
+
+local UP = Vector3.new(0, 1, 0)
+
+export type RaymarcherConfig = {
+	Canvas: Canvas.Canvas?,
+	Resolution: Vector2?,
+	Parent: Instance?,
+	Driver: any?,
+	Scene: (p: Vector3) -> number, -- distance to the nearest surface
+	Material: ((p: Vector3, normal: Vector3) -> Color3)?, -- surface colour (default gray)
+	Light: Vector3?, -- direction TO the light (default high + to the side)
+	Sky: Color3?, -- background / fog colour
+	FOV: number?, -- degrees (default 60)
+	MaxSteps: number?,
+	MaxDist: number?,
+	Epsilon: number?,
+	FogDist: number?,
+	Shadows: boolean?,
+	AO: boolean?,
+	OnUpdate: ((self: any, t: number) -> ())?, -- per-frame hook (animate the scene/camera)
+}
+
+export type Raymarcher = typeof(setmetatable({} :: any, Raymarcher))
+
+local function pick<T>(v: T?, d: T): T
+	if v == nil then
+		return d
+	end
+	return v
+end
+
+function Raymarcher.new(config: RaymarcherConfig): Raymarcher
+	local canvas = config.Canvas
+	if not canvas then
+		assert(config.Resolution, "IMGN.Raymarcher: pass a Canvas or a Resolution")
+		canvas = Canvas.new({ Resolution = config.Resolution, Parent = config.Parent, Driver = config.Driver })
+	end
+
+	local self = setmetatable({
+		Canvas = canvas,
+		Scene = config.Scene,
+		Material = config.Material or function()
+			return Color3.fromRGB(200, 200, 205)
+		end,
+		LightDir = (config.Light or Vector3.new(0.6, 0.8, -0.3)).Unit,
+		Sky = config.Sky or Color3.fromRGB(150, 175, 215),
+		FOV = config.FOV or 60,
+		MaxSteps = config.MaxSteps or 72,
+		MaxDist = config.MaxDist or 24,
+		Epsilon = config.Epsilon or 0.002,
+		FogDist = config.FogDist or 22,
+		Shadows = pick(config.Shadows, true),
+		AO = pick(config.AO, true),
+		OnUpdate = config.OnUpdate,
+		_conn = nil,
+		_t = 0,
+		CamPos = Vector3.new(0, 2, -5),
+		Forward = Vector3.new(0, 0, 1),
+		Right = Vector3.new(1, 0, 0),
+		CamUp = UP,
+	}, Raymarcher)
+
+	Raymarcher.SetCamera(self, self.CamPos, Vector3.new(0, 0, 0))
+	return self
+end
+
+--[=[
+	@within Raymarcher
+	Places the camera at `pos` looking at `lookAt`.
+]=]
+function Raymarcher.SetCamera(self: Raymarcher, pos: Vector3, lookAt: Vector3)
+	self.CamPos = pos
+	self.Forward = (lookAt - pos).Unit
+	self.Right = self.Forward:Cross(UP).Unit
+	self.CamUp = self.Right:Cross(self.Forward)
+end
+
+--[=[
+	@within Raymarcher
+	Sphere-traces a ray. Returns `hit, distance, point`.
+]=]
+function Raymarcher.March(self: Raymarcher, origin: Vector3, dir: Vector3): (boolean, number, Vector3)
+	local scene = self.Scene
+	local eps, maxDist, maxSteps = self.Epsilon, self.MaxDist, self.MaxSteps
+	local t = 0
+	for _ = 1, maxSteps do
+		local p = origin + dir * t
+		local d = scene(p)
+		if d < eps then
+			return true, t, p
+		end
+		t += d
+		if t > maxDist then
+			break
+		end
+	end
+	return false, t, origin + dir * t
+end
+
+--[=[
+	@within Raymarcher
+	The surface normal at `p` (gradient of the SDF by central differences).
+]=]
+function Raymarcher.Normal(self: Raymarcher, p: Vector3): Vector3
+	local scene = self.Scene
+	local e = 0.0015
+	return Vector3.new(
+		scene(p + Vector3.new(e, 0, 0)) - scene(p - Vector3.new(e, 0, 0)),
+		scene(p + Vector3.new(0, e, 0)) - scene(p - Vector3.new(0, e, 0)),
+		scene(p + Vector3.new(0, 0, e)) - scene(p - Vector3.new(0, 0, e))
+	).Unit
+end
+
+-- penumbra soft shadow: march toward the light, narrowing the closer the ray passes a surface
+local function softShadow(self: Raymarcher, origin: Vector3, dir: Vector3): number
+	local scene = self.Scene
+	local res, t = 1, 0.05
+	for _ = 1, 28 do
+		local d = scene(origin + dir * t)
+		if d < 0.001 then
+			return 0
+		end
+		res = math.min(res, 14 * d / t)
+		t += d
+		if t > 10 then
+			break
+		end
+	end
+	return math.clamp(res, 0, 1)
+end
+
+local function ambientOcclusion(self: Raymarcher, p: Vector3, n: Vector3): number
+	local scene = self.Scene
+	local occ, sca = 0, 1
+	for i = 1, 5 do
+		local h = 0.01 + 0.12 * i / 5
+		occ += (h - scene(p + n * h)) * sca
+		sca *= 0.85
+	end
+	return math.clamp(1 - 1.5 * occ, 0, 1)
+end
+
+local function clamp01(v: number): number
+	return if v < 0 then 0 elseif v > 1 then 1 else v
+end
+
+--[=[
+	@within Raymarcher
+	Renders the scene to the canvas and flushes it.
+]=]
+function Raymarcher.Render(self: Raymarcher)
+	local canvas = self.Canvas
+	local W, H = canvas.Width, canvas.Height
+	local origin = self.CamPos
+	local fwd, right, up = self.Forward, self.Right, self.CamUp
+	local fovScale = math.tan(math.rad(self.FOV) / 2)
+	local aspect = W / H
+	local lightDir = self.LightDir
+	local sky, fogDist = self.Sky, self.FogDist
+
+	for y = 0, H - 1 do
+		local py = (1 - 2 * (y + 0.5) / H) * fovScale
+		for x = 0, W - 1 do
+			local px = (2 * (x + 0.5) / W - 1) * fovScale * aspect
+			local dir = (fwd + right * px + up * py).Unit
+
+			local hit, t, p = Raymarcher.March(self, origin, dir)
+			local color
+			if hit then
+				local n = Raymarcher.Normal(self, p)
+				local diff = math.max(0, n:Dot(lightDir))
+				local sh = if self.Shadows and diff > 0 then softShadow(self, p + n * 0.02, lightDir) else 1
+				local ao = if self.AO then ambientOcclusion(self, p, n) else 1
+				local base = self.Material(p, n)
+				local light = 0.22 * ao + diff * sh * 0.85
+				-- specular (Blinn-Phong)
+				local half = (lightDir - dir).Unit
+				local spec = math.pow(math.max(0, n:Dot(half)), 24) * sh * 0.5
+				color = Color3.new(
+					clamp01(base.R * light + spec),
+					clamp01(base.G * light + spec),
+					clamp01(base.B * light + spec)
+				)
+				-- distance fog
+				local f = clamp01(t / fogDist)
+				color = color:Lerp(sky, f * f)
+			else
+				-- sky gradient by ray height
+				color = sky:Lerp(Color3.new(1, 1, 1), clamp01(dir.Y) * 0.4)
+			end
+			canvas:SetPixel(x, y, color)
+		end
+	end
+
+	canvas:Render()
+end
+
+--[=[
+	@within Raymarcher
+	Starts a render loop, calling `OnUpdate(self, t)` each frame first (animate the scene/camera).
+	Heavy - low resolution recommended.
+]=]
+function Raymarcher.Start(self: Raymarcher)
+	if self._conn then
+		return
+	end
+	self._conn = RunService.Heartbeat:Connect(function(dt)
+		self._t += dt
+		if self.OnUpdate then
+			self.OnUpdate(self, self._t)
+		end
+		Raymarcher.Render(self)
+	end)
+end
+
+--[=[
+	@within Raymarcher
+	Stops the render loop.
+]=]
+function Raymarcher.Stop(self: Raymarcher)
+	if self._conn then
+		self._conn:Disconnect()
+		self._conn = nil
+	end
+end
+
+return Raymarcher
+]])
+local _10 = folder("_Core", _1)
+mod("Config", _10, [[
 -- IMGN
 -- _Core/Config.luau
 -- Plinko Labs
@@ -4066,7 +4338,7 @@ return {
 	configure = configure,
 }
 ]])
-mod("PixelBuffer", _9, [[
+mod("PixelBuffer", _10, [[
 -- IMGN
 -- _Core/PixelBuffer.luau
 -- Plinko Labs
@@ -4174,7 +4446,7 @@ end
 
 return PixelBuffer
 ]])
-local _10 = mod("_Drivers", _1, [[
+local _11 = mod("_Drivers", _1, [[
 -- IMGN
 -- _Drivers/init.luau
 -- Plinko Labs
@@ -4237,7 +4509,7 @@ end
 
 return Drivers
 ]])
-mod("Blob", _10, [[
+mod("Blob", _11, [[
 -- IMGN
 -- _Drivers/Blob.luau
 -- Plinko Labs
@@ -4389,7 +4661,7 @@ end
 
 return Blob
 ]])
-mod("GreedyMesh", _10, [[
+mod("GreedyMesh", _11, [[
 -- IMGN
 -- _Drivers/GreedyMesh.luau
 -- Plinko Labs
@@ -4574,7 +4846,7 @@ end
 
 return GreedyMesh
 ]])
-mod("PixelGrid", _10, [[
+mod("PixelGrid", _11, [[
 -- IMGN
 -- _Drivers/PixelGrid.luau
 -- Plinko Labs
@@ -4769,7 +5041,7 @@ end
 
 return PixelGrid
 ]])
-mod("RichText", _10, [[
+mod("RichText", _11, [[
 -- IMGN
 -- _Drivers/RichText.luau
 -- Plinko Labs
@@ -4936,7 +5208,7 @@ end
 
 return RichText
 ]])
-mod("RowMerge", _10, [[
+mod("RowMerge", _11, [[
 -- IMGN
 -- _Drivers/RowMerge.luau
 -- Plinko Labs
@@ -5120,7 +5392,7 @@ end
 
 return RowMerge
 ]])
-mod("Sparse", _10, [[
+mod("Sparse", _11, [[
 -- IMGN
 -- _Drivers/Sparse.luau
 -- Plinko Labs
@@ -5271,8 +5543,8 @@ end
 
 return Sparse
 ]])
-local _11 = folder("_Packages", _1)
-local _12 = mod("Image", _11, [[
+local _12 = folder("_Packages", _1)
+local _13 = mod("Image", _12, [[
 local Reader = script.ImageReader.Reader
 
 local ImageReader = require(script.ImageReader)
@@ -5292,7 +5564,7 @@ return {
     ImageFormat = require(script.ImageFormat),
     ImageError = require(script.ImageError)
 }]])
-mod("Cursor", _12, [[
+mod("Cursor", _13, [[
 local ImageError = require(script.Parent.ImageError)
 
 type ImageError = ImageError.ImageError
@@ -5495,7 +5767,7 @@ return {
 	new = new
 }
 ]])
-mod("DataReader", _12, [[
+mod("DataReader", _13, [[
 local ImageReader = script.Parent.ImageReader
 local ImageReaderTypes = require(ImageReader.types)
 
@@ -5510,7 +5782,7 @@ function DataReader.convertToBuffer(dataStream: ImageReaderTypes.ReadableData): 
 end
 
 return DataReader]])
-local _13 = mod("DynamicImage", _12, [[
+local _14 = mod("DynamicImage", _13, [[
 local Reader = require(script.Parent.ImageReader.Reader)
 local ImageFormat = require(script.Parent.ImageFormat)
 local ImageError = require(script.Parent.ImageError)
@@ -5563,7 +5835,7 @@ return {
 	end,
 }
 ]])
-mod("types", _13, [[
+mod("types", _14, [[
 local ImageFormat = require(script.Parent.Parent.ImageFormat)
 
 export type DynamicImage<T> = {
@@ -5579,7 +5851,7 @@ export type DynamicImage<T> = {
 }
 
 return nil]])
-mod("ImageError", _12, [[
+mod("ImageError", _13, [[
 local Result = require(script.Parent.Result)
 local SafeEnum = require(script.Parent.SafeEnum)
 
@@ -5594,7 +5866,7 @@ local ImageError = {
 }
 
 return ImageError]])
-mod("ImageFormat", _12, [[
+mod("ImageFormat", _13, [[
 local SafeEnum = require(script.Parent.SafeEnum)
 
 type Extensions = "BMP"
@@ -5630,7 +5902,7 @@ end
 
 return ImageFormat :: typeof(ImageFormat)
 ]])
-local _14 = mod("ImageReader", _12, [[
+local _15 = mod("ImageReader", _13, [[
 local types = require(script.types)
 local structs = require(script.structs)
 
@@ -5716,7 +5988,7 @@ return {
 	end,
 }
 ]])
-local _15 = mod("Reader", _14, [[
+local _16 = mod("Reader", _15, [[
 --!strict
 
 local ImageReader = script.Parent
@@ -5761,7 +6033,7 @@ return {
         return CODECS
     end
 }]])
-mod("Bmp", _15, [[
+mod("Bmp", _16, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -6193,7 +6465,7 @@ end
 
 return Bmp
 ]])
-local _16 = mod("Jpeg", _15, [[
+local _17 = mod("Jpeg", _16, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -6363,7 +6635,7 @@ end
 
 return Jpg
 ]])
-local _17 = mod("Decoder", _16, [[
+local _18 = mod("Decoder", _17, [[
 local JPEG = {}
 
 local HUFFMAN_MODULE = require(script.HuffmanTable)
@@ -7509,7 +7781,7 @@ end
 
 return JPEG
 ]])
-mod("BitStream", _17, [[
+mod("BitStream", _18, [[
 local module = {}
 
 function module.CreateBitStream(data)
@@ -7571,7 +7843,7 @@ function module.CreateBitStream(data)
 end
 
 return module]])
-mod("HuffmanTable", _17, [[
+mod("HuffmanTable", _18, [[
 local module = {}
 
 local function BitsFromLength(root, element, pos)
@@ -7650,7 +7922,7 @@ function module.GetCode(huffmanTable, bitStream)
 end
 
 return module]])
-mod("types", _16, [[
+mod("types", _17, [[
 local Jpg = script.Parent
 local Reader = Jpg.Parent
 local ImageReader = Reader.Parent
@@ -7671,7 +7943,7 @@ export type JpgHeader = {
 }
 
 return nil]])
-local _18 = mod("Png", _15, [[
+local _19 = mod("Png", _16, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -7937,7 +8209,7 @@ end
 
 return Png
 ]])
-mod("BppConvert", _18, [[
+mod("BppConvert", _19, [[
 local Preprocess = require(script.Parent.Preprocess)
 local fourBit = Preprocess[0.5]
 local twoBit = Preprocess[0.25]
@@ -8045,8 +8317,8 @@ end
 
 return Convert
 ]])
-local _19 = folder("Chunks", _18)
-mod("IDAT", _19, [[
+local _20 = folder("Chunks", _19)
+mod("IDAT", _20, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -8064,7 +8336,7 @@ return function(cursor: Cursor, file, chunk)
     return
 end
 ]])
-mod("IEND", _19, [[
+mod("IEND", _20, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -8076,7 +8348,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("PLTE", _19, [[
+mod("PLTE", _20, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -8088,7 +8360,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("gAMA", _19, [[
+mod("gAMA", _20, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Chunks = script.Parent
@@ -8102,7 +8374,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("sRGB", _19, [[
+mod("sRGB", _20, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -8114,7 +8386,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("tEXt", _19, [[
+mod("tEXt", _20, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -8133,7 +8405,7 @@ return function(cursor: Cursor, file)
     return
 end
 ]])
-mod("tRNS", _19, [[
+mod("tRNS", _20, [[
 local Reader = script.Parent.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -8168,7 +8440,7 @@ return function(cursor: Cursor, file, data)
 	}
 end
 ]])
-mod("Deflate", _18, [=[
+mod("Deflate", _19, [=[
 --[[
 
 LUA MODULE
@@ -8645,7 +8917,7 @@ function Deflate:InflateZlib(io)
 end
 
 return Deflate]=])
-mod("IDHR", _18, [[
+mod("IDHR", _19, [[
 local Reader = script.Parent.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -8679,7 +8951,7 @@ return function(PNG, cursor: Cursor)
     }
 end
 ]])
-mod("Interlacing", _18, [[
+mod("Interlacing", _19, [[
 local Interlacing = {}
 
 local X_STEP = { 8, 8, 4, 4, 2, 2, 1 }
@@ -8847,7 +9119,7 @@ end
 
 return Interlacing
 ]])
-mod("Preprocess", _18, [[
+mod("Preprocess", _19, [[
 local util = require(script.Parent.Parent.util)
 
 local createRGBAColor = util.createRGBAColor
@@ -8908,7 +9180,7 @@ return {
 	end,
 }
 ]])
-mod("Unfilter", _18, [[
+mod("Unfilter", _19, [[
 local Unfilter = {}
 
 -- 0
@@ -9102,9 +9374,9 @@ end
 
 return Unfilter
 ]])
-mod("util", _18, [[
+mod("util", _19, [[
 return require(script.Parent.Parent.util)]])
-mod("Tga", _15, [[
+mod("Tga", _16, [[
 local Reader = script.Parent
 local ImageReader = Reader.Parent
 local Cursor = require(ImageReader.Parent.Cursor)
@@ -9321,7 +9593,7 @@ end
 
 return Tga
 ]])
-mod("util", _15, [[
+mod("util", _16, [[
 local util = {}
 
 function util.createRGBAColor(r: number, g: number, b: number, a: number?): number
@@ -9350,7 +9622,7 @@ function util.beToLe16(beValue: number)
 end
 
 return util]])
-mod("structs", _14, [[
+mod("structs", _15, [[
 export type Dimensions = { width: number, height: number }
 
 export type function getAppropriateDecoder(ty: type, tys: type)
@@ -9358,7 +9630,7 @@ export type function getAppropriateDecoder(ty: type, tys: type)
 end
 
 return nil]])
-mod("types", _14, [[
+mod("types", _15, [[
 local ImageFormat = require(script.Parent.Parent.ImageFormat)
 local ImageError = require(script.Parent.Parent.ImageError)
 local Cursor = require(script.Parent.Parent.Cursor)
@@ -9396,7 +9668,7 @@ export type ImageReader<T> = {
 }
 
 return nil]])
-mod("Result", _12, [[
+mod("Result", _13, [[
 export type Result<T, E> = {
     isOk: boolean,
     value: {T | E},
@@ -9475,7 +9747,7 @@ function Result.castSmallToDefault<T, E>(result: SmallResult<T, E>): Result<T, E
 end
 
 return Result]])
-mod("SafeEnum", _12, [[
+mod("SafeEnum", _13, [[
 local counter = -1
 
 return function<T>(): T
@@ -9483,8 +9755,8 @@ return function<T>(): T
 	return counter
 end
 ]])
-local _20 = folder("_Patterns", _1)
-mod("Chart", _20, [[
+local _21 = folder("_Patterns", _1)
+mod("Chart", _21, [[
 -- IMGN
 -- _Patterns/Chart.luau
 -- Plinko Labs
@@ -9629,7 +9901,7 @@ end
 
 return Chart
 ]])
-mod("Dither", _20, [[
+mod("Dither", _21, [[
 -- IMGN
 -- _Patterns/Dither.luau
 -- Plinko Labs
@@ -9735,7 +10007,7 @@ end
 
 return Dither
 ]])
-mod("Draw", _20, [[
+mod("Draw", _21, [[
 -- IMGN
 -- _Patterns/Draw.luau
 -- Plinko Labs
@@ -9869,7 +10141,7 @@ end
 
 return Draw
 ]])
-mod("Effect", _20, [[
+mod("Effect", _21, [[
 -- IMGN
 -- _Patterns/Effect.luau
 -- Plinko Labs
@@ -10235,7 +10507,7 @@ end
 
 return Effect
 ]])
-mod("Font", _20, [[
+mod("Font", _21, [[
 -- IMGN
 -- _Patterns/Font.luau
 -- Plinko Labs
@@ -10358,7 +10630,7 @@ end
 
 return Font
 ]])
-mod("Identicon", _20, [[
+mod("Identicon", _21, [[
 -- IMGN
 -- _Patterns/Identicon.luau
 -- Plinko Labs
@@ -10434,7 +10706,7 @@ end
 
 return Identicon
 ]])
-mod("Image", _20, [[
+mod("Image", _21, [[
 -- IMGN
 -- _Patterns/Image.luau
 -- Plinko Labs
@@ -10663,7 +10935,108 @@ end
 
 return Image
 ]])
-mod("Texture", _20, [[
+mod("SDF", _21, [[
+-- IMGN
+-- _Patterns/SDF.luau
+-- Plinko Labs
+--
+-- Signed distance functions for the raymarcher. An SDF returns the distance from a point to the
+-- nearest surface (negative inside); you compose a whole scene out of these primitives and
+-- operators inside a `Scene(p) -> distance` function, and the raymarcher sphere-traces it. This is
+-- how a few lines describe smooth, lit, shadowed 3D - no meshes.
+
+--[=[
+	@class SDF
+	Signed-distance primitives + operators for [Raymarcher] scenes. Reached via `IMGN.SDF`.
+]=]
+local SDF = {}
+
+local function vabs(v: Vector3): Vector3
+	return Vector3.new(math.abs(v.X), math.abs(v.Y), math.abs(v.Z))
+end
+local function vmax(v: Vector3, s: number): Vector3
+	return Vector3.new(math.max(v.X, s), math.max(v.Y, s), math.max(v.Z, s))
+end
+
+--[=[
+	@within SDF
+	Distance to a sphere of `radius` at `center`.
+]=]
+function SDF.sphere(p: Vector3, center: Vector3, radius: number): number
+	return (p - center).Magnitude - radius
+end
+
+--[=[
+	@within SDF
+	Distance to a box at `center` with `half` extents.
+]=]
+function SDF.box(p: Vector3, center: Vector3, half: Vector3): number
+	local q = vabs(p - center) - half
+	return vmax(q, 0).Magnitude + math.min(math.max(q.X, math.max(q.Y, q.Z)), 0)
+end
+
+--[=[
+	@within SDF
+	Distance to a horizontal plane at height `y` (the ground).
+]=]
+function SDF.plane(p: Vector3, y: number): number
+	return p.Y - y
+end
+
+--[=[
+	@within SDF
+	Distance to a torus (ring) at `center`, major radius `R`, tube radius `r`, lying in the XZ plane.
+]=]
+function SDF.torus(p: Vector3, center: Vector3, R: number, r: number): number
+	local q = p - center
+	local l = math.sqrt(q.X * q.X + q.Z * q.Z) - R
+	return math.sqrt(l * l + q.Y * q.Y) - r
+end
+
+--[=[
+	@within SDF
+	Rounds a shape's distance by `radius` (inflates it with rounded edges).
+]=]
+function SDF.round(d: number, radius: number): number
+	return d - radius
+end
+
+--[=[
+	@within SDF
+	Union of two shapes (the nearer surface).
+]=]
+function SDF.union(a: number, b: number): number
+	return math.min(a, b)
+end
+
+--[=[
+	@within SDF
+	Subtracts shape `b` from shape `a`.
+]=]
+function SDF.subtract(a: number, b: number): number
+	return math.max(a, -b)
+end
+
+--[=[
+	@within SDF
+	Intersection of two shapes.
+]=]
+function SDF.intersect(a: number, b: number): number
+	return math.max(a, b)
+end
+
+--[=[
+	@within SDF
+	Smooth (blobby) union of two shapes, blended over `k`.
+]=]
+function SDF.smoothUnion(a: number, b: number, k: number): number
+	local h = math.clamp(0.5 + 0.5 * (b - a) / k, 0, 1)
+	return b + (a - b) * h - k * h * (1 - h)
+end
+
+return SDF
+]])
+mod("Texture", _21, [[
 -- IMGN
 -- _Patterns/Texture.luau
 -- Plinko Labs
@@ -10746,5 +11119,5 @@ end
 return Texture
 ]])
 
-print("[IMGN] installed 66 modules under ReplicatedStorage.IMGN")
+print("[IMGN] installed 68 modules under ReplicatedStorage.IMGN")
 return true

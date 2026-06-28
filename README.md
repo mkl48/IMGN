@@ -288,6 +288,28 @@ rc:Start()      -- built-in WASD + arrow/Q-E controls, renders every frame
 
 **Textures** are `(u, v) -> Color3?` samplers — `IMGN.Texture.brick/checker/solid(...)`, or `IMGN.Texture.fromCanvas(canvas)` to **wallpaper a level with a loaded image**. It's resolution-bound (every pixel redraws each frame), so keep the canvas modest and drop the resolution if it's heavy. See `examples/Raycaster.client.luau`.
 
+### Raymarcher (SDF, the Shadertoy look)
+
+`IMGN.Raymarcher` is a **signed-distance-field renderer**: define a scene as a `Scene(p) -> distance` function from `IMGN.SDF` primitives, and it sphere-traces every pixel and shades the hit with **diffuse lighting, soft shadows, ambient occlusion, specular and fog** — smooth, lit, shadowed 3D, no meshes.
+
+```lua
+local SDF = IMGN.SDF
+local rm = IMGN.Raymarcher({
+    Canvas = canvas,
+    Scene = function(p)
+        local ground = SDF.plane(p, -1)
+        local blob = SDF.smoothUnion(SDF.sphere(p, Vector3.new(-0.7,0,0), 1),
+                                     SDF.box(p, Vector3.new(0.9,0,0), Vector3.new(0.7,0.7,0.7)), 0.5)
+        return SDF.union(ground, blob)
+    end,
+    Material = function(p, n) return Color3.fromRGB(210, 120, 90) end,
+    OnUpdate = function(self, t) self:SetCamera(Vector3.new(math.cos(t)*5, 2, math.sin(t)*5), Vector3.zero) end,
+})
+rm:Start()
+```
+
+`SDF` has `sphere/box/plane/torus/round/union/subtract/intersect/smoothUnion`. It's **the heaviest thing here** (per-pixel marching + shadow/AO rays), so use a small canvas (~64×48). See `examples/Raymarch.client.luau`.
+
 ## Particles
 
 `IMGN.Particles` is a 2D particle emitter on a canvas — fire, sparks, rain, snow, explosions, confetti. Particles move under gravity, fade with age, and only the moving pixels repaint.
@@ -481,6 +503,7 @@ See [`examples/`](examples):
 - **Dashboard** — a live line + bar chart panel (`IMGN.Chart`) drawn into `:Query` regions.
 - **Identicons** — a grid of 16 unique seed-based avatars, no uploads.
 - **Effects** — the same scene through every post-processing effect (CRT/glitch/hologram/…).
+- **Raymarch** — a raytraced-style SDF scene (soft shadows + AO + lighting) rendered into GUI frames.
 
 - **GradientSurface** — procedural gradient on a part via `:Shader`.
 - **PaintCanvas** — click-drag finger paint on a `ScreenGui` with `AutoRender`.
